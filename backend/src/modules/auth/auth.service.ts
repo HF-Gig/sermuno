@@ -12,6 +12,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
 import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
+import * as nodemailer from 'nodemailer';
 import { Queue } from 'bullmq';
 import {
   generateSecret as otpGenerateSecret,
@@ -239,6 +240,123 @@ export class AuthService {
     }
   }
 
+  // ─── Email ────────────────────────────────────────────────────────────────
+
+  private async sendVerificationEmail(
+    email: string,
+    fullName: string | null,
+    token: string,
+  ): Promise<boolean> {
+    const host = this.config.get<string>('smtp.host') ?? '';
+    const from = this.config.get<string>('smtp.from') ?? '';
+    const port = this.config.get<number>('smtp.port') ?? 587;
+    const smtpUser = this.config.get<string>('smtp.user') ?? '';
+    const pass = this.config.get<string>('smtp.pass') ?? '';
+
+    if (!host || !from) {
+      this.logger.warn(
+        `SMTP is not configured (SMTP_HOST/SMTP_FROM). Verification email skipped for ${email}.`,
+      );
+      return false;
+    }
+
+    const frontendUrl =
+      this.config.get<string>('frontend.url') ?? 'http://localhost:5173';
+    const verifyUrl = `${frontendUrl}/verify-email?token=${encodeURIComponent(token)}`;
+
+    const transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      ...(smtpUser && pass ? { auth: { user: smtpUser, pass } } : {}),
+    });
+
+    const safeName =
+      fullName && fullName.trim().length > 0 ? fullName : email;
+
+    try {
+      await transporter.sendMail({
+        from,
+        to: email,
+        subject: 'Verify your email address for Sermuno',
+        html: `
+          <p>Hello ${safeName},</p>
+          <p>Thank you for signing up for Sermuno!</p>
+          <p>Please verify your email address by clicking the link below:</p>
+          <p><a href="${verifyUrl}">Verify Your Email</a></p>
+          <p>This link expires in 24 hours.</p>
+          <p>If you didn't create this account, you can safely ignore this email.</p>
+        `,
+        text: `Hello ${safeName},\n\nThank you for signing up for Sermuno!\n\nPlease verify your email address by visiting:\n${verifyUrl}\n\nThis link expires in 24 hours.\n\nIf you didn't create this account, you can safely ignore this email.`,
+      });
+      this.logger.debug(`Verification email sent to ${email}`);
+      return true;
+    } catch (error) {
+      this.logger.error(
+        `Failed to send verification email to ${email}`,
+        error as Error,
+      );
+      return false;
+    }
+  }
+
+  private async sendPasswordResetEmail(
+    email: string,
+    fullName: string | null,
+    token: string,
+  ): Promise<boolean> {
+    const host = this.config.get<string>('smtp.host') ?? '';
+    const from = this.config.get<string>('smtp.from') ?? '';
+    const port = this.config.get<number>('smtp.port') ?? 587;
+    const smtpUser = this.config.get<string>('smtp.user') ?? '';
+    const pass = this.config.get<string>('smtp.pass') ?? '';
+
+    if (!host || !from) {
+      this.logger.warn(
+        `SMTP is not configured (SMTP_HOST/SMTP_FROM). Password reset email skipped for ${email}.`,
+      );
+      return false;
+    }
+
+    const frontendUrl =
+      this.config.get<string>('frontend.url') ?? 'http://localhost:5173';
+    const resetUrl = `${frontendUrl}/reset-password?token=${encodeURIComponent(token)}`;
+
+    const transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      ...(smtpUser && pass ? { auth: { user: smtpUser, pass } } : {}),
+    });
+
+    const safeName =
+      fullName && fullName.trim().length > 0 ? fullName : email;
+
+    try {
+      await transporter.sendMail({
+        from,
+        to: email,
+        subject: 'Reset your password for Sermuno',
+        html: `
+          <p>Hello ${safeName},</p>
+          <p>We received a request to reset your password. Click the link below to create a new password:</p>
+          <p><a href="${resetUrl}">Reset Your Password</a></p>
+          <p>This link expires in 1 hour.</p>
+          <p>If you didn't request a password reset, you can safely ignore this email.</p>
+        `,
+        text: `Hello ${safeName},\n\nWe received a request to reset your password. Visit the link below to create a new password:\n${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request a password reset, you can safely ignore this email.`,
+      });
+      this.logger.debug(`Password reset email sent to ${email}`);
+      return true;
+    } catch (error) {
+      this.logger.error(
+        `Failed to send password reset email to ${email}`,
+        error as Error,
+      );
+      return false;
+    }
+  }
+
   // ─── Token generation ──────────────────────────────────────────────────────
 
   private generateAccessToken(user: {
@@ -384,6 +502,10 @@ export class AuthService {
       data: { name: dto.organizationName ?? 'My Organization' },
     });
 
+    // Generate verification token
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const verificationExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
     const user = await this.prisma.user.create({
       data: {
         email: dto.email,
@@ -392,6 +514,8 @@ export class AuthService {
         organizationId: org.id,
         role: UserRole.ADMIN,
         emailVerified: false,
+        inviteToken: verificationToken,
+        inviteExpiresAt: verificationExpiresAt,
       },
     });
 
@@ -406,6 +530,13 @@ export class AuthService {
       where: { id: user.id },
       data: { lastLogin: new Date() },
     });
+
+    // Send verification email
+    this.sendVerificationEmail(user.email, user.fullName, verificationToken).catch(
+      (error) => {
+        this.logger.error('Failed to send verification email', error as Error);
+      },
+    );
 
     return {
       accessToken,
@@ -761,7 +892,12 @@ export class AuthService {
       data: { inviteToken: token, inviteExpiresAt: expiresAt },
     });
 
-    // TODO: enqueue password reset email via BullMQ (Phase 2)
+    // Send password reset email
+    this.sendPasswordResetEmail(user.email, user.fullName, token).catch(
+      (error) => {
+        this.logger.error('Failed to send password reset email', error as Error);
+      },
+    );
   }
 
   async resetPassword(dto: ResetPasswordDto): Promise<void> {

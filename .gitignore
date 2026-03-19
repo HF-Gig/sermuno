@@ -1,10 +1,3 @@
-# Secrets and local env files
-**/.env
-**/.env.local
-**/.env.*.local
-!**/.env.example
-!**/.env*.example
-
 # Service accounts and credentials
 **/serviceKey.json
 **/serviceKey.local.json
@@ -21,3 +14,55 @@
 **/*.cer
 **/*.jks
 **/*.keystore
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Storage and uploads
+uploads/
+attachment-storage/
+export-artifacts/
+
+# Database
+*.sqlite
+*.sqlite3
+prisma/dev.db
+
+# Cache
+.cache/
+.eslintcache
+.turbo/
+
+# OS files
+.git/
+
+.env
+.env.local
+backend/.env
+frontend/.env.local
