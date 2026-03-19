@@ -1,0 +1,23 @@
+# Secrets and local env files
+**/.env
+**/.env.local
+**/.env.*.local
+!**/.env.example
+!**/.env*.example
+
+# Service accounts and credentials
+**/serviceKey.json
+**/serviceKey.local.json
+**/service-account*.json
+**/*credential*.json
+**/*credentials*.json
+
+# Common secret/cert formats
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+**/*.cer
+**/*.jks
+**/*.keystore

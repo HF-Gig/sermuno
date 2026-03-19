@@ -1,0 +1,104 @@
+/* ============================================
+   Sermuno Design System Tokens
+   STRICT: Uses ONLY mandatory colors from RULES.md
+   ============================================ */
+
+:root {
+  /* ---- Colors (RULES.md — exact hex, NO deviation) ---- */
+  --color-primary: #163832;
+  --color-secondary: #235347;
+  --color-accent: #8EB69B;
+  --color-background: #ffffff;
+  --color-surface: #8EB69B;
+  --color-text-primary: #051F20;
+  --color-text-muted: #0B2B26;
+  --color-border: #235347;
+  --color-cta-primary: #163832;
+  --color-cta-secondary: #235347;
+
+  /* Derived functional tokens (same palette, no new colors) */
+  --color-sidebar-bg: #163832;
+  --color-sidebar-hover: #235347;
+  --color-sidebar-text: #FFFFFF;
+  --color-sidebar-text-muted: #8EB69B;
+  --color-sidebar-active-bg: #235347;
+  --color-header-bg: #ffffff;
+  --color-header-border: #235347;
+  --color-card-bg: #ffffff;
+  --color-card-border: #23534733;
+  /* border with slight transparency */
+  --color-content-bg: #ffffff;
+  --color-table-hover: #ffffff;
+  --color-input-border: #8EB69B;
+  --color-input-focus: #235347;
+  --color-badge-success-bg: #ffffff;
+  --color-badge-success-text: #163832;
+
+  /* ---- Typography (RULES.md — mandatory fonts) ---- */
+  --font-headline: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-heading: var(--font-headline);
+  --font-body: 'Inter', system-ui, sans-serif;
+  --font-ui: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Font weights */
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  /* Font sizes */
+  --text-xs: 0.75rem;
+  /* 12px */
+  --text-sm: 0.875rem;
+  /* 14px */
+  --text-base: 1rem;
+  /* 16px */
+  --text-lg: 1.125rem;
+  /* 18px */
+  --text-xl: 1.25rem;
+  /* 20px */
+  --text-2xl: 1.5rem;
+  /* 24px */
+  --text-3xl: 1.875rem;
+  /* 30px */
+
+  /* ---- Spacing scale ---- */
+  --space-1: 0.25rem;
+  /* 4px */
+  --space-2: 0.5rem;
+  /* 8px */
+  --space-3: 0.75rem;
+  /* 12px */
+  --space-4: 1rem;
+  /* 16px */
+  --space-5: 1.5rem;
+  /* 24px */
+  --space-6: 2rem;
+  /* 32px */
+  --space-8: 3rem;
+  /* 48px */
+  --space-10: 4rem;
+  /* 64px */
+  --space-12: 6rem;
+  /* 96px */
+
+  /* ---- Border radius ---- */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-full: 9999px;
+
+  /* ---- Shadows (eDesk border-first approach) ---- */
+  --shadow-sm: 0 1px 2px rgba(5, 31, 32, 0.04);
+  --shadow-md: 0 1px 3px rgba(5, 31, 32, 0.06), 0 1px 2px rgba(5, 31, 32, 0.04);
+  --shadow-lg: 0 4px 6px -1px rgba(5, 31, 32, 0.06), 0 2px 4px -1px rgba(5, 31, 32, 0.04);
+
+  /* ---- Layout ---- */
+  --sidebar-width: 260px;
+  --sidebar-collapsed-width: 64px;
+  --header-height: 56px;
+  --content-max-width: 1200px;
+  --content-padding: var(--space-5);
+}
