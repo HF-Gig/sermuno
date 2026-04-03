@@ -17,9 +17,14 @@ import type {
   NotificationChannelConfigDto,
   UpdateOrganizationNotificationSettingsDto,
   UpdateQuietHoursDto,
+  EmailDeliveryMode,
 } from './dto/notification.dto';
 import { Prisma } from '@prisma/client';
 import type { EventsGateway } from '../websockets/events.gateway';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { PushNotificationsService } from './push-notifications.service';
+import type { PushTokenDto, RevokePushTokenDto } from './dto/notification.dto';
+import { NOTIFICATION_DIGEST_QUEUE } from '../../jobs/queues/notification-digest.queue';
 
 type ChannelMap = {
   in_app: boolean;
@@ -43,11 +48,11 @@ const NOTIFICATION_TYPE_DEFS: Record<
   { config: Record<string, unknown>; channels: ChannelMap }
 > = {
   new_message: {
-    channels: { in_app: true, email: true, push: false, desktop: false },
+    channels: { in_app: true, email: true, push: true, desktop: true },
     config: { scope: 'all_mailboxes', mailboxIds: [] },
   },
   thread_assigned: {
-    channels: { in_app: true, email: true, push: false, desktop: false },
+    channels: { in_app: true, email: true, push: true, desktop: true },
     config: {},
   },
   mention: {
@@ -63,7 +68,7 @@ const NOTIFICATION_TYPE_DEFS: Record<
     config: {},
   },
   thread_reply: {
-    channels: { in_app: true, email: true, push: false, desktop: false },
+    channels: { in_app: true, email: true, push: true, desktop: true },
     config: { scope: 'assigned_threads_only' },
   },
   rule_triggered: {
@@ -76,11 +81,21 @@ const NOTIFICATION_TYPE_DEFS: Record<
   },
   daily_digest: {
     channels: { in_app: false, email: true, push: false, desktop: false },
-    config: { time: '09:00', timezone: 'UTC', includeStatistics: true },
+    config: {
+      time: '09:00',
+      timezone: 'UTC',
+      includeStatistics: true,
+      emailDeliveryMode: 'daily_digest',
+    },
   },
   weekly_report: {
     channels: { in_app: false, email: true, push: false, desktop: false },
-    config: { day: 'monday', time: '09:00', timezone: 'UTC' },
+    config: {
+      day: 'monday',
+      time: '09:00',
+      timezone: 'UTC',
+      emailDeliveryMode: 'daily_digest',
+    },
   },
 };
 
@@ -91,8 +106,12 @@ export class NotificationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly quietHours: QuietHoursService,
+    private readonly featureFlags: FeatureFlagsService,
+    private readonly pushNotifications: PushNotificationsService,
     @InjectQueue(NOTIFICATION_DISPATCH_QUEUE)
     private readonly dispatchQueue: Queue,
+    @InjectQueue(NOTIFICATION_DIGEST_QUEUE)
+    private readonly digestQueue: Queue,
     @Inject(forwardRef(() => 'EVENTS_GATEWAY'))
     private readonly eventsGateway: EventsGateway | null,
   ) {}
@@ -138,6 +157,10 @@ export class NotificationsService {
       Object.keys(NOTIFICATION_TYPE_DEFS).map((type) => {
         const base = orgSettings.types[type];
         const pref = prefMap.get(type);
+        const mergedConfig = {
+          ...base.config,
+          ...this.readObject(pref?.config),
+        };
         return [
           type,
           {
@@ -153,8 +176,8 @@ export class NotificationsService {
                 (pref?.desktop ?? base.channels.desktop),
             },
             config: {
-              ...base.config,
-              ...this.readObject(pref?.config),
+              ...mergedConfig,
+              emailDeliveryMode: this.getEmailDeliveryMode(mergedConfig),
             },
             restrictedChannels: Object.entries(base.channels)
               .filter(([, enabled]) => !enabled)
@@ -183,6 +206,12 @@ export class NotificationsService {
         .map(([type, payload]) => {
           const base = orgSettings.types[type];
           const channels = this.normalizeChannels(payload, base.channels);
+          const configPatch = {
+            ...this.readObject(payload.config),
+            ...(payload.emailDeliveryMode
+              ? { emailDeliveryMode: payload.emailDeliveryMode }
+              : {}),
+          };
 
           return this.prisma.notificationPreference.upsert({
             where: {
@@ -200,7 +229,7 @@ export class NotificationsService {
               email: channels.email,
               push: channels.push,
               desktop: channels.desktop,
-              config: this.normalizeObject(payload.config),
+              config: this.normalizeObject(configPatch),
             },
             update: {
               enabled: payload.enabled ?? true,
@@ -208,7 +237,7 @@ export class NotificationsService {
               email: channels.email,
               push: channels.push,
               desktop: channels.desktop,
-              config: this.normalizeObject(payload.config),
+              config: this.normalizeObject(configPatch),
             },
           });
         }),
@@ -310,10 +339,19 @@ export class NotificationsService {
             {
               enabled: override.enabled ?? base.enabled,
               channels: this.normalizeChannels(override, base.channels),
-              config: {
-                ...base.config,
-                ...this.readObject(override.config),
-              },
+              config: (() => {
+                const merged = {
+                  ...base.config,
+                  ...this.readObject(override.config),
+                  ...(override.emailDeliveryMode
+                    ? { emailDeliveryMode: override.emailDeliveryMode }
+                    : {}),
+                };
+                return {
+                  ...merged,
+                  emailDeliveryMode: this.getEmailDeliveryMode(merged),
+                };
+              })(),
             },
           ];
         }),
@@ -328,6 +366,22 @@ export class NotificationsService {
     });
 
     return normalized;
+  }
+
+  async getPushConfig(_user: JwtUser) {
+    return this.pushNotifications.getClientConfig();
+  }
+
+  async listPushRegistrations(user: JwtUser) {
+    return this.pushNotifications.listRegistrations(user);
+  }
+
+  async registerPush(dto: PushTokenDto, user: JwtUser) {
+    return this.pushNotifications.register(dto, user);
+  }
+
+  async revokePush(dto: RevokePushTokenDto, user: JwtUser) {
+    return this.pushNotifications.revoke(dto, user);
   }
 
   async dispatch(params: DispatchNotificationParams): Promise<void> {
@@ -359,7 +413,8 @@ export class NotificationsService {
       }
     }
 
-    const [userPref, globalPref, orgSettings] = await Promise.all([
+    const [userPref, globalPref, orgSettings, recipientUser] = await Promise.all(
+      [
       this.prisma.notificationPreference.findFirst({
         where: { userId, notificationType: type },
       }),
@@ -367,7 +422,12 @@ export class NotificationsService {
         where: { userId, notificationType: 'global' },
       }),
       this.getOrganizationSettingsInternal(params.organizationId),
-    ]);
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { timezone: true },
+      }),
+    ],
+    );
 
     const orgTypeSetting = orgSettings.types[type];
     if (!orgTypeSetting.enabled) {
@@ -382,7 +442,10 @@ export class NotificationsService {
         (params.channels?.email ?? false) ||
         (orgTypeSetting.channels.email &&
           (userPref?.email ?? orgTypeSetting.channels.email)),
-      push: false,
+      push:
+        (params.channels?.push ?? false) ||
+        (orgTypeSetting.channels.push &&
+          (userPref?.push ?? orgTypeSetting.channels.push)),
       desktop:
         (params.channels?.desktop ?? false) ||
         (orgTypeSetting.channels.desktop &&
@@ -392,6 +455,7 @@ export class NotificationsService {
       ...orgTypeSetting.config,
       ...this.readObject(userPref?.config),
     };
+    const emailDeliveryMode = this.getEmailDeliveryMode(effectiveConfig);
 
     if (userPref?.enabled === false) {
       return;
@@ -448,7 +512,62 @@ export class NotificationsService {
     };
 
     if (effectiveChannels.email) {
-      await enqueue('email');
+      if (emailDeliveryMode === 'instant') {
+        await enqueue('email');
+      } else if (emailDeliveryMode === 'never') {
+        this.logger.log(
+          `[notifications] Email channel skipped by emailDeliveryMode=never user=${userId} type=${type}`,
+        );
+      } else {
+        const window = this.getDigestWindow({
+          mode: emailDeliveryMode,
+          notificationType: type,
+          now,
+          preferredTime:
+            typeof effectiveConfig.time === 'string'
+              ? effectiveConfig.time
+              : '09:00',
+          timezone:
+            typeof effectiveConfig.timezone === 'string'
+              ? effectiveConfig.timezone
+              : (recipientUser?.timezone ?? 'UTC'),
+        });
+
+        await this.prisma.notificationDigestItem.create({
+          data: {
+            organizationId: params.organizationId,
+            userId,
+            notificationId: notification.id,
+            notificationType: type,
+            emailDeliveryMode,
+            title,
+            message: message ?? null,
+            resourceId: resourceId ?? null,
+            data: {
+              ...(params.data ?? {}),
+              channels: effectiveChannels,
+            } as unknown as Prisma.InputJsonValue,
+            windowKey: window.windowKey,
+            windowStart: window.windowStart,
+            windowEnd: window.windowEnd,
+          },
+        });
+
+        this.logger.log(
+          `[notifications] Digest candidate stored user=${userId} type=${type} mode=${emailDeliveryMode} window=${window.windowKey}`,
+        );
+        await this.digestQueue.add(
+          emailDeliveryMode === 'hourly_digest' ? 'hourly' : 'daily',
+          {},
+        );
+      }
+    }
+
+    if (
+      effectiveChannels.push &&
+      this.featureFlags.isEnabled('ENABLE_PUSH_NOTIFICATIONS')
+    ) {
+      await enqueue('push');
     }
   }
 
@@ -477,10 +596,16 @@ export class NotificationsService {
             {
               enabled: override.enabled ?? true,
               channels: this.normalizeChannels(override, def.channels),
-              config: {
-                ...def.config,
-                ...this.readObject(override.config),
-              },
+              config: (() => {
+                const merged = {
+                  ...def.config,
+                  ...this.readObject(override.config),
+                };
+                return {
+                  ...merged,
+                  emailDeliveryMode: this.getEmailDeliveryMode(merged),
+                };
+              })(),
             } satisfies TypeSetting,
           ];
         }),
@@ -573,6 +698,115 @@ export class NotificationsService {
     }
 
     return true;
+  }
+
+  private getEmailDeliveryMode(
+    config: Record<string, unknown>,
+  ): EmailDeliveryMode {
+    const raw = String(config.emailDeliveryMode || '').toLowerCase();
+    if (
+      raw === 'instant' ||
+      raw === 'hourly_digest' ||
+      raw === 'daily_digest' ||
+      raw === 'never'
+    ) {
+      return raw;
+    }
+    return 'instant';
+  }
+
+  private getDigestWindow(params: {
+    mode: Extract<EmailDeliveryMode, 'hourly_digest' | 'daily_digest'>;
+    notificationType: string;
+    now: Date;
+    preferredTime: string;
+    timezone: string;
+  }): { windowStart: Date; windowEnd: Date; windowKey: string } {
+    if (params.mode === 'hourly_digest') {
+      const start = new Date(params.now);
+      start.setMinutes(0, 0, 0);
+      const end = new Date(start);
+      end.setHours(end.getHours() + 1);
+      return {
+        windowStart: start,
+        windowEnd: end,
+        windowKey: `${params.notificationType}:${start.toISOString()}`,
+      };
+    }
+
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: params.timezone || 'UTC',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const [year, month, day] = formatter
+      .format(params.now)
+      .split('-')
+      .map((segment) => Number(segment));
+    const [hours, minutes] = this.parseTime(params.preferredTime);
+    const todayAtScheduled = this.toUtcFromZonedLocal(
+      year,
+      month,
+      day,
+      hours,
+      minutes,
+      params.timezone || 'UTC',
+    );
+    const tomorrow = new Date(todayAtScheduled);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    const yesterday = new Date(todayAtScheduled);
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+    const start = params.now >= todayAtScheduled ? todayAtScheduled : yesterday;
+    const end = params.now >= todayAtScheduled ? tomorrow : todayAtScheduled;
+    const dateKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    return {
+      windowStart: start,
+      windowEnd: end,
+      windowKey: `${params.notificationType}:${params.timezone}:${dateKey}`,
+    };
+  }
+
+  private parseTime(value: string): [number, number] {
+    const [rawHour, rawMinute] = String(value || '09:00').split(':');
+    const hour = Number(rawHour);
+    const minute = Number(rawMinute);
+    return [
+      Number.isFinite(hour) ? Math.min(Math.max(hour, 0), 23) : 9,
+      Number.isFinite(minute) ? Math.min(Math.max(minute, 0), 59) : 0,
+    ];
+  }
+
+  private toUtcFromZonedLocal(
+    year: number,
+    month: number,
+    day: number,
+    hour: number,
+    minute: number,
+    timezone: string,
+  ): Date {
+    const provisionalUtc = new Date(
+      Date.UTC(year, month - 1, day, hour, minute, 0, 0),
+    );
+    const offsetMinutes = this.getTimezoneOffsetMinutes(provisionalUtc, timezone);
+    return new Date(provisionalUtc.getTime() - offsetMinutes * 60_000);
+  }
+
+  private getTimezoneOffsetMinutes(date: Date, timezone: string): number {
+    const formatted = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone || 'UTC',
+      timeZoneName: 'shortOffset',
+    }).formatToParts(date);
+    const zonePart = formatted.find((part) => part.type === 'timeZoneName');
+    const value = zonePart?.value || 'GMT+0';
+    const match = value.match(/GMT([+-])(\d{1,2})(?::?(\d{2}))?/i);
+    if (!match) {
+      return 0;
+    }
+    const sign = match[1] === '-' ? -1 : 1;
+    const hours = Number(match[2] || 0);
+    const minutes = Number(match[3] || 0);
+    return sign * (hours * 60 + minutes);
   }
 
   private readObject<T extends object = Record<string, unknown>>(

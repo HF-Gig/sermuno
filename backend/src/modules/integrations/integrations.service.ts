@@ -31,6 +31,14 @@ export class IntegrationsService {
         connected: !!prefs['zoomAccessToken'],
         expiresAt: prefs['zoomTokenExpiresAt'] ?? null,
       },
+      caldav: {
+        connected: !!prefs['calDavUrl'] && !!prefs['calDavUsername'] && !!prefs['calDavPassword'],
+        url: prefs['calDavUrl'] ?? null,
+        username: prefs['calDavUsername'] ?? null,
+        calendarName: prefs['calDavCalendarDisplayName'] ?? null,
+        lastCheckedAt: prefs['calDavLastSyncedAt'] ?? null,
+        lastError: prefs['calDavLastError'] ?? null,
+      },
     };
   }
 
@@ -74,6 +82,37 @@ export class IntegrationsService {
     void zoomAccessToken;
     void zoomRefreshToken;
     void zoomTokenExpiresAt;
+
+    await this.prisma.user.update({
+      where: { id: user.sub },
+      data: { preferences: rest },
+    });
+  }
+
+  async deleteCalDav(user: JwtUser): Promise<void> {
+    const userRecord = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+    });
+    const prefs =
+      (userRecord?.preferences as Record<string, string> | null) ?? {};
+
+    const {
+      calDavUrl,
+      calDavUsername,
+      calDavPassword,
+      calDavCalendarUrl,
+      calDavCalendarDisplayName,
+      calDavLastSyncedAt,
+      calDavLastError,
+      ...rest
+    } = prefs;
+    void calDavUrl;
+    void calDavUsername;
+    void calDavPassword;
+    void calDavCalendarUrl;
+    void calDavCalendarDisplayName;
+    void calDavLastSyncedAt;
+    void calDavLastError;
 
     await this.prisma.user.update({
       where: { id: user.sub },

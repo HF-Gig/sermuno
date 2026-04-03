@@ -2,11 +2,20 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
-import { UserCircle2, KeyRound, BadgeCheck, ImagePlus, Upload, Trash2, Eye, EyeOff, Bell, Mail, AlertTriangle, AtSign, Settings as SettingsIcon, UserCheck, Clock3, Activity, CalendarDays } from 'lucide-react';
+import { UserCircle2, KeyRound, BadgeCheck, ImagePlus, Upload, Trash2, Eye, EyeOff, Bell, Mail, AlertTriangle, AtSign, Settings as SettingsIcon, UserCheck, Clock3, Activity, CalendarDays, ChevronDown, ChevronUp } from 'lucide-react';
 import api, { resolveAvatarUrl } from '../../../lib/api';
 import { useAuth } from '../../../context/AuthContext';
 import AvatarCropModal from './components/AvatarCropModal';
 import MfaSetup from '../../../components/MfaSetup';
+import {
+    ensureDesktopPermission,
+    fetchPushConfig,
+    getCurrentPushSubscription,
+    getStoredDesktopSoundEnabled,
+    isBrowserPushSupported,
+    registerCurrentBrowserPush,
+    revokeCurrentBrowserPush,
+} from '../../../lib/pushNotifications';
 
 interface UserProfileData {
     fullName: string;
@@ -34,10 +43,23 @@ type NotificationPreferenceState = {
     channels: {
         in_app: boolean;
         email: boolean;
+        push: boolean;
         desktop: boolean;
     };
     config: Record<string, any>;
     restrictedChannels?: string[];
+};
+
+type PushRegistrationState = {
+    id: string;
+    provider: string;
+    registrationKey: string;
+    endpoint?: string | null;
+    soundEnabled: boolean;
+    active: boolean;
+    browserName?: string | null;
+    deviceName?: string | null;
+    updatedAt: string;
 };
 
 type QuietHoursState = {
@@ -63,6 +85,13 @@ const notificationTypeMeta: Record<string, { label: string; desc: string; icon: 
 
 const cardClass = 'rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)]';
 const inputClass = 'w-full rounded-xl border border-[var(--color-input-border)] bg-white px-3 py-2.5 text-sm text-[var(--color-text-primary)] shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20';
+const PUSH_REGISTRATION_KEY_STORAGE = 'sermunoPushRegistrationKey';
+
+const normalizePushEndpoint = (endpoint?: string | null) => {
+    if (!endpoint) return '';
+    const trimmed = endpoint.trim();
+    return trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed;
+};
 
 export default function ProfilePage() {
     const { t, i18n } = useTranslation();
@@ -85,12 +114,19 @@ export default function ProfilePage() {
     const [notificationPreferences, setNotificationPreferences] = useState<Record<string, NotificationPreferenceState>>({});
     const [notificationsLoading, setNotificationsLoading] = useState(false);
     const [notificationSaveLoading, setNotificationSaveLoading] = useState(false);
+    const [pushFeatureEnabled, setPushFeatureEnabled] = useState(false);
+    const [pushRegistrations, setPushRegistrations] = useState<PushRegistrationState[]>([]);
+    const [currentPushEndpoint, setCurrentPushEndpoint] = useState<string | null>(null);
+    const [currentPushRegistrationKey, setCurrentPushRegistrationKey] = useState<string | null>(null);
+    const [desktopSoundEnabled, setDesktopSoundEnabled] = useState(getStoredDesktopSoundEnabled);
+    const [pushActionLoading, setPushActionLoading] = useState(false);
+    const [expandedAdvancedRows, setExpandedAdvancedRows] = useState<Record<string, boolean>>({});
     const [quietHoursState, setQuietHoursState] = useState<QuietHoursState>({
         enabled: false,
         startTime: '22:00',
         endTime: '07:00',
         timezone: 'UTC',
-        channels: ['email', 'desktop'],
+        channels: ['email', 'push', 'desktop'],
     });
 
     const tabParam = searchParams.get('tab');
@@ -101,7 +137,58 @@ export default function ProfilePage() {
         setSearchParams(next, { replace: true });
     };
 
-    const updateNotificationPreference = (notificationType: string, channel: 'in_app' | 'email' | 'desktop', value: boolean) => {
+    const loadPushState = async () => {
+        try {
+            const [config, registrations, subscription] = await Promise.all([
+                fetchPushConfig().catch(() => ({ enabled: false, provider: 'web_push' as const, publicKey: null })),
+                api.get('/notifications/push/registrations').catch(() => ({ data: [] })),
+                getCurrentPushSubscription().catch(() => null),
+            ]);
+            setPushFeatureEnabled(Boolean(config.enabled));
+            setPushRegistrations(Array.isArray(registrations.data) ? registrations.data : []);
+            setCurrentPushEndpoint(subscription?.endpoint || null);
+            setCurrentPushRegistrationKey(localStorage.getItem(PUSH_REGISTRATION_KEY_STORAGE));
+        } catch {
+            setPushFeatureEnabled(false);
+            setPushRegistrations([]);
+            setCurrentPushEndpoint(null);
+            setCurrentPushRegistrationKey(null);
+        }
+    };
+
+    const syncCurrentBrowserRegistration = async (soundEnabled = desktopSoundEnabled) => {
+        if (!isBrowserPushSupported()) {
+            return false;
+        }
+
+        setPushActionLoading(true);
+        try {
+            await registerCurrentBrowserPush(soundEnabled);
+            await loadPushState();
+            return true;
+        } catch (error: any) {
+            setMessage({ text: error?.message || 'Failed to register this browser for push notifications.', type: 'error' });
+            return false;
+        } finally {
+            setPushActionLoading(false);
+        }
+    };
+
+    const updateNotificationPreference = async (notificationType: string, channel: 'in_app' | 'email' | 'push' | 'desktop', value: boolean) => {
+        if ((channel === 'push' || channel === 'desktop') && value) {
+            const permission = await ensureDesktopPermission();
+            if (permission === 'unsupported') {
+                setMessage({ text: 'This browser does not support desktop push notifications.', type: 'error' });
+                return;
+            }
+            if (permission !== 'granted') {
+                setMessage({ text: 'Desktop notification permission was not granted.', type: 'error' });
+                return;
+            }
+
+            await syncCurrentBrowserRegistration();
+        }
+
         setNotificationPreferences((prev) => ({
             ...prev,
             [notificationType]: {
@@ -112,10 +199,6 @@ export default function ProfilePage() {
                 },
             },
         }));
-
-        if (channel === 'desktop' && value && typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-            Notification.requestPermission().catch(() => undefined);
-        }
     };
 
     const {
@@ -210,8 +293,9 @@ export default function ProfilePage() {
                 startTime: quietHours.startTime || quietHours.start || '22:00',
                 endTime: quietHours.endTime || quietHours.end || '07:00',
                 timezone: quietHours.timezone || 'UTC',
-                channels: Array.isArray(quietHours.channels) ? quietHours.channels : ['email', 'desktop'],
+                channels: Array.isArray(quietHours.channels) ? quietHours.channels : ['email', 'push', 'desktop'],
             });
+            await loadPushState();
         } catch (error: any) {
             setMessage({ text: error?.response?.data?.message || 'Failed to load notification preferences.', type: 'error' });
         } finally {
@@ -223,6 +307,30 @@ export default function ProfilePage() {
         if (activeTab !== 'notifications') return;
         loadNotificationPreferences();
     }, [activeTab]);
+
+    const currentBrowserRegistration = useMemo(
+        () => {
+            const normalizedCurrentEndpoint = normalizePushEndpoint(currentPushEndpoint);
+            if (normalizedCurrentEndpoint) {
+                const endpointMatch = pushRegistrations.find((entry) => (
+                    normalizePushEndpoint(entry.endpoint) === normalizedCurrentEndpoint
+                ));
+                if (endpointMatch) {
+                    return endpointMatch;
+                }
+            }
+
+            if (currentPushRegistrationKey) {
+                const keyMatch = pushRegistrations.find((entry) => entry.registrationKey === currentPushRegistrationKey);
+                if (keyMatch) {
+                    return keyMatch;
+                }
+            }
+
+            return null;
+        },
+        [currentPushEndpoint, currentPushRegistrationKey, pushRegistrations],
+    );
 
     const updateNotificationEnabled = (notificationType: string, value: boolean) => {
         setNotificationPreferences((prev) => ({
@@ -247,6 +355,13 @@ export default function ProfilePage() {
         }));
     };
 
+    const toggleAdvancedRow = (notificationType: string) => {
+        setExpandedAdvancedRows((prev) => ({
+            ...prev,
+            [notificationType]: !prev[notificationType],
+        }));
+    };
+
     const saveNotificationPreferences = async () => {
         setNotificationSaveLoading(true);
         setMessage(null);
@@ -259,6 +374,9 @@ export default function ProfilePage() {
                 timezone: quietHoursState.timezone,
                 channels: quietHoursState.channels,
             });
+            if (isBrowserPushSupported() && Notification.permission === 'granted' && Object.values(notificationPreferences).some((pref) => pref.channels?.push || pref.channels?.desktop)) {
+                await syncCurrentBrowserRegistration(desktopSoundEnabled);
+            }
             setMessage({ text: 'Notification preferences updated.', type: 'success' });
             await loadNotificationPreferences();
         } catch (error: any) {
@@ -342,6 +460,113 @@ export default function ProfilePage() {
         }
         setAvatarDraftFile(file);
     };
+
+    const renderAdvancedNotificationSettings = (type: string, pref: NotificationPreferenceState) => (
+        <div className="rounded-lg border border-[var(--color-card-border)] bg-white p-4 space-y-4">
+            <label className="flex items-center gap-2 text-xs font-medium text-[var(--color-text-primary)]">
+                <input
+                    type="checkbox"
+                    checked={pref.enabled}
+                    onChange={(event) => updateNotificationEnabled(type, event.target.checked)}
+                    className="w-4 h-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]"
+                />
+                Enable this notification type
+            </label>
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div>
+                    <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Email delivery mode</label>
+                    <select
+                        value={String(pref.config?.emailDeliveryMode || 'instant')}
+                        onChange={(event) => updateNotificationConfig(type, { emailDeliveryMode: event.target.value })}
+                        className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm"
+                    >
+                        <option value="instant">Instant</option>
+                        <option value="hourly_digest">Hourly digest</option>
+                        <option value="daily_digest">Daily digest</option>
+                        <option value="never">Never</option>
+                    </select>
+                </div>
+                {type === 'new_message' && (
+                    <>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Mailbox Scope</label>
+                            <select value={String(pref.config?.scope || 'all_mailboxes')} onChange={(event) => updateNotificationConfig(type, { scope: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">
+                                <option value="all_mailboxes">All mailboxes</option>
+                                <option value="per_mailbox">Per mailbox</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Mailbox IDs (comma separated)</label>
+                            <input value={Array.isArray(pref.config?.mailboxIds) ? pref.config.mailboxIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { mailboxIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                        </div>
+                    </>
+                )}
+                {type === 'sla_warning' && (
+                    <div>
+                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Minutes before breach</label>
+                        <input type="number" value={Number(pref.config?.minutesBeforeBreach || 30)} onChange={(event) => updateNotificationConfig(type, { minutesBeforeBreach: Number(event.target.value || 0) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                    </div>
+                )}
+                {type === 'thread_reply' && (
+                    <div>
+                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Scope</label>
+                        <select value={String(pref.config?.scope || 'assigned_threads_only')} onChange={(event) => updateNotificationConfig(type, { scope: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">
+                            <option value="assigned_threads_only">Assigned threads only</option>
+                            <option value="all_threads">All threads</option>
+                        </select>
+                    </div>
+                )}
+                {type === 'rule_triggered' && (
+                    <div>
+                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Rule IDs (comma separated)</label>
+                        <input value={Array.isArray(pref.config?.ruleIds) ? pref.config.ruleIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { ruleIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                    </div>
+                )}
+                {type === 'contact_activity' && (
+                    <div>
+                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Contact IDs (comma separated)</label>
+                        <input value={Array.isArray(pref.config?.contactIds) ? pref.config.contactIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { contactIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                    </div>
+                )}
+                {type === 'daily_digest' && (
+                    <>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Time</label>
+                            <input type="time" value={String(pref.config?.time || '09:00')} onChange={(event) => updateNotificationConfig(type, { time: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Timezone</label>
+                            <input value={String(pref.config?.timezone || 'UTC')} onChange={(event) => updateNotificationConfig(type, { timezone: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-[var(--color-text-primary)] md:col-span-2">
+                            <input type="checkbox" checked={Boolean(pref.config?.includeStatistics ?? true)} onChange={(event) => updateNotificationConfig(type, { includeStatistics: event.target.checked })} className="w-4 h-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]" />
+                            Include statistics
+                        </label>
+                    </>
+                )}
+                {type === 'weekly_report' && (
+                    <>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Day</label>
+                            <select value={String(pref.config?.day || 'monday')} onChange={(event) => updateNotificationConfig(type, { day: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">
+                                <option value="monday">monday</option>
+                                <option value="friday">friday</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Time</label>
+                            <input type="time" value={String(pref.config?.time || '09:00')} onChange={(event) => updateNotificationConfig(type, { time: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                        </div>
+                        <div>
+                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Timezone</label>
+                            <input value={String(pref.config?.timezone || 'UTC')} onChange={(event) => updateNotificationConfig(type, { timezone: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
 
     return (
         <div className="max-w-5xl mx-auto py-2 md:py-4 space-y-6">
@@ -637,132 +862,181 @@ export default function ProfilePage() {
                         </div>
                     ) : (
                         <>
-                            <div className="space-y-3">
-                                {Object.entries(notificationTypeMeta).map(([type, meta]) => {
-                                    const pref = notificationPreferences[type] || {
-                                        enabled: true,
-                                        channels: { in_app: true, email: true, desktop: false },
-                                        config: {},
-                                        restrictedChannels: [],
-                                    };
-                                    const Icon = meta.icon;
-                                    const restricted = new Set(pref.restrictedChannels || []);
+                            <div className="overflow-hidden rounded-xl border border-[var(--color-card-border)] bg-white">
+                                <table className="w-full table-fixed border-collapse">
+                                    <thead>
+                                        <tr className="bg-[var(--color-background)] border-b border-[var(--color-card-border)]">
+                                            <th rowSpan={2} className="w-[46%] px-4 py-3 text-left text-sm font-semibold text-[var(--color-text-primary)]">Notification Type</th>
+                                            <th colSpan={4} className="px-4 py-2 text-center text-sm font-semibold text-[var(--color-text-primary)]">Channels</th>
+                                            <th rowSpan={2} className="w-[14%] px-4 py-3 text-center text-sm font-semibold text-[var(--color-text-primary)]">Advanced</th>
+                                        </tr>
+                                        <tr className="bg-[var(--color-background)] border-b border-[var(--color-card-border)]">
+                                            <th className="w-[10%] px-2 py-2 text-center text-sm font-medium text-[var(--color-text-muted)]">In-app</th>
+                                            <th className="w-[10%] px-2 py-2 text-center text-sm font-medium text-[var(--color-text-muted)]">Email</th>
+                                            <th className="w-[10%] px-2 py-2 text-center text-sm font-medium text-[var(--color-text-muted)]">Push</th>
+                                            <th className="w-[10%] px-2 py-2 text-center text-sm font-medium text-[var(--color-text-muted)]">Desktop</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {Object.entries(notificationTypeMeta).map(([type, meta]) => {
+                                            const pref = notificationPreferences[type] || {
+                                                enabled: true,
+                                                channels: { in_app: true, email: true, push: false, desktop: false },
+                                                config: {},
+                                                restrictedChannels: [],
+                                            };
+                                            const restricted = new Set(pref.restrictedChannels || []);
+                                            const isAdvancedOpen = Boolean(expandedAdvancedRows[type]);
 
-                                    return (
-                                        <div key={type} className="rounded-xl border border-[var(--color-card-border)] bg-white p-4 space-y-3">
-                                            <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                                                <div className="flex items-start gap-3">
-                                                    <div className="w-8 h-8 rounded-lg bg-[var(--color-background)] flex items-center justify-center shrink-0">
-                                                        <Icon className="w-4 h-4 text-[var(--color-primary)]" />
-                                                    </div>
-                                                    <div>
-                                                        <p className="text-sm font-medium text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-ui)' }}>{meta.label}</p>
-                                                        <p className="text-xs text-[var(--color-text-muted)] mt-0.5" style={{ fontFamily: 'var(--font-body)' }}>{meta.desc}</p>
-                                                    </div>
-                                                </div>
-                                                <label className="flex items-center gap-2 text-xs text-[var(--color-text-primary)]">
-                                                    <input type="checkbox" checked={pref.enabled} onChange={(event) => updateNotificationEnabled(type, event.target.checked)} className="w-4 h-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]" />
-                                                    Enabled
-                                                </label>
-                                            </div>
+                                            return (
+                                                <React.Fragment key={type}>
+                                                    <tr className="border-b border-[var(--color-card-border)]">
+                                                        <td className="px-4 py-3 align-top">
+                                                            <p className="text-base font-semibold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-ui)' }}>
+                                                                {meta.label}
+                                                            </p>
+                                                            <p className="mt-1 text-xs text-[var(--color-text-muted)]" style={{ fontFamily: 'var(--font-body)' }}>
+                                                                {meta.desc}
+                                                            </p>
+                                                        </td>
+                                                        {(['in_app', 'email', 'push', 'desktop'] as const).map((channel) => (
+                                                            <td key={channel} className="px-3 py-3 text-center align-top">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={pref.channels?.[channel] ?? false}
+                                                                    disabled={restricted.has(channel)}
+                                                                    onChange={(event) => {
+                                                                        updateNotificationPreference(type, channel, event.target.checked).catch(() => undefined);
+                                                                    }}
+                                                                    className="w-5 h-5 rounded border-[var(--color-card-border)] text-[var(--color-primary)] disabled:opacity-40"
+                                                                    aria-label={`${meta.label} ${channel}`}
+                                                                />
+                                                            </td>
+                                                        ))}
+                                                        <td className="px-4 py-3 text-center align-top">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => toggleAdvancedRow(type)}
+                                                                className="inline-flex items-center gap-1 text-sm font-medium text-emerald-700 hover:text-emerald-800"
+                                                            >
+                                                                Advanced
+                                                                {isAdvancedOpen ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                    {isAdvancedOpen && (
+                                                        <tr className="border-b border-[var(--color-card-border)] bg-[var(--color-background)]/50">
+                                                            <td colSpan={6} className="px-4 py-4">
+                                                                {renderAdvancedNotificationSettings(type, pref)}
+                                                            </td>
+                                                        </tr>
+                                                    )}
+                                                </React.Fragment>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
 
-                                            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                                                {(['in_app', 'email', 'desktop'] as const).map((channel) => (
-                                                    <label key={channel} className={`flex items-center gap-2 text-xs ${restricted.has(channel) ? 'text-[var(--color-text-muted)] opacity-60' : 'text-[var(--color-text-primary)]'}`}>
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={pref.channels?.[channel] ?? false}
-                                                            disabled={restricted.has(channel)}
-                                                            onChange={(event) => updateNotificationPreference(type, channel, event.target.checked)}
-                                                            className="w-4 h-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]"
-                                                        />
-                                                        {channel.replace('_', ' ')}
-                                                    </label>
-                                                ))}
-                                            </div>
+                            <div className="mt-6 rounded-2xl border border-[var(--color-card-border)] bg-white p-5">
+                                <h3 className="text-2xl font-semibold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-ui)' }}>
+                                    Notifications on this browser
+                                </h3>
+                                <p className="mt-1 text-sm text-[var(--color-text-muted)]" style={{ fontFamily: 'var(--font-body)' }}>
+                                    Manage desktop notifications, browser permission, and sound for this device.
+                                </p>
 
-                                            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                                                {type === 'new_message' && (
-                                                    <>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Mailbox Scope</label>
-                                                            <select value={String(pref.config?.scope || 'all_mailboxes')} onChange={(event) => updateNotificationConfig(type, { scope: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">
-                                                                <option value="all_mailboxes">All mailboxes</option>
-                                                                <option value="per_mailbox">Per mailbox</option>
-                                                            </select>
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Mailbox IDs (comma separated)</label>
-                                                            <input value={Array.isArray(pref.config?.mailboxIds) ? pref.config.mailboxIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { mailboxIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                        </div>
-                                                    </>
-                                                )}
-                                                {type === 'sla_warning' && (
-                                                    <div>
-                                                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Minutes before breach</label>
-                                                        <input type="number" value={Number(pref.config?.minutesBeforeBreach || 30)} onChange={(event) => updateNotificationConfig(type, { minutesBeforeBreach: Number(event.target.value || 0) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                    </div>
-                                                )}
-                                                {type === 'thread_reply' && (
-                                                    <div>
-                                                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Scope</label>
-                                                        <select value={String(pref.config?.scope || 'assigned_threads_only')} onChange={(event) => updateNotificationConfig(type, { scope: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">
-                                                            <option value="assigned_threads_only">Assigned threads only</option>
-                                                            <option value="all_threads">All threads</option>
-                                                        </select>
-                                                    </div>
-                                                )}
-                                                {type === 'rule_triggered' && (
-                                                    <div>
-                                                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Rule IDs (comma separated)</label>
-                                                        <input value={Array.isArray(pref.config?.ruleIds) ? pref.config.ruleIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { ruleIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                    </div>
-                                                )}
-                                                {type === 'contact_activity' && (
-                                                    <div>
-                                                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Contact IDs (comma separated)</label>
-                                                        <input value={Array.isArray(pref.config?.contactIds) ? pref.config.contactIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { contactIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                    </div>
-                                                )}
-                                                {type === 'daily_digest' && (
-                                                    <>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Time</label>
-                                                            <input type="time" value={String(pref.config?.time || '09:00')} onChange={(event) => updateNotificationConfig(type, { time: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Timezone</label>
-                                                            <input value={String(pref.config?.timezone || 'UTC')} onChange={(event) => updateNotificationConfig(type, { timezone: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                        </div>
-                                                        <label className="flex items-center gap-2 text-xs text-[var(--color-text-primary)]">
-                                                            <input type="checkbox" checked={Boolean(pref.config?.includeStatistics ?? true)} onChange={(event) => updateNotificationConfig(type, { includeStatistics: event.target.checked })} className="w-4 h-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]" />
-                                                            Include statistics
-                                                        </label>
-                                                    </>
-                                                )}
-                                                {type === 'weekly_report' && (
-                                                    <>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Day</label>
-                                                            <select value={String(pref.config?.day || 'monday')} onChange={(event) => updateNotificationConfig(type, { day: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">
-                                                                <option value="monday">monday</option>
-                                                                <option value="friday">friday</option>
-                                                            </select>
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Time</label>
-                                                            <input type="time" value={String(pref.config?.time || '09:00')} onChange={(event) => updateNotificationConfig(type, { time: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                        </div>
-                                                        <div>
-                                                            <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Timezone</label>
-                                                            <input value={String(pref.config?.timezone || 'UTC')} onChange={(event) => updateNotificationConfig(type, { timezone: event.target.value })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
-                                                        </div>
-                                                    </>
-                                                )}
-                                            </div>
+                                <div className="mt-5 rounded-xl border border-[var(--color-card-border)] bg-[var(--color-background)] px-4 py-4">
+                                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                                        <div className="text-sm text-[var(--color-text-primary)]">
+                                            <span className="inline-flex items-center gap-2 font-medium">
+                                                <span className={`h-2.5 w-2.5 rounded-full ${pushFeatureEnabled ? 'bg-emerald-600' : 'bg-slate-400'}`} />
+                                                Notifications:
+                                            </span>{' '}
+                                            <span className={`font-semibold ${pushFeatureEnabled ? 'text-emerald-700' : 'text-[var(--color-text-muted)]'}`}>
+                                                {pushFeatureEnabled ? 'Enabled' : 'Disabled'}
+                                            </span>
                                         </div>
-                                    );
-                                })}
+                                        <div className="text-sm text-[var(--color-text-primary)]">
+                                            <span className="font-medium">Permission:</span>{' '}
+                                            <span className={`font-semibold ${isBrowserPushSupported() && Notification.permission === 'granted' ? 'text-emerald-700' : 'text-[var(--color-text-muted)]'}`}>
+                                                {!isBrowserPushSupported() ? 'Unsupported' : Notification.permission === 'granted' ? 'Allowed' : Notification.permission === 'denied' ? 'Blocked' : 'Not set'}
+                                            </span>
+                                        </div>
+                                        <div className="text-sm text-[var(--color-text-primary)]">
+                                            <span className="font-medium">Browser:</span>{' '}
+                                            <span className="font-semibold">
+                                                {currentBrowserRegistration?.browserName || 'Unknown'}
+                                            </span>
+                                        </div>
+                                        <div className="text-sm text-[var(--color-text-primary)]">
+                                            <span className="font-medium">Status:</span>{' '}
+                                            <span className={`font-semibold ${currentBrowserRegistration?.active ? 'text-emerald-700' : 'text-[var(--color-text-muted)]'}`}>
+                                                {currentBrowserRegistration?.active ? 'Connected' : 'Not connected'}
+                                            </span>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="mt-5 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                                    <label className="inline-flex items-center gap-3 text-[28px] leading-none">
+                                        <span className="text-sm font-medium text-[var(--color-text-primary)]">Notification Sound</span>
+                                        <span className="relative inline-flex items-center">
+                                            <input
+                                                type="checkbox"
+                                                checked={desktopSoundEnabled}
+                                                onChange={async (event) => {
+                                                    const nextValue = event.target.checked;
+                                                    setDesktopSoundEnabled(nextValue);
+                                                    if (Notification.permission === 'granted') {
+                                                        await syncCurrentBrowserRegistration(nextValue);
+                                                    }
+                                                }}
+                                                className="peer sr-only"
+                                            />
+                                            <span
+                                                className={`relative h-7 w-12 rounded-full border border-[var(--color-card-border)] transition-colors ${desktopSoundEnabled ? 'bg-emerald-700' : 'bg-slate-300'}`}
+                                            >
+                                                <span
+                                                    className={`absolute top-1 h-5 w-5 rounded-full bg-white shadow transition-transform ${desktopSoundEnabled ? 'translate-x-6 left-0' : 'translate-x-0 left-1'}`}
+                                                />
+                                            </span>
+                                        </span>
+                                        <span className="text-sm font-medium text-[var(--color-text-primary)]">
+                                            {desktopSoundEnabled ? 'On' : 'Off'}
+                                        </span>
+                                    </label>
+
+                                    <div className="flex flex-wrap gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={() => syncCurrentBrowserRegistration().catch(() => undefined)}
+                                            disabled={pushActionLoading || !pushFeatureEnabled}
+                                            className="inline-flex items-center rounded-xl border border-[var(--color-card-border)] bg-white px-5 py-2.5 text-sm font-semibold text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            {pushActionLoading ? 'Registering...' : 'Register this browser'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={async () => {
+                                                setPushActionLoading(true);
+                                                try {
+                                                    await revokeCurrentBrowserPush();
+                                                    await loadPushState();
+                                                    setMessage({ text: 'Browser push registration revoked.', type: 'success' });
+                                                } catch (error: any) {
+                                                    setMessage({ text: error?.response?.data?.message || 'Failed to revoke browser push registration.', type: 'error' });
+                                                } finally {
+                                                    setPushActionLoading(false);
+                                                }
+                                            }}
+                                            disabled={pushActionLoading}
+                                            className="inline-flex items-center rounded-xl border border-red-200 bg-red-50 px-5 py-2.5 text-sm font-semibold text-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            Revoke this browser
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
 
                             <div className="mt-6 rounded-xl border border-[var(--color-card-border)] bg-white p-4 space-y-4">
@@ -790,7 +1064,7 @@ export default function ProfilePage() {
                                     <div>
                                         <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Channels</label>
                                         <div className="flex flex-wrap gap-3 rounded-lg border border-[var(--color-card-border)] px-3 py-2">
-                                            {['email', 'desktop'].map((channel) => (
+                                            {['email', 'push', 'desktop'].map((channel) => (
                                                 <label key={channel} className="flex items-center gap-2 text-xs text-[var(--color-text-primary)]">
                                                     <input type="checkbox" checked={quietHoursState.channels.includes(channel)} onChange={(event) => setQuietHoursState((prev) => ({ ...prev, channels: event.target.checked ? [...new Set([...prev.channels, channel])] : prev.channels.filter((item) => item !== channel) }))} className="w-4 h-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]" />
                                                     {channel}

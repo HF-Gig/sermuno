@@ -176,9 +176,19 @@ export class CalendarService {
           },
         );
       }
+      await this.calendarSync.syncEventToCalDavIfConnected({
+        eventId: createdEvent.id,
+        userId: user.sub,
+        organizationId: user.organizationId,
+      });
     }
 
-    return createdEvent;
+    if (!createdEvent) return createdEvent;
+
+    return this.prisma.event.findUnique({
+      where: { id: createdEvent.id },
+      include: { attendees: true },
+    });
   }
 
   async findOne(id: string, user: JwtUser) {
@@ -342,11 +352,30 @@ export class CalendarService {
         },
       );
     }
-    return finalUpdated;
+    if (!finalUpdated) return finalUpdated;
+
+    await this.calendarSync.syncEventToCalDavIfConnected({
+      eventId: finalUpdated.id,
+      userId: user.sub,
+      organizationId: user.organizationId,
+    });
+
+    return this.prisma.event.findUnique({
+      where: { id: finalUpdated.id },
+      include: { attendees: true },
+    });
   }
 
   async remove(id: string, user: JwtUser) {
     const event = await this.findOne(id, user);
+    await this.calendarSync.deleteEventFromCalDavIfConnected({
+      event: {
+        id: event.id,
+        externalId: event.externalId,
+        provider: event.provider,
+      },
+      userId: user.sub,
+    });
     await this.prisma.eventAttendee.deleteMany({ where: { eventId: id } });
     await this.prisma.event.delete({ where: { id } });
     await this.auditLog(
@@ -786,9 +815,9 @@ export class CalendarService {
   }
 
   async syncCalDav(
-    calDavUrl: string,
-    username: string,
-    password: string,
+    calDavUrl: string | undefined,
+    username: string | undefined,
+    password: string | undefined,
     user: JwtUser,
   ) {
     return this.calendarSync.syncCalDav({

@@ -11,6 +11,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import * as path from 'path';
 import { PrismaService } from '../../database/prisma.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import { AttachmentScanService } from '../attachments/attachment-scan.service';
 import type {
   ListMessagesDto,
   BulkReadDto,
@@ -19,9 +20,10 @@ import type {
 } from './dto/message.dto';
 import { EMAIL_SEND_QUEUE } from '../../jobs/queues/email-send.queue';
 import { SCHEDULED_MESSAGES_QUEUE } from '../../jobs/queues/scheduled-messages.queue';
-import { MessageDirection, Prisma } from '@prisma/client';
+import { AttachmentScanStatus, MessageDirection, Prisma } from '@prisma/client';
 import type { EmailSendJobData } from '../../jobs/processors/email-send.processor';
 import type { ScheduledMessageJobData } from '../../jobs/processors/scheduled-messages.processor';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class MessagesService {
@@ -30,10 +32,12 @@ export class MessagesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly attachmentScan: AttachmentScanService,
     @InjectQueue(EMAIL_SEND_QUEUE)
     private readonly emailSendQueue: Queue<EmailSendJobData>,
     @InjectQueue(SCHEDULED_MESSAGES_QUEUE)
     private readonly scheduledQueue: Queue<ScheduledMessageJobData>,
+    private readonly notifications: NotificationsService,
   ) {
     const storageType =
       this.configService.get<string>('attachment.storageType') ?? 'local';
@@ -74,6 +78,7 @@ export class MessagesService {
       take: limit + 1,
       include: {
         attachments: {
+          where: this.getVisibleAttachmentWhere(),
           select: {
             id: true,
             filename: true,
@@ -101,7 +106,9 @@ export class MessagesService {
         deletedAt: null,
       },
       include: {
-        attachments: true,
+        attachments: {
+          where: this.getVisibleAttachmentWhere(),
+        },
         folder: { select: { id: true, name: true } },
       },
     });
@@ -147,6 +154,17 @@ export class MessagesService {
     if (!mailbox) throw new NotFoundException('Mailbox not found');
 
     let threadId = dto.threadId;
+    let existingThreadAssignee: string | null = null;
+    if (threadId) {
+      const existingThread = await this.prisma.thread.findFirst({
+        where: {
+          id: threadId,
+          organizationId: user.organizationId,
+        },
+        select: { assignedUserId: true, subject: true },
+      });
+      existingThreadAssignee = existingThread?.assignedUserId ?? null;
+    }
     if (!threadId) {
       // Create a new thread
       const thread = await this.prisma.thread.create({
@@ -225,6 +243,25 @@ export class MessagesService {
       );
     }
 
+    if (dto.threadId && existingThreadAssignee && existingThreadAssignee !== user.sub) {
+      await this.notifications
+        .dispatch({
+          userId: existingThreadAssignee,
+          organizationId: user.organizationId,
+          type: 'thread_reply',
+          title: 'A reply was sent on an assigned thread',
+          message: `${user.email} replied in thread ${threadId}`,
+          resourceId: threadId,
+          data: {
+            threadId,
+            mailboxId: dto.mailboxId,
+            assignedToUserId: existingThreadAssignee,
+            repliedByUserId: user.sub,
+          },
+        })
+        .catch(() => undefined);
+    }
+
     return message;
   }
 
@@ -240,10 +277,12 @@ export class MessagesService {
       attachmentId,
       user,
     );
-    const url = await this.buildDownloadUrl(
-      attachment.storageKey,
-      attachment.filename,
-    );
+    const approvedAttachment =
+      await this.attachmentScan.ensureAttachmentDownloadAllowed(
+        attachment,
+        user.sub,
+      );
+    const url = await this.buildDownloadUrl(approvedAttachment);
     return { url, expiresIn: 3600 };
   }
 
@@ -257,17 +296,20 @@ export class MessagesService {
       attachmentId,
       user,
     );
-    const url = await this.buildDownloadUrl(
-      attachment.storageKey,
-      attachment.filename,
-    );
+    const approvedAttachment =
+      await this.attachmentScan.ensureAttachmentDownloadAllowed(
+        attachment,
+        user.sub,
+      );
+    const url = await this.buildDownloadUrl(approvedAttachment);
     return { url };
   }
 
-  private async buildDownloadUrl(
-    storageKey: string,
-    filename: string,
-  ): Promise<string> {
+  private async buildDownloadUrl(attachment: {
+    id: string;
+    storageKey: string;
+    filename: string;
+  }): Promise<string> {
     const storageType =
       this.configService.get<string>('attachment.storageType') ?? 'local';
 
@@ -276,14 +318,13 @@ export class MessagesService {
         this.configService.get<string>('attachment.s3Bucket') ?? '';
       const cmd = new GetObjectCommand({
         Bucket: bucket,
-        Key: storageKey,
-        ResponseContentDisposition: `attachment; filename="${filename}"`,
+        Key: attachment.storageKey,
+        ResponseContentDisposition: `attachment; filename="${attachment.filename}"`,
       });
       return getSignedUrl(this.s3, cmd, { expiresIn: 3600 });
     }
 
-    // Local storage: return a path relative to /attachments
-    return `/attachments/${encodeURIComponent(storageKey)}`;
+    return `/attachments/${encodeURIComponent(attachment.id)}/download`;
   }
 
   private async assertAttachmentAccess(
@@ -297,5 +338,14 @@ export class MessagesService {
     });
     if (!attachment) throw new NotFoundException('Attachment not found');
     return attachment;
+  }
+
+  private getVisibleAttachmentWhere(): Prisma.AttachmentWhereInput {
+    return {
+      quarantinedAt: null,
+      scanStatus: {
+        in: [AttachmentScanStatus.UNSCANNED, AttachmentScanStatus.CLEAN],
+      },
+    };
   }
 }

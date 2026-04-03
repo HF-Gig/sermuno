@@ -14,6 +14,8 @@ import {
   UpdateNotificationSettingsDto,
   UpdateOrganizationNotificationSettingsDto,
   UpdateQuietHoursDto,
+  PushTokenDto,
+  RevokePushTokenDto,
 } from './dto/notification.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
@@ -85,5 +87,29 @@ export class NotificationsController {
     @CurrentUser() user: JwtUser,
   ) {
     return this.notificationsService.updateOrganizationSettings(dto, user);
+  }
+
+  @Get('push/config')
+  @RequirePermission('organization:view')
+  getPushConfig(@CurrentUser() user: JwtUser) {
+    return this.notificationsService.getPushConfig(user);
+  }
+
+  @Get('push/registrations')
+  @RequirePermission('organization:view')
+  listPushRegistrations(@CurrentUser() user: JwtUser) {
+    return this.notificationsService.listPushRegistrations(user);
+  }
+
+  @Post('push/register')
+  @RequirePermission('organization:view')
+  registerPush(@Body() dto: PushTokenDto, @CurrentUser() user: JwtUser) {
+    return this.notificationsService.registerPush(dto, user);
+  }
+
+  @Post('push/revoke')
+  @RequirePermission('organization:view')
+  revokePush(@Body() dto: RevokePushTokenDto, @CurrentUser() user: JwtUser) {
+    return this.notificationsService.revokePush(dto, user);
   }
 }

@@ -196,7 +196,8 @@ export class CalendarController {
   @Post('sync/caldav')
   @RequirePermission('calendar:manage')
   syncCalDav(
-    @Body() body: { calDavUrl: string; username: string; password: string },
+    @Body()
+    body: { calDavUrl?: string; username?: string; password?: string },
     @CurrentUser() user: JwtUser,
   ) {
     return this.calendarService.syncCalDav(

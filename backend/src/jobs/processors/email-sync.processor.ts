@@ -1,5 +1,6 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Job } from 'bullmq';
 import { ImapFlow } from 'imapflow';
 import * as crypto from 'crypto';
@@ -9,6 +10,11 @@ import { PrismaService } from '../../database/prisma.service';
 import { CrmService } from '../../modules/crm/crm.service';
 import type { Prisma } from '@prisma/client';
 import { EventsGateway } from '../../modules/websockets/events.gateway';
+import {
+  resolveEmailSyncProviderPolicy,
+  sharedEmailSyncRateLimiter,
+  type EmailSyncProviderPolicy,
+} from './email-sync-provider-policy';
 
 export interface EmailSyncJobData {
   mailboxId: string;
@@ -60,6 +66,7 @@ export class EmailSyncProcessor extends WorkerHost {
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
     @Optional() private readonly crmService: CrmService | null,
     @Optional() private readonly eventsGateway: EventsGateway | null,
   ) {
@@ -82,6 +89,14 @@ export class EmailSyncProcessor extends WorkerHost {
       );
       return;
     }
+
+    const providerSyncPolicy = resolveEmailSyncProviderPolicy(
+      this.configService,
+      mailbox,
+    );
+    this.logger.log(
+      `[email-sync] mailbox=${mailboxId} provider=${providerSyncPolicy.label} batch=${providerSyncPolicy.batchSize} delayMs=${providerSyncPolicy.delayMs} cap=${providerSyncPolicy.rateLimit.capacity} refill=${providerSyncPolicy.rateLimit.refillPerSecond}/s`,
+    );
 
     const imapHost =
       mailbox.imapHost ||
@@ -212,6 +227,7 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         effectiveToken,
         streamingMode ?? false,
+        providerSyncPolicy,
       );
       if (outlookSynced) {
         await this.prisma.mailbox.update({
@@ -257,12 +273,14 @@ export class EmailSyncProcessor extends WorkerHost {
     });
 
     try {
+      await this.acquireProviderRequestSlot(providerSyncPolicy);
       await client.connect();
       await this.syncAllFolders(
         client,
         mailboxId,
         organizationId,
         streamingMode ?? false,
+        providerSyncPolicy,
       );
 
       await this.prisma.mailbox.update({
@@ -310,6 +328,29 @@ export class EmailSyncProcessor extends WorkerHost {
     } finally {
       await client.logout().catch(() => undefined);
     }
+  }
+
+  private async acquireProviderRequestSlot(
+    providerSyncPolicy: EmailSyncProviderPolicy,
+  ): Promise<void> {
+    await sharedEmailSyncRateLimiter.acquire(
+      providerSyncPolicy.key,
+      providerSyncPolicy,
+    );
+  }
+
+  private resolveFetchBatchSize(
+    providerSyncPolicy: EmailSyncProviderPolicy,
+    streamingMode: boolean,
+  ): number {
+    if (streamingMode) {
+      return Math.max(
+        1,
+        Math.min(providerSyncPolicy.batchSize, STREAM_CHUNK_SIZE),
+      );
+    }
+
+    return Math.max(1, providerSyncPolicy.batchSize);
   }
 
   private async markMailboxSyncFailed(
@@ -571,59 +612,60 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     accessToken: string,
     streamingMode: boolean,
+    providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<boolean> {
     const apiHeaders = {
       Authorization: `Bearer ${accessToken}`,
       Accept: 'application/json',
     };
+    const pageSize = Math.max(1, Math.min(providerSyncPolicy.batchSize, 1000));
 
     const apiCandidates = [
       {
         name: 'graph',
-        folderUrl:
-          'https://graph.microsoft.com/v1.0/me/mailFolders?$top=50&$select=id,displayName',
-        messagesUrl: (folderId: string) =>
+        folderUrl: (top: number) =>
+          `https://graph.microsoft.com/v1.0/me/mailFolders?$top=${top}&$select=id,displayName`,
+        messagesUrl: (folderId: string, top: number) =>
           `https://graph.microsoft.com/v1.0/me/mailFolders/${encodeURIComponent(folderId)}/messages` +
-          '?$top=50&$orderby=receivedDateTime%20desc',
+          `?$top=${top}&$orderby=receivedDateTime%20desc`,
       },
       {
         name: 'outlook-rest',
-        folderUrl: 'https://outlook.office.com/api/v2.0/me/mailfolders?$top=50',
-        messagesUrl: (folderId: string) =>
+        folderUrl: (top: number) =>
+          `https://outlook.office.com/api/v2.0/me/mailfolders?$top=${top}`,
+        messagesUrl: (folderId: string, top: number) =>
           `https://outlook.office.com/api/v2.0/me/mailfolders/${encodeURIComponent(folderId)}/messages` +
-          '?$top=50&$orderby=DateTimeReceived%20desc',
+          `?$top=${top}&$orderby=DateTimeReceived%20desc`,
       },
     ];
 
     for (const candidate of apiCandidates) {
-      const foldersRes = await fetch(candidate.folderUrl, {
-        headers: apiHeaders,
-      });
-      if (!foldersRes.ok) {
-        const body = await foldersRes.text();
-        this.logger.warn(
-          `[email-sync] ${candidate.name} folders read failed mailbox=${mailboxId} status=${foldersRes.status}: ${body.slice(0, 260)}`,
-        );
-        continue;
-      }
-
-      const foldersJson = (await foldersRes.json()) as {
-        value?: Array<{
+      const folderRows: Array<{ id: string; displayName: string }> = [];
+      try {
+        for await (const folderPage of this.iterateOutlookApiCollection<{
           id?: string;
           displayName?: string;
           Id?: string;
           DisplayName?: string;
-        }>;
-      };
-
-      const folderRows = (foldersJson.value ?? [])
-        .map((folder) => ({
-          id: String(folder.id ?? folder.Id ?? '').trim(),
-          displayName: String(
-            folder.displayName ?? folder.DisplayName ?? '',
-          ).trim(),
-        }))
-        .filter((folder) => folder.id && folder.displayName);
+        }>(candidate.folderUrl(pageSize), apiHeaders, providerSyncPolicy)) {
+          folderRows.push(
+            ...folderPage
+              .map((folder) => ({
+                id: String(folder.id ?? folder.Id ?? '').trim(),
+                displayName: String(
+                  folder.displayName ?? folder.DisplayName ?? '',
+                ).trim(),
+              }))
+              .filter((folder) => folder.id && folder.displayName),
+          );
+        }
+      } catch (err) {
+        const { status, body } = this.outlookApiErrorDetails(err);
+        this.logger.warn(
+          `[email-sync] ${candidate.name} folders read failed mailbox=${mailboxId} status=${status}: ${body.slice(0, 260)}`,
+        );
+        continue;
+      }
 
       if (folderRows.length === 0) {
         this.logger.warn(
@@ -679,43 +721,43 @@ export class EmailSyncProcessor extends WorkerHost {
           });
         }
 
-        const messagesRes = await fetch(candidate.messagesUrl(folder.id), {
-          headers: apiHeaders,
-        });
-        if (!messagesRes.ok) {
-          const body = await messagesRes.text();
+        let createdCount = 0;
+        try {
+          for await (const messagePage of this.iterateOutlookApiCollection<
+            Record<string, unknown>
+          >(
+            candidate.messagesUrl(folder.id, pageSize),
+            apiHeaders,
+            providerSyncPolicy,
+          )) {
+            const chunks = streamingMode
+              ? chunkArray(messagePage, STREAM_CHUNK_SIZE)
+              : [messagePage];
+
+            for (const chunk of chunks) {
+              for (const message of chunk) {
+                const created = await this.upsertOutlookApiMessage(
+                  message,
+                  mailboxId,
+                  organizationId,
+                  mailboxFolder.id,
+                  folder.folderType,
+                );
+                if (created) createdCount += 1;
+              }
+              if (streamingMode) await sleep(STREAM_DELAY_MS);
+            }
+          }
+        } catch (err) {
+          const { status, body } = this.outlookApiErrorDetails(err);
           this.logger.warn(
-            `[email-sync] ${candidate.name} messages read failed mailbox=${mailboxId} folder=${folder.displayName} status=${messagesRes.status}: ${body.slice(0, 260)}`,
+            `[email-sync] ${candidate.name} messages read failed mailbox=${mailboxId} folder=${folder.displayName} status=${status}: ${body.slice(0, 260)}`,
           );
           await this.prisma.mailboxFolder.update({
             where: { id: mailboxFolder.id },
             data: { syncStatus: 'FAILED' },
           });
           continue;
-        }
-
-        const messagesJson = (await messagesRes.json()) as {
-          value?: Array<Record<string, unknown>>;
-        };
-
-        const messages = messagesJson.value ?? [];
-        const chunks = streamingMode
-          ? chunkArray(messages, STREAM_CHUNK_SIZE)
-          : [messages];
-        let createdCount = 0;
-
-        for (const chunk of chunks) {
-          for (const message of chunk) {
-            const created = await this.upsertOutlookApiMessage(
-              message,
-              mailboxId,
-              organizationId,
-              mailboxFolder.id,
-              folder.folderType,
-            );
-            if (created) createdCount += 1;
-          }
-          if (streamingMode) await sleep(STREAM_DELAY_MS);
         }
 
         await this.prisma.mailboxFolder.update({
@@ -737,6 +779,61 @@ export class EmailSyncProcessor extends WorkerHost {
     }
 
     return false;
+  }
+
+  private async *iterateOutlookApiCollection<T>(
+    initialUrl: string,
+    headers: Record<string, string>,
+    providerSyncPolicy: EmailSyncProviderPolicy,
+  ): AsyncGenerator<T[]> {
+    let nextUrl: string | null = initialUrl;
+
+    while (nextUrl) {
+      await this.acquireProviderRequestSlot(providerSyncPolicy);
+      const response = await fetch(nextUrl, { headers });
+      if (!response.ok) {
+        throw {
+          status: response.status,
+          body: await response.text(),
+        };
+      }
+
+      const payload = (await response.json()) as {
+        value?: T[];
+        '@odata.nextLink'?: string;
+        nextLink?: string;
+      } & Record<string, unknown>;
+
+      yield payload.value ?? [];
+
+      nextUrl = String(
+        payload['@odata.nextLink'] ??
+          payload['odata.nextLink'] ??
+          payload.nextLink ??
+          '',
+      ).trim();
+      if (!nextUrl) {
+        nextUrl = null;
+      }
+    }
+  }
+
+  private outlookApiErrorDetails(err: unknown): {
+    status: string;
+    body: string;
+  } {
+    if (!err || typeof err !== 'object') {
+      return {
+        status: 'unknown',
+        body: String(err),
+      };
+    }
+
+    const error = err as { status?: number | string; body?: string };
+    return {
+      status: String(error.status ?? 'unknown'),
+      body: String(error.body ?? ''),
+    };
   }
 
   private async upsertOutlookApiMessage(
@@ -922,8 +1019,10 @@ export class EmailSyncProcessor extends WorkerHost {
     mailboxId: string,
     organizationId: string,
     streamingMode: boolean,
+    providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<void> {
     // List all IMAP folders
+    await this.acquireProviderRequestSlot(providerSyncPolicy);
     const folderList = await client.list();
     this.logger.log(
       `[email-sync] mailbox=${mailboxId} found ${folderList.length} IMAP folders`,
@@ -959,6 +1058,7 @@ export class EmailSyncProcessor extends WorkerHost {
           path,
           type,
           streamingMode,
+          providerSyncPolicy,
         );
       } catch (err) {
         // Log but don't abort — continue with other folders
@@ -976,9 +1076,11 @@ export class EmailSyncProcessor extends WorkerHost {
     folderPath: string,
     folderType: string,
     streamingMode: boolean,
+    providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<void> {
     let lock: { release: () => void } | null = null;
     try {
+      await this.acquireProviderRequestSlot(providerSyncPolicy);
       lock = await client.getMailboxLock(folderPath);
     } catch (err) {
       this.logger.warn(
@@ -1022,48 +1124,38 @@ export class EmailSyncProcessor extends WorkerHost {
         });
       }
 
-      const messages: Array<{
-        uid: number;
-        envelope: {
-          messageId?: string;
-          subject?: string;
-          from?: Array<{ address?: string; name?: string }>;
-          to?: Array<{ address?: string }>;
-          date?: Date;
-          inReplyTo?: string;
-        };
-        source?: Buffer;
-      }> = [];
-
-      const collectMessages = async (range: string) => {
-        for await (const msg of client.fetch(range, {
-          uid: true,
-          envelope: true,
-          source: true,
-        })) {
-          messages.push({
-            uid: msg.uid,
-            envelope: msg.envelope as (typeof messages)[0]['envelope'],
-            source: msg.source,
-          });
-        }
-      };
+      let messageUids: number[] = [];
 
       try {
-        await collectMessages(`${lastUidNext}:*`);
+        await this.acquireProviderRequestSlot(providerSyncPolicy);
+        const incrementalSearch = await client.search(
+          { uid: `${lastUidNext}:*` },
+          { uid: true },
+        );
+        const incrementalUids = Array.isArray(incrementalSearch)
+          ? incrementalSearch
+          : [];
+        messageUids = [...incrementalUids].sort((left, right) => left - right);
       } catch {
         this.logger.warn(
           `[email-sync] mailbox=${mailboxId} folder=${folderPath} incremental fetch failed; retrying full scan`,
         );
-        messages.length = 0;
-        await collectMessages('1:*');
+        await this.acquireProviderRequestSlot(providerSyncPolicy);
+        const fullScanSearch = await client.search(
+          { all: true },
+          { uid: true },
+        );
+        const fullScanUids = Array.isArray(fullScanSearch)
+          ? fullScanSearch
+          : [];
+        messageUids = [...fullScanUids].sort((left, right) => left - right);
       }
 
       this.logger.log(
-        `[email-sync] mailbox=${mailboxId} folder=${folderPath} fetched ${messages.length} new messages`,
+        `[email-sync] mailbox=${mailboxId} folder=${folderPath} fetched ${messageUids.length} new messages`,
       );
 
-      if (messages.length === 0) {
+      if (messageUids.length === 0) {
         await this.prisma.mailboxFolder.update({
           where: { id: folder.id },
           data: { syncStatus: 'SUCCESS', lastSyncedAt: new Date() },
@@ -1071,24 +1163,64 @@ export class EmailSyncProcessor extends WorkerHost {
         return;
       }
 
-      const chunks = streamingMode
-        ? chunkArray(messages, STREAM_CHUNK_SIZE)
-        : [messages];
+      const fetchBatchSize = this.resolveFetchBatchSize(
+        providerSyncPolicy,
+        streamingMode,
+      );
+      const uidBatches = chunkArray(messageUids, fetchBatchSize);
+      let processedCount = 0;
 
-      for (const chunk of chunks) {
-        for (const msg of chunk) {
-          await this.upsertMessage(
-            msg,
-            mailboxId,
-            organizationId,
-            folder.id,
-            folderType,
-          );
+      for (const uidBatch of uidBatches) {
+        const fetchedMessages: Array<{
+          uid: number;
+          envelope: {
+            messageId?: string;
+            subject?: string;
+            from?: Array<{ address?: string; name?: string }>;
+            to?: Array<{ address?: string }>;
+            date?: Date;
+            inReplyTo?: string;
+          };
+          source?: Buffer;
+        }> = [];
+
+        await this.acquireProviderRequestSlot(providerSyncPolicy);
+        for await (const msg of client.fetch(
+          uidBatch,
+          {
+            uid: true,
+            envelope: true,
+            source: true,
+          },
+          { uid: true },
+        )) {
+          fetchedMessages.push({
+            uid: msg.uid,
+            envelope: msg.envelope as (typeof fetchedMessages)[0]['envelope'],
+            source: msg.source,
+          });
         }
-        if (streamingMode) await sleep(STREAM_DELAY_MS);
+
+        const chunks = streamingMode
+          ? chunkArray(fetchedMessages, STREAM_CHUNK_SIZE)
+          : [fetchedMessages];
+
+        for (const chunk of chunks) {
+          for (const msg of chunk) {
+            await this.upsertMessage(
+              msg,
+              mailboxId,
+              organizationId,
+              folder.id,
+              folderType,
+            );
+            processedCount += 1;
+          }
+          if (streamingMode) await sleep(STREAM_DELAY_MS);
+        }
       }
 
-      const maxUid = Math.max(...messages.map((m) => m.uid));
+      const maxUid = Math.max(...messageUids);
       await this.prisma.mailboxFolder.update({
         where: { id: folder.id },
         data: {
@@ -1099,11 +1231,11 @@ export class EmailSyncProcessor extends WorkerHost {
               : undefined,
           syncStatus: 'SUCCESS',
           lastSyncedAt: new Date(),
-          messageCount: { increment: messages.length },
+          messageCount: { increment: processedCount },
         },
       });
     } finally {
-      lock.release();
+      lock?.release();
     }
   }
 

@@ -8,88 +8,93 @@ datasource db {
 }
 
 model Organization {
-  id                   String             @id @default(uuid())
-  name                 String
-  createdAt            DateTime           @default(now())
-  updatedAt            DateTime           @updatedAt
-  stripeCustomerId     String?
-  stripeSubscriptionId String?
-  maxMailboxes         Int                @default(1)
-  maxUsers             Int                @default(1)
-  maxStorageGb         Int                @default(1)
-  defaultTimezone      String             @default("UTC")
-  defaultLocale        String             @default("en")
-  emailFooter          String?
-  enforceMfa           Boolean            @default(false)
-  logoUrl              String?
-  notificationSettings Json?              @default("{}")
-  plan                 PlanTier           @default(trial)
-  subscriptionStatus   SubscriptionStatus @default(active)
-  companies            Company[]
-  contacts             Contact[]
-  emailTemplates       EmailTemplate[]
-  calendarTemplates    CalendarTemplate[]
-  events               Event[]
-  mailboxes            Mailbox[]
-  rules                Rule[]
-  signatures           Signature[]
-  slaPolicies          SlaPolicy[]
-  tags                 Tag[]
-  teams                Team[]
-  Thread               Thread[]
-  auditLogs            AuditLog[]
-  scheduledMessages    ScheduledMessage[]
-  threadNotes          ThreadNote[]
-  users                User[]
-  webhooks             Webhook[]
-  exportJobs           ExportJob[]
-  importJobs           ImportJob[]
+  id                      String                   @id @default(uuid())
+  name                    String
+  createdAt               DateTime                 @default(now())
+  updatedAt               DateTime                 @updatedAt
+  stripeCustomerId        String?
+  stripeSubscriptionId    String?
+  maxMailboxes            Int                      @default(1)
+  maxUsers                Int                      @default(1)
+  maxStorageGb            Int                      @default(1)
+  defaultTimezone         String                   @default("UTC")
+  defaultLocale           String                   @default("en")
+  emailFooter             String?
+  enforceMfa              Boolean                  @default(false)
+  logoUrl                 String?
+  notificationSettings    Json?                    @default("{}")
+  plan                    PlanTier                 @default(trial)
+  subscriptionStatus      SubscriptionStatus       @default(active)
+  companies               Company[]
+  contacts                Contact[]
+  emailTemplates          EmailTemplate[]
+  calendarTemplates       CalendarTemplate[]
+  events                  Event[]
+  mailboxes               Mailbox[]
+  rules                   Rule[]
+  signatures              Signature[]
+  slaPolicies             SlaPolicy[]
+  tags                    Tag[]
+  teams                   Team[]
+  Thread                  Thread[]
+  auditLogs               AuditLog[]
+  scheduledMessages       ScheduledMessage[]
+  threadNotes             ThreadNote[]
+  users                   User[]
+  webhooks                Webhook[]
+  exportJobs              ExportJob[]
+  importJobs              ImportJob[]
   notificationPreferences NotificationPreference[]
+  pushRegistrations       PushRegistration[]
+  notificationDigestItems NotificationDigestItem[]
 
   @@map("organizations")
 }
 
 model User {
-  id              String          @id @default(uuid())
-  organizationId  String
-  email           String          @unique
-  passwordHash    String
-  fullName        String
-  role            UserRole        @default(USER)
-  emailVerified   Boolean         @default(false)
-  mfaEnabled      Boolean         @default(false)
-  isActive        Boolean         @default(true)
-  deletedAt       DateTime?
-  timezone        String          @default("UTC")
-  locale          String          @default("en")
-  preferences     Json?
-  lastLogin       DateTime?       @map("last_login")
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
-  mfaSecret       String?
-  inviteToken     String?         @unique
-  inviteExpiresAt DateTime?
-  invitedByName   String?
-  avatarUrl       String?
-  provider        String          @default("email")
-  method          String          @default("email")
-  EventAttendee   EventAttendee[]
-  events          Event[]
-  notifications   Notification[]
-  refreshTokens   RefreshToken[]
-  scheduledMessages ScheduledMessage[]
-  teamMemberships TeamMember[]
-  assignedThreads Thread[]
-  auditLogs       AuditLog[]
-  createdTemplates EmailTemplate[]
+  id                       String                   @id @default(uuid())
+  organizationId           String
+  email                    String                   @unique
+  passwordHash             String
+  fullName                 String
+  role                     UserRole                 @default(USER)
+  emailVerified            Boolean                  @default(false)
+  mfaEnabled               Boolean                  @default(false)
+  isActive                 Boolean                  @default(true)
+  deletedAt                DateTime?
+  timezone                 String                   @default("UTC")
+  locale                   String                   @default("en")
+  preferences              Json?
+  lastLogin                DateTime?                @map("last_login")
+  createdAt                DateTime                 @default(now())
+  updatedAt                DateTime                 @updatedAt
+  mfaSecret                String?
+  inviteToken              String?                  @unique
+  inviteExpiresAt          DateTime?
+  invitedByName            String?
+  avatarUrl                String?
+  provider                 String                   @default("email")
+  method                   String                   @default("email")
+  EventAttendee            EventAttendee[]
+  events                   Event[]
+  notifications            Notification[]
+  refreshTokens            RefreshToken[]
+  scheduledMessages        ScheduledMessage[]
+  teamMemberships          TeamMember[]
+  assignedThreads          Thread[]
+  auditLogs                AuditLog[]
+  createdTemplates         EmailTemplate[]
   createdCalendarTemplates CalendarTemplate[]
-  mailboxAccess   MailboxAccess[]
-  rules           Rule[]
-  threadNotes     ThreadNote[]
-  exportJobs      ExportJob[]
-  importJobs      ImportJob[]
-  notificationPreferences NotificationPreference[]
-  organization    Organization    @relation(fields: [organizationId], references: [id])
+  mailboxAccess            MailboxAccess[]
+  rules                    Rule[]
+  threadNotes              ThreadNote[]
+  mentionedInThreadNotes   ThreadNoteMention[]      @relation("ThreadNoteMentionedUser")
+  exportJobs               ExportJob[]
+  importJobs               ImportJob[]
+  notificationPreferences  NotificationPreference[]
+  pushRegistrations        PushRegistration[]
+  notificationDigestItems  NotificationDigestItem[]
+  organization             Organization             @relation(fields: [organizationId], references: [id])
 
   @@index([organizationId, deletedAt])
   @@map("users")
@@ -112,79 +117,79 @@ model RefreshToken {
 }
 
 model Team {
-  id              String          @id @default(uuid())
-  organizationId  String
-  name            String
-  description     String?
-  deletedAt       DateTime?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
-  members         TeamMember[]
-  mailboxAccess   MailboxAccess[]
-  emailTemplates  EmailTemplate[]
+  id                String             @id @default(uuid())
+  organizationId    String
+  name              String
+  description       String?
+  deletedAt         DateTime?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  members           TeamMember[]
+  mailboxAccess     MailboxAccess[]
+  emailTemplates    EmailTemplate[]
   calendarTemplates CalendarTemplate[]
-  organization    Organization    @relation(fields: [organizationId], references: [id])
-  assignedThreads Thread[]
-  rules           Rule[]
+  organization      Organization       @relation(fields: [organizationId], references: [id])
+  assignedThreads   Thread[]
+  rules             Rule[]
 
   @@index([organizationId, deletedAt])
   @@map("teams")
 }
 
 model TeamMember {
-  id     String @id @default(uuid())
+  id     String   @id @default(uuid())
   userId String
   teamId String
   role   TeamRole @default(member)
-  team   Team   @relation(fields: [teamId], references: [id])
-  user   User   @relation(fields: [userId], references: [id])
+  team   Team     @relation(fields: [teamId], references: [id])
+  user   User     @relation(fields: [userId], references: [id])
 
   @@unique([userId, teamId])
   @@map("team_members")
 }
 
 model Mailbox {
-  id                   String          @id @default(uuid())
-  organizationId       String
-  email                String?
-  name                 String
-  provider             MailboxProvider
-  smtpUser             String?
-  smtpPass             String?
-  imapUser             String?
-  imapPass             String?
-  lastSyncAt           DateTime?
-  createdAt            DateTime        @default(now())
-  updatedAt            DateTime        @updatedAt
-  imapHost             String?
-  imapPort             Int?            @default(993)
-  imapSecure           Boolean         @default(true)
-  smtpHost             String?
-  smtpPort             Int?            @default(587)
-  smtpSecure           Boolean         @default(true)
-  googleAccessToken    String?
-  googleRefreshToken   String?
-  googleTokenExpiresAt DateTime?
-  oauthProvider        String?
-  oauthAccessToken     String?
-  oauthRefreshToken    String?
-  oauthTokenExpiresAt  DateTime?
-  syncStatus           SyncStatus      @default(PENDING)
-  healthStatus         HealthStatus    @default(unknown)
-  readStateMode        ReadStateMode   @default(personal)
-  nextRetryAt          DateTime?
-  syncErrorCount       Int             @default(0)
-  lastSyncError        String?
+  id                        String             @id @default(uuid())
+  organizationId            String
+  email                     String?
+  name                      String
+  provider                  MailboxProvider
+  smtpUser                  String?
+  smtpPass                  String?
+  imapUser                  String?
+  imapPass                  String?
+  lastSyncAt                DateTime?
+  createdAt                 DateTime           @default(now())
+  updatedAt                 DateTime           @updatedAt
+  imapHost                  String?
+  imapPort                  Int?               @default(993)
+  imapSecure                Boolean            @default(true)
+  smtpHost                  String?
+  smtpPort                  Int?               @default(587)
+  smtpSecure                Boolean            @default(true)
+  googleAccessToken         String?
+  googleRefreshToken        String?
+  googleTokenExpiresAt      DateTime?
+  oauthProvider             String?
+  oauthAccessToken          String?
+  oauthRefreshToken         String?
+  oauthTokenExpiresAt       DateTime?
+  syncStatus                SyncStatus         @default(PENDING)
+  healthStatus              HealthStatus       @default(unknown)
+  readStateMode             ReadStateMode      @default(personal)
+  nextRetryAt               DateTime?
+  syncErrorCount            Int                @default(0)
+  lastSyncError             String?
   organizationMailAccountId String?
-  deletedAt            DateTime?
-  folders              MailboxFolder[]
-  mailboxAccess        MailboxAccess[]
-  messages             Message[]
-  organization         Organization    @relation(fields: [organizationId], references: [id])
-  scheduledMessages    ScheduledMessage[]
-  signatures           Signature[]
-  threads              Thread[]
-  rules                Rule[]
+  deletedAt                 DateTime?
+  folders                   MailboxFolder[]
+  mailboxAccess             MailboxAccess[]
+  messages                  Message[]
+  organization              Organization       @relation(fields: [organizationId], references: [id])
+  scheduledMessages         ScheduledMessage[]
+  signatures                Signature[]
+  threads                   Thread[]
+  rules                     Rule[]
 
   @@index([organizationId])
   @@map("mailboxes")
@@ -194,11 +199,11 @@ model MailboxFolder {
   id            String     @id @default(uuid())
   mailboxId     String
   name          String
-  type          String?    // e.g. "inbox", "sent", "drafts", "trash", "spam", "custom"
+  type          String? // e.g. "inbox", "sent", "drafts", "trash", "spam", "custom"
   uidValidity   BigInt?
   uidNext       BigInt?
   highestModSeq BigInt?
-  parentId      String?    // for nested folder hierarchy
+  parentId      String? // for nested folder hierarchy
   messageCount  Int        @default(0)
   unreadCount   Int        @default(0)
   syncStatus    SyncStatus @default(PENDING)
@@ -231,38 +236,38 @@ model MailboxAccess {
 }
 
 model Thread {
-  id               String         @id @default(uuid())
-  mailboxId        String
-  organizationId   String
-  contactId        String?
-  companyId        String?
-  assignedUserId   String?
-  assignedToTeamId String?        @map("assignedTeamId")
-  slaPolicyId      String?
-  subject          String
-  status           ThreadStatus   @default(NEW)
-  priority         ThreadPriority @default(NORMAL)
-  starred          Boolean        @default(false)
-  snoozedUntil     DateTime?
-  archivedAt       DateTime?
-  previousStatus   String?
-  firstResponseAt  DateTime?
+  id                 String             @id @default(uuid())
+  mailboxId          String
+  organizationId     String
+  contactId          String?
+  companyId          String?
+  assignedUserId     String?
+  assignedToTeamId   String?            @map("assignedTeamId")
+  slaPolicyId        String?
+  subject            String
+  status             ThreadStatus       @default(NEW)
+  priority           ThreadPriority     @default(NORMAL)
+  starred            Boolean            @default(false)
+  snoozedUntil       DateTime?
+  archivedAt         DateTime?
+  previousStatus     String?
+  firstResponseAt    DateTime?
   firstResponseDueAt DateTime?
-  resolutionDueAt  DateTime?
-  slaBreached      Boolean        @default(false)
-  createdAt        DateTime       @default(now())
-  updatedAt        DateTime       @updatedAt
-  messages         Message[]
-  tags             ThreadTag[]
-  assignedTeam     Team?          @relation(fields: [assignedToTeamId], references: [id])
-  assignedUser     User?          @relation(fields: [assignedUserId], references: [id])
-  company          Company?       @relation(fields: [companyId], references: [id])
-  contact          Contact?       @relation(fields: [contactId], references: [id])
-  mailbox          Mailbox        @relation(fields: [mailboxId], references: [id])
-  organization     Organization   @relation(fields: [organizationId], references: [id])
-  scheduledMessages ScheduledMessage[]
-  slaPolicy        SlaPolicy?     @relation(fields: [slaPolicyId], references: [id])
-  notes            ThreadNote[]
+  resolutionDueAt    DateTime?
+  slaBreached        Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  messages           Message[]
+  tags               ThreadTag[]
+  assignedTeam       Team?              @relation(fields: [assignedToTeamId], references: [id])
+  assignedUser       User?              @relation(fields: [assignedUserId], references: [id])
+  company            Company?           @relation(fields: [companyId], references: [id])
+  contact            Contact?           @relation(fields: [contactId], references: [id])
+  mailbox            Mailbox            @relation(fields: [mailboxId], references: [id])
+  organization       Organization       @relation(fields: [organizationId], references: [id])
+  scheduledMessages  ScheduledMessage[]
+  slaPolicy          SlaPolicy?         @relation(fields: [slaPolicyId], references: [id])
+  notes              ThreadNote[]
 
   @@index([organizationId, mailboxId, status])
   @@map("threads")
@@ -308,16 +313,31 @@ model Message {
 }
 
 model Attachment {
-  id          String   @id @default(uuid())
-  messageId   String
-  filename    String
-  contentType String?
-  sizeBytes   Int
-  storageKey  String
-  createdAt   DateTime @default(now())
-  message     Message  @relation(fields: [messageId], references: [id])
+  id                String               @id @default(uuid())
+  messageId         String
+  filename          String
+  contentType       String?
+  sizeBytes         Int
+  storageKey        String
+  scanStatus        AttachmentScanStatus @default(UNSCANNED)
+  scannerName       String?
+  scannerVersion    String?
+  scannedAt         DateTime?
+  scanFailureReason String?
+  malwareSignature  String?
+  quarantinedAt     DateTime?
+  createdAt         DateTime             @default(now())
+  message           Message              @relation(fields: [messageId], references: [id])
 
   @@map("attachments")
+}
+
+enum AttachmentScanStatus {
+  UNSCANNED
+  PENDING
+  CLEAN
+  INFECTED
+  FAILED
 }
 
 model Tag {
@@ -348,141 +368,141 @@ model ThreadTag {
 }
 
 model Contact {
-  id             String          @id @default(uuid())
-  organizationId String
-  companyId      String?
-  email          String
-  name           String?
-  fullName       String?
-  additionalEmails Json?        @default("[]")
-  lifecycleStage String         @default("lead")
-  phone          String?
-  phoneNumbers   Json?           @default("[]")
-  addresses      Json?           @default("[]")
-  socialProfiles Json?           @default("[]")
-  customFields   Json?           @default("{}")
+  id               String          @id @default(uuid())
+  organizationId   String
+  companyId        String?
+  email            String
+  name             String?
+  fullName         String?
+  additionalEmails Json?           @default("[]")
+  lifecycleStage   String          @default("lead")
+  phone            String?
+  phoneNumbers     Json?           @default("[]")
+  addresses        Json?           @default("[]")
+  socialProfiles   Json?           @default("[]")
+  customFields     Json?           @default("{}")
   assignedToUserId String?
-  source         String          @default("manual")
-  lastContactedAt DateTime?
-  avatarUrl      String?
-  deletedAt      DateTime?
-  createdAt      DateTime        @default(now())
-  updatedAt      DateTime        @updatedAt
-  company        Company?        @relation(fields: [companyId], references: [id])
-  organization   Organization    @relation(fields: [organizationId], references: [id])
-  eventAttendees EventAttendee[]
-  threads        Thread[]
+  source           String          @default("manual")
+  lastContactedAt  DateTime?
+  avatarUrl        String?
+  deletedAt        DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  company          Company?        @relation(fields: [companyId], references: [id])
+  organization     Organization    @relation(fields: [organizationId], references: [id])
+  eventAttendees   EventAttendee[]
+  threads          Thread[]
 
   @@unique([organizationId, email])
   @@map("contacts")
 }
 
 model Company {
-  id             String       @id @default(uuid())
-  organizationId String
-  name           String
-  domain         String?
-  primaryDomain  String?
-  additionalDomains Json?     @default("[]")
-  customFields   Json?        @default("{}")
-  logoUrl        String?
-  deletedAt      DateTime?
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  contacts       Contact[]
-  threads        Thread[]
+  id                String       @id @default(uuid())
+  organizationId    String
+  name              String
+  domain            String?
+  primaryDomain     String?
+  additionalDomains Json?        @default("[]")
+  customFields      Json?        @default("{}")
+  logoUrl           String?
+  deletedAt         DateTime?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  organization      Organization @relation(fields: [organizationId], references: [id])
+  contacts          Contact[]
+  threads           Thread[]
 
   @@map("companies")
 }
 
 model Signature {
-  id             String       @id @default(uuid())
-  organizationId String
-  mailboxId      String?
-  name           String
-  bodyHtml       String?
-  contentHtml    String
-  scope          String       @default("organization")
-  ownerId        String?
-  ownerType      String?
-  isDefault      Boolean      @default(false)
-  isLocked       Boolean      @default(false)
-  variables      Json?
-  assignedMailboxIds Json?    @default("[]")
-  sortOrder      Int          @default(0)
-  createdByUserId String?
-  deletedAt      DateTime?
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  mailbox        Mailbox?     @relation(fields: [mailboxId], references: [id])
-  organization   Organization @relation(fields: [organizationId], references: [id])
+  id                 String       @id @default(uuid())
+  organizationId     String
+  mailboxId          String?
+  name               String
+  bodyHtml           String?
+  contentHtml        String
+  scope              String       @default("organization")
+  ownerId            String?
+  ownerType          String?
+  isDefault          Boolean      @default(false)
+  isLocked           Boolean      @default(false)
+  variables          Json?
+  assignedMailboxIds Json?        @default("[]")
+  sortOrder          Int          @default(0)
+  createdByUserId    String?
+  deletedAt          DateTime?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  mailbox            Mailbox?     @relation(fields: [mailboxId], references: [id])
+  organization       Organization @relation(fields: [organizationId], references: [id])
 
   @@index([organizationId, deletedAt])
   @@map("signatures")
 }
 
 model Rule {
-  id             String       @id @default(uuid())
-  organizationId String
-  teamId         String?
-  userId         String?
-  mailboxId      String?
-  name           String
-  isActive       Boolean      @default(true)
-  priority       Int          @default(2)
-  conditionLogic String       @default("AND")
-  trigger        RuleTrigger
-  conditions     Json
-  actions        Json
-  executionMode  String       @default("merge")
-  timesTriggered Int          @default(0)
+  id              String       @id @default(uuid())
+  organizationId  String
+  teamId          String?
+  userId          String?
+  mailboxId       String?
+  name            String
+  isActive        Boolean      @default(true)
+  priority        Int          @default(2)
+  conditionLogic  String       @default("AND")
+  trigger         RuleTrigger
+  conditions      Json
+  actions         Json
+  executionMode   String       @default("merge")
+  timesTriggered  Int          @default(0)
   lastTriggeredAt DateTime?
-  deletedAt      DateTime?
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  mailbox        Mailbox?     @relation(fields: [mailboxId], references: [id])
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  team           Team?        @relation(fields: [teamId], references: [id])
-  user           User?        @relation(fields: [userId], references: [id])
+  deletedAt       DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  mailbox         Mailbox?     @relation(fields: [mailboxId], references: [id])
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  team            Team?        @relation(fields: [teamId], references: [id])
+  user            User?        @relation(fields: [userId], references: [id])
 
   @@map("rules")
 }
 
 model Event {
-  id              String          @id @default(uuid())
-  organizationId  String
-  organizerId     String
-  syncUserId      String?
-  provider        String?
-  externalId      String?
+  id                String          @id @default(uuid())
+  organizationId    String
+  organizerId       String
+  syncUserId        String?
+  provider          String?
+  externalId        String?
   externalUpdatedAt DateTime?
-  title           String
-  description     String?
-  allDay          Boolean         @default(false)
-  timezone        String?
-  status          String          @default("confirmed")
-  visibility      String          @default("default")
-  recurrenceRule  String?
-  recurrenceEnd   DateTime?
-  reminders       Json?           @default("[]")
-  color           String?
-  linkedThreadId  String?
-  linkedContactId String?
-  linkedCompanyId String?
-  templateId      String?
-  meetingProvider String?
-  meetingId       String?
-  meetingPassword String?
-  startTime       DateTime
-  endTime         DateTime
-  location        String?
-  meetingLink     String?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
-  attendees       EventAttendee[]
-  organization    Organization    @relation(fields: [organizationId], references: [id])
-  organizer       User            @relation(fields: [organizerId], references: [id])
+  title             String
+  description       String?
+  allDay            Boolean         @default(false)
+  timezone          String?
+  status            String          @default("confirmed")
+  visibility        String          @default("default")
+  recurrenceRule    String?
+  recurrenceEnd     DateTime?
+  reminders         Json?           @default("[]")
+  color             String?
+  linkedThreadId    String?
+  linkedContactId   String?
+  linkedCompanyId   String?
+  templateId        String?
+  meetingProvider   String?
+  meetingId         String?
+  meetingPassword   String?
+  startTime         DateTime
+  endTime           DateTime
+  location          String?
+  meetingLink       String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  attendees         EventAttendee[]
+  organization      Organization    @relation(fields: [organizationId], references: [id])
+  organizer         User            @relation(fields: [organizerId], references: [id])
 
   @@unique([organizationId, provider, externalId, syncUserId], map: "events_org_provider_external_sync_user_unique")
   @@index([organizationId, syncUserId, provider])
@@ -490,28 +510,28 @@ model Event {
 }
 
 model CalendarTemplate {
-  id              String       @id @default(uuid())
-  organizationId  String
-  createdByUserId String
-  teamId          String?
-  name            String
-  title           String
-  description     String?
-  durationMinutes Int          @default(30)
-  location        String?
-  meetingLink     String?
-  variableDefinitions Json?    @default("[]")
-  requiredFields  Json?        @default("[]")
-  invitationTemplate String?
-  meetingProvider String?
-  scope           String       @default("personal")
-  isActive        Boolean      @default(true)
-  deletedAt       DateTime?
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
-  organization    Organization @relation(fields: [organizationId], references: [id])
-  createdBy       User         @relation(fields: [createdByUserId], references: [id])
-  team            Team?        @relation(fields: [teamId], references: [id])
+  id                  String       @id @default(uuid())
+  organizationId      String
+  createdByUserId     String
+  teamId              String?
+  name                String
+  title               String
+  description         String?
+  durationMinutes     Int          @default(30)
+  location            String?
+  meetingLink         String?
+  variableDefinitions Json?        @default("[]")
+  requiredFields      Json?        @default("[]")
+  invitationTemplate  String?
+  meetingProvider     String?
+  scope               String       @default("personal")
+  isActive            Boolean      @default(true)
+  deletedAt           DateTime?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+  organization        Organization @relation(fields: [organizationId], references: [id])
+  createdBy           User         @relation(fields: [createdByUserId], references: [id])
+  team                Team?        @relation(fields: [teamId], references: [id])
 
   @@index([organizationId, deletedAt])
   @@map("calendar_templates")
@@ -533,49 +553,109 @@ model EventAttendee {
 }
 
 model Notification {
-  id         String    @id @default(uuid())
+  id             String    @id @default(uuid())
   organizationId String?
-  userId     String
-  type       String
-  title      String
-  message    String?
-  data       Json?
-  resourceId String?
-  channel    String    @default("in_app")
-  readAt     DateTime?
-  sentAt     DateTime?
-  failedAt   DateTime?
-  error      String?
-  createdAt  DateTime  @default(now())
-  user       User      @relation(fields: [userId], references: [id])
+  userId         String
+  type           String
+  title          String
+  message        String?
+  data           Json?
+  resourceId     String?
+  channel        String    @default("in_app")
+  readAt         DateTime?
+  sentAt         DateTime?
+  failedAt       DateTime?
+  error          String?
+  createdAt      DateTime  @default(now())
+  user           User      @relation(fields: [userId], references: [id])
+  digestItems    NotificationDigestItem[]
 
   @@map("notifications")
 }
 
 model NotificationPreference {
-  id                   String       @id @default(uuid())
-  userId               String
-  organizationId       String?
-  notificationType     String
-  enabled              Boolean      @default(true)
-  inApp                Boolean      @default(true)
-  email                Boolean      @default(true)
-  push                 Boolean      @default(false)
-  desktop              Boolean      @default(false)
-  slack                Boolean      @default(false)
-  config               Json         @default("{}")
-  quietHoursStart      String?
-  quietHoursEnd        String?
-  quietHoursTimezone   String       @default("UTC")
-  quietHoursChannels   Json         @default("[]")
-  slackWebhookUrl      String?
-  createdAt            DateTime     @default(now())
-  updatedAt            DateTime     @updatedAt
-  user                 User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  organization         Organization? @relation(fields: [organizationId], references: [id])
+  id                 String        @id @default(uuid())
+  userId             String
+  organizationId     String?
+  notificationType   String
+  enabled            Boolean       @default(true)
+  inApp              Boolean       @default(true)
+  email              Boolean       @default(true)
+  push               Boolean       @default(false)
+  desktop            Boolean       @default(false)
+  slack              Boolean       @default(false)
+  config             Json          @default("{}")
+  quietHoursStart    String?
+  quietHoursEnd      String?
+  quietHoursTimezone String        @default("UTC")
+  quietHoursChannels Json          @default("[]")
+  slackWebhookUrl    String?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  user               User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization       Organization? @relation(fields: [organizationId], references: [id])
 
   @@unique([userId, notificationType])
   @@map("notification_preferences")
+}
+
+model PushRegistration {
+  id                String       @id @default(uuid())
+  userId            String
+  organizationId    String
+  provider          PushProvider
+  registrationKey   String       @unique
+  endpoint          String?
+  token             String?
+  subscription      Json?
+  deviceName        String?
+  browserName       String?
+  userAgent         String?
+  metadata          Json?
+  soundEnabled      Boolean      @default(false)
+  active            Boolean      @default(true)
+  revokedAt         DateTime?
+  lastUsedAt        DateTime?
+  lastSuccessAt     DateTime?
+  lastFailureAt     DateTime?
+  lastFailureReason String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, active, revokedAt])
+  @@index([organizationId, provider, active])
+  @@map("push_registrations")
+}
+
+model NotificationDigestItem {
+  id                String                   @id @default(uuid())
+  organizationId    String
+  userId            String
+  notificationId    String?
+  notificationType  String
+  emailDeliveryMode String
+  title             String
+  message           String?
+  resourceId        String?
+  data              Json?
+  windowKey         String
+  windowStart       DateTime
+  windowEnd         DateTime
+  status            NotificationDigestStatus @default(pending)
+  processedAt       DateTime?
+  failedAt          DateTime?
+  error             String?
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  notification      Notification?            @relation(fields: [notificationId], references: [id], onDelete: SetNull)
+  organization      Organization             @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user              User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, emailDeliveryMode, windowEnd])
+  @@index([userId, notificationType, windowKey])
+  @@map("notification_digest_items")
 }
 
 model Webhook {
@@ -662,18 +742,35 @@ model ImportJob {
 }
 
 model ThreadNote {
-  id             String       @id @default(uuid())
+  id             String              @id @default(uuid())
   organizationId String
   threadId       String
   userId         String
   body           String
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  organization   Organization @relation(fields: [organizationId], references: [id])
-  thread         Thread       @relation(fields: [threadId], references: [id])
-  user           User         @relation(fields: [userId], references: [id])
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  organization   Organization        @relation(fields: [organizationId], references: [id])
+  thread         Thread              @relation(fields: [threadId], references: [id])
+  user           User                @relation(fields: [userId], references: [id])
+  mentions       ThreadNoteMention[]
 
   @@map("thread_notes")
+}
+
+model ThreadNoteMention {
+  id              String     @id @default(uuid())
+  organizationId  String
+  noteId          String
+  mentionedUserId String
+  mentionKey      String
+  createdAt       DateTime   @default(now())
+  note            ThreadNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  mentionedUser   User       @relation("ThreadNoteMentionedUser", fields: [mentionedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([noteId, mentionedUserId])
+  @@index([organizationId, mentionKey])
+  @@index([mentionedUserId, createdAt])
+  @@map("thread_note_mentions")
 }
 
 model ScheduledMessage {
@@ -827,4 +924,15 @@ enum ReadStateMode {
   personal
   shared
   hybrid
+}
+
+enum PushProvider {
+  web_push
+  fcm
+}
+
+enum NotificationDigestStatus {
+  pending
+  processed
+  failed
 }

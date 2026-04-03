@@ -1,4 +1,10 @@
-import { IsBoolean, IsObject, IsOptional, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsObject,
+  IsOptional,
+  IsString,
+} from 'class-validator';
 
 export interface DispatchNotificationParams {
   userId: string;
@@ -14,6 +20,12 @@ export interface DispatchNotificationParams {
     desktop?: boolean;
   };
 }
+
+export type EmailDeliveryMode =
+  | 'instant'
+  | 'hourly_digest'
+  | 'daily_digest'
+  | 'never';
 
 export class NotificationChannelConfigDto {
   @IsOptional()
@@ -43,6 +55,10 @@ export class NotificationChannelConfigDto {
   @IsOptional()
   @IsObject()
   config?: Record<string, unknown>;
+
+  @IsOptional()
+  @IsIn(['instant', 'hourly_digest', 'daily_digest', 'never'])
+  emailDeliveryMode?: EmailDeliveryMode;
 }
 
 export class UpdateNotificationSettingsDto {
@@ -96,4 +112,58 @@ export class PushTokenDto {
   @IsOptional()
   @IsString()
   token?: string;
+
+  @IsOptional()
+  @IsIn(['web_push', 'fcm'])
+  provider?: 'web_push' | 'fcm';
+
+  @IsOptional()
+  @IsString()
+  endpoint?: string;
+
+  @IsOptional()
+  @IsObject()
+  subscription?: Record<string, unknown>;
+
+  @IsOptional()
+  @IsString()
+  deviceName?: string;
+
+  @IsOptional()
+  @IsString()
+  browserName?: string;
+
+  @IsOptional()
+  @IsString()
+  userAgent?: string;
+
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
+
+  @IsOptional()
+  @IsBoolean()
+  soundEnabled?: boolean;
+}
+
+export class RevokePushTokenDto {
+  @IsOptional()
+  @IsString()
+  registrationId?: string;
+
+  @IsOptional()
+  @IsString()
+  registrationKey?: string;
+
+  @IsOptional()
+  @IsString()
+  token?: string;
+
+  @IsOptional()
+  @IsString()
+  endpoint?: string;
+
+  @IsOptional()
+  @IsObject()
+  subscription?: Record<string, unknown>;
 }

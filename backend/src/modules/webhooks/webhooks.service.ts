@@ -213,7 +213,8 @@ export class WebhooksService {
     const sig = `sha256=${crypto.createHmac('sha256', hook.secret).update(body).digest('hex')}`;
 
     const maxAttempts = Math.max(1, Number(hook.maxRetries || 3));
-    const retryDelayMs = Math.max(1, Number(hook.retryDelaySeconds || 60)) * 1000;
+    const retryDelayMs =
+      Math.max(1, Number(hook.retryDelaySeconds || 60)) * 1000;
     let attempt = 0;
     let delivered = false;
 

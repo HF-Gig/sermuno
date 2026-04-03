@@ -14,12 +14,14 @@ import type {
   UpdateCompanyDto,
 } from './dto/crm.dto';
 import { Prisma } from '@prisma/client';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class CrmService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async listContacts(user: JwtUser) {
@@ -69,7 +71,7 @@ export class CrmService {
     if (existing)
       throw new ConflictException('Contact with this email already exists');
 
-    return this.prisma.contact.create({
+    const created = await this.prisma.contact.create({
       data: {
         organizationId: user.organizationId,
         email: dto.email,
@@ -88,6 +90,18 @@ export class CrmService {
         companyId: dto.companyId ?? null,
       },
     });
+
+    await this.dispatchContactActivity({
+      organizationId: user.organizationId,
+      actor: user,
+      contactId: created.id,
+      contactEmail: created.email,
+      contactName: created.fullName || created.name || created.email,
+      activity: 'created',
+      preferredUserId: created.assignedToUserId ?? undefined,
+    });
+
+    return created;
   }
 
   async getContact(id: string, user: JwtUser) {
@@ -185,7 +199,7 @@ export class CrmService {
         throw new ConflictException('Contact with this email already exists');
     }
 
-    return this.prisma.contact.update({
+    const updated = await this.prisma.contact.update({
       where: { id },
       data: {
         ...(dto.email !== undefined && { email: dto.email }),
@@ -224,6 +238,18 @@ export class CrmService {
         }),
       },
     });
+
+    await this.dispatchContactActivity({
+      organizationId: user.organizationId,
+      actor: user,
+      contactId: updated.id,
+      contactEmail: updated.email,
+      contactName: updated.fullName || updated.name || updated.email,
+      activity: 'updated',
+      preferredUserId: updated.assignedToUserId ?? undefined,
+    });
+
+    return updated;
   }
 
   async deleteContact(id: string, user: JwtUser): Promise<void> {
@@ -552,5 +578,41 @@ export class CrmService {
     });
 
     return Array.from(new Set(accesses.map((entry) => entry.mailboxId)));
+  }
+
+  private async dispatchContactActivity(params: {
+    organizationId: string;
+    actor: JwtUser;
+    contactId: string;
+    contactEmail: string;
+    contactName: string;
+    activity: 'created' | 'updated';
+    preferredUserId?: string;
+  }) {
+    const recipients = new Set<string>();
+    recipients.add(params.actor.sub);
+    if (params.preferredUserId) {
+      recipients.add(params.preferredUserId);
+    }
+
+    await Promise.all(
+      [...recipients].map((recipientId) =>
+        this.notifications
+          .dispatch({
+            userId: recipientId,
+            organizationId: params.organizationId,
+            type: 'contact_activity',
+            title: `Contact ${params.activity}`,
+            message: `${params.contactName} (${params.contactEmail}) was ${params.activity}`,
+            resourceId: params.contactId,
+            data: {
+              contactId: params.contactId,
+              activity: params.activity,
+              actorUserId: params.actor.sub,
+            },
+          })
+          .catch(() => undefined),
+      ),
+    );
   }
 }

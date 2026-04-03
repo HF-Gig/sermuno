@@ -32,6 +32,7 @@ import { EventsGateway } from '../websockets/events.gateway';
 import sanitizeHtml from 'sanitize-html';
 import { SlaService } from '../sla/sla.service';
 import type { BusinessHours, SlaTargets } from '../sla/dto/sla.dto';
+import { NotificationsService } from '../notifications/notifications.service';
 
 const ALGORITHM = 'aes-256-gcm';
 
@@ -67,6 +68,49 @@ interface ThreadMatch {
   matchedBy: 'messageId' | 'subject' | 'new';
 }
 
+const THREAD_NOTE_WITH_MENTIONS_INCLUDE = {
+  user: {
+    select: { id: true, fullName: true, email: true, avatarUrl: true },
+  },
+  mentions: {
+    orderBy: { createdAt: 'asc' as const },
+    include: {
+      mentionedUser: {
+        select: { id: true, fullName: true, email: true, avatarUrl: true },
+      },
+    },
+  },
+} satisfies Prisma.ThreadNoteInclude;
+
+type ThreadNoteWithMentions = Prisma.ThreadNoteGetPayload<{
+  include: typeof THREAD_NOTE_WITH_MENTIONS_INCLUDE;
+}>;
+
+type MentionedUserSummary = {
+  id: string;
+  fullName: string;
+  email: string;
+  avatarUrl: string | null;
+  mentionKey: string;
+};
+
+type MappedThreadNote = {
+  id: string;
+  organizationId: string;
+  threadId: string;
+  userId: string;
+  body: string;
+  createdAt: Date;
+  updatedAt: Date;
+  user: {
+    id: string;
+    fullName: string;
+    email: string;
+    avatarUrl: string | null;
+  };
+  mentionedUsers: MentionedUserSummary[];
+};
+
 @Injectable()
 export class ThreadsService {
   private readonly logger = new Logger(ThreadsService.name);
@@ -76,6 +120,7 @@ export class ThreadsService {
     private readonly configService: ConfigService,
     private readonly eventsGateway: EventsGateway,
     private readonly slaService: SlaService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   private async buildSlaThreadData(params: {
@@ -146,8 +191,8 @@ export class ThreadsService {
     const slaBreached = Boolean(
       (deadlines.firstResponseDueAt &&
         deadlines.firstResponseDueAt.getTime() <= now.getTime()) ||
-        (deadlines.resolutionDueAt &&
-          deadlines.resolutionDueAt.getTime() <= now.getTime()),
+      (deadlines.resolutionDueAt &&
+        deadlines.resolutionDueAt.getTime() <= now.getTime()),
     );
 
     return {
@@ -820,8 +865,8 @@ export class ThreadsService {
           priority: dto.priority ?? thread.priority,
           slaPolicyId:
             rawSlaPolicyId !== undefined
-              ? rawSlaPolicyId ?? null
-              : thread.slaPolicyId ?? null,
+              ? (rawSlaPolicyId ?? null)
+              : (thread.slaPolicyId ?? null),
         }),
       );
     }
@@ -953,6 +998,7 @@ export class ThreadsService {
         id: true,
         subject: true,
         mailboxId: true,
+        assignedUserId: true,
         createdAt: true,
         priority: true,
         slaPolicyId: true,
@@ -1097,6 +1143,30 @@ export class ThreadsService {
       });
     }
 
+    if (thread.assignedUserId && thread.assignedUserId !== user.sub) {
+      await this.notificationsService
+        .dispatch({
+          userId: thread.assignedUserId,
+          organizationId: user.organizationId,
+          type: 'thread_reply',
+          title: 'A reply was sent on an assigned thread',
+          message: `${user.email} replied to "${thread.subject || 'a thread'}"`,
+          resourceId: thread.id,
+          data: {
+            threadId: thread.id,
+            mailboxId: thread.mailboxId,
+            assignedToUserId: thread.assignedUserId,
+            repliedByUserId: user.sub,
+          },
+        })
+        .catch((error) => {
+          this.logger.error(
+            `[threads] Failed to dispatch thread_reply notification thread=${thread.id} user=${thread.assignedUserId}`,
+            error instanceof Error ? error.stack : undefined,
+          );
+        });
+    }
+
     return message;
   }
 
@@ -1106,69 +1176,154 @@ export class ThreadsService {
     });
     if (!thread) throw new NotFoundException('Thread not found');
 
-    return this.prisma.thread.update({
+    const assignData =
+      dto.userId !== undefined
+        ? {
+            assignedUserId: dto.userId || null,
+            assignedToTeamId: null,
+          }
+        : dto.teamId !== undefined
+          ? {
+              assignedToTeamId: dto.teamId || null,
+              assignedUserId: null,
+            }
+          : {
+              assignedUserId: null,
+              assignedToTeamId: null,
+            };
+
+    const updated = await this.prisma.thread.update({
       where: { id: threadId },
       data: {
-        ...(dto.userId !== undefined && { assignedUserId: dto.userId }),
-        ...(dto.teamId !== undefined && { assignedToTeamId: dto.teamId }),
+        ...assignData,
         status: ThreadStatus.OPEN,
       },
     });
+
+    this.eventsGateway.emitToOrganization(
+      user.organizationId,
+      'thread:assigned',
+      {
+        threadId: updated.id,
+        mailboxId: updated.mailboxId,
+        assignedUserId: updated.assignedUserId ?? null,
+        assignedToTeamId: updated.assignedToTeamId ?? null,
+      },
+    );
+
+    const hasNewUserAssignment =
+      dto.userId !== undefined &&
+      !!updated.assignedUserId &&
+      updated.assignedUserId !== thread.assignedUserId;
+
+    if (hasNewUserAssignment) {
+      try {
+        await this.notificationsService.dispatch({
+          userId: updated.assignedUserId!,
+          organizationId: user.organizationId,
+          type: 'thread_assigned',
+          title: 'Thread assigned to you',
+          message: `${user.email} assigned "${updated.subject || 'a thread'}" to you`,
+          resourceId: updated.id,
+          data: {
+            threadId: updated.id,
+            assignedByUserId: user.sub,
+            assignedUserId: updated.assignedUserId,
+            mailboxId: updated.mailboxId,
+          },
+        });
+      } catch (error) {
+        this.logger.error(
+          `[threads] Failed to dispatch thread_assigned notification thread=${updated.id} user=${updated.assignedUserId}`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
+    }
+
+    return updated;
   }
 
   // ─── Thread Notes ─────────────────────────────────────────────────────────
 
   private async assertNotePermission(user: JwtUser) {
+    void user;
     // threads:notes permission is required (included for ADMIN, MANAGER, USER per ROLE_PERMISSIONS)
     // At this layer we trust the JWT permissions — guard enforces it at controller level
   }
 
   async getNotes(threadId: string, user: JwtUser) {
     await this.findOne(threadId, user); // assert thread belongs to org
-    return this.prisma.threadNote.findMany({
+    const notes = await this.prisma.threadNote.findMany({
       where: { threadId, organizationId: user.organizationId },
-      include: {
-        user: { select: { id: true, fullName: true, avatarUrl: true } },
-      },
+      include: THREAD_NOTE_WITH_MENTIONS_INCLUDE,
       orderBy: { createdAt: 'asc' },
     });
+    return notes.map((note) => this.mapThreadNote(note));
   }
 
   async createNote(threadId: string, dto: CreateNoteDto, user: JwtUser) {
-    await this.findOne(threadId, user);
-    const cleanBody = sanitizeHtml(dto.body, {
-      allowedTags: [],
-      allowedAttributes: {},
-    }).trim();
+    const thread = await this.findOne(threadId, user);
+    const cleanBody = this.sanitizeNoteBody(dto.body);
+    const resolvedMentions = await this.resolveMentionedUsers(
+      user.organizationId,
+      cleanBody,
+    );
 
-    if (!cleanBody) {
-      throw new BadRequestException('Note body cannot be empty');
-    }
-
-    const note = await this.prisma.threadNote.create({
-      data: {
-        threadId,
-        organizationId: user.organizationId,
-        userId: user.sub,
-        body: cleanBody,
-      },
-      include: {
-        user: {
-          select: { id: true, fullName: true, email: true, avatarUrl: true },
+    const note = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.threadNote.create({
+        data: {
+          threadId,
+          organizationId: user.organizationId,
+          userId: user.sub,
+          body: cleanBody,
         },
-      },
+        select: { id: true },
+      });
+
+      if (resolvedMentions.length > 0) {
+        await tx.threadNoteMention.createMany({
+          data: resolvedMentions.map((mentionedUser) => ({
+            organizationId: user.organizationId,
+            noteId: created.id,
+            mentionedUserId: mentionedUser.id,
+            mentionKey: mentionedUser.mentionKey,
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      return tx.threadNote.findFirstOrThrow({
+        where: { id: created.id, organizationId: user.organizationId },
+        include: THREAD_NOTE_WITH_MENTIONS_INCLUDE,
+      });
     });
+
+    const mappedNote = this.mapThreadNote(note);
+    try {
+      await this.dispatchMentionNotifications({
+        threadId,
+        threadSubject: thread.subject,
+        note: mappedNote,
+        authorUserId: user.sub,
+        mentionedUsers: mappedNote.mentionedUsers,
+      });
+    } catch (error) {
+      this.logger.error(
+        `[thread-notes] Failed mention dispatch thread=${threadId} note=${mappedNote.id}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
 
     this.eventsGateway.emitToOrganization(
       user.organizationId,
       'thread:note_added',
       {
         threadId,
-        note,
+        note: mappedNote,
       },
     );
 
-    return note;
+    return mappedNote;
   }
 
   async updateNote(
@@ -1177,27 +1332,82 @@ export class ThreadsService {
     dto: UpdateNoteDto,
     user: JwtUser,
   ) {
-    await this.findOne(threadId, user);
+    const thread = await this.findOne(threadId, user);
     const note = await this.prisma.threadNote.findFirst({
       where: { id: noteId, threadId, organizationId: user.organizationId },
+      include: {
+        mentions: {
+          include: {
+            mentionedUser: {
+              select: {
+                id: true,
+                fullName: true,
+                email: true,
+                avatarUrl: true,
+              },
+            },
+          },
+        },
+      },
     });
     if (!note) throw new NotFoundException('Note not found');
     if (note.userId !== user.sub)
       throw new ForbiddenException("Cannot edit another user's note");
 
-    const cleanBody = sanitizeHtml(dto.body, {
-      allowedTags: [],
-      allowedAttributes: {},
-    }).trim();
+    const cleanBody = this.sanitizeNoteBody(dto.body);
+    const resolvedMentions = await this.resolveMentionedUsers(
+      user.organizationId,
+      cleanBody,
+    );
+    const existingMentionedUserIds = new Set(
+      note.mentions.map((mention) => mention.mentionedUserId),
+    );
+    const newlyAddedMentions = resolvedMentions.filter(
+      (mentionedUser) => !existingMentionedUserIds.has(mentionedUser.id),
+    );
 
-    if (!cleanBody) {
-      throw new BadRequestException('Note body cannot be empty');
+    const updatedNote = await this.prisma.$transaction(async (tx) => {
+      await tx.threadNote.update({
+        where: { id: noteId },
+        data: { body: cleanBody },
+      });
+      await tx.threadNoteMention.deleteMany({ where: { noteId } });
+
+      if (resolvedMentions.length > 0) {
+        await tx.threadNoteMention.createMany({
+          data: resolvedMentions.map((mentionedUser) => ({
+            organizationId: user.organizationId,
+            noteId,
+            mentionedUserId: mentionedUser.id,
+            mentionKey: mentionedUser.mentionKey,
+          })),
+          skipDuplicates: true,
+        });
+      }
+
+      return tx.threadNote.findFirstOrThrow({
+        where: { id: noteId, threadId, organizationId: user.organizationId },
+        include: THREAD_NOTE_WITH_MENTIONS_INCLUDE,
+      });
+    });
+
+    const mappedNote = this.mapThreadNote(updatedNote);
+    try {
+      await this.dispatchMentionNotifications({
+        threadId,
+        threadSubject: thread.subject,
+        note: mappedNote,
+        authorUserId: user.sub,
+        mentionedUsers: newlyAddedMentions,
+      });
+    } catch (error) {
+      this.logger.error(
+        `[thread-notes] Failed mention dispatch thread=${threadId} note=${mappedNote.id}`,
+        error instanceof Error ? error.stack : undefined,
+      );
     }
 
-    return this.prisma.threadNote.update({
-      where: { id: noteId },
-      data: { body: cleanBody },
-    });
+    return mappedNote;
   }
 
   async deleteNote(threadId: string, noteId: string, user: JwtUser) {
@@ -1215,6 +1425,147 @@ export class ThreadsService {
     }
     await this.prisma.threadNote.delete({ where: { id: noteId } });
     return { message: 'Note deleted' };
+  }
+
+  private sanitizeNoteBody(body: string) {
+    const cleanBody = sanitizeHtml(body, {
+      allowedTags: [],
+      allowedAttributes: {},
+    }).trim();
+
+    if (!cleanBody) {
+      throw new BadRequestException('Note body cannot be empty');
+    }
+
+    return cleanBody;
+  }
+
+  private extractMentionKeys(body: string) {
+    const keys = new Set<string>();
+    const matcher = /(^|[^A-Za-z0-9._+@-])@([A-Za-z0-9._+-]{1,64})\b/g;
+    let match: RegExpExecArray | null = matcher.exec(body);
+
+    while (match) {
+      keys.add(match[2].toLowerCase());
+      match = matcher.exec(body);
+    }
+
+    return [...keys];
+  }
+
+  private toMentionKey(email: string) {
+    return email.trim().toLowerCase().split('@')[0] || '';
+  }
+
+  private async resolveMentionedUsers(
+    organizationId: string,
+    body: string,
+  ): Promise<MentionedUserSummary[]> {
+    const mentionKeys = this.extractMentionKeys(body);
+    if (mentionKeys.length === 0) {
+      return [];
+    }
+
+    const requestedKeys = new Set(mentionKeys);
+    const users = await this.prisma.user.findMany({
+      where: {
+        organizationId,
+        deletedAt: null,
+        isActive: true,
+      },
+      select: {
+        id: true,
+        fullName: true,
+        email: true,
+        avatarUrl: true,
+      },
+    });
+
+    const uniqueMatches = new Map<string, MentionedUserSummary>();
+    const ambiguousKeys = new Set<string>();
+
+    for (const candidate of users) {
+      const mentionKey = this.toMentionKey(candidate.email);
+      if (!mentionKey || !requestedKeys.has(mentionKey)) {
+        continue;
+      }
+
+      if (ambiguousKeys.has(mentionKey)) {
+        continue;
+      }
+
+      if (uniqueMatches.has(mentionKey)) {
+        uniqueMatches.delete(mentionKey);
+        ambiguousKeys.add(mentionKey);
+        continue;
+      }
+
+      uniqueMatches.set(mentionKey, {
+        id: candidate.id,
+        fullName: candidate.fullName,
+        email: candidate.email,
+        avatarUrl: candidate.avatarUrl,
+        mentionKey,
+      });
+    }
+
+    return mentionKeys
+      .map((mentionKey) => uniqueMatches.get(mentionKey))
+      .filter((mentionedUser): mentionedUser is MentionedUserSummary =>
+        Boolean(mentionedUser),
+      );
+  }
+
+  private mapThreadNote(note: ThreadNoteWithMentions): MappedThreadNote {
+    return {
+      id: note.id,
+      organizationId: note.organizationId,
+      threadId: note.threadId,
+      userId: note.userId,
+      body: note.body,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+      user: note.user,
+      mentionedUsers: note.mentions.map((mention) => ({
+        id: mention.mentionedUser.id,
+        fullName: mention.mentionedUser.fullName,
+        email: mention.mentionedUser.email,
+        avatarUrl: mention.mentionedUser.avatarUrl,
+        mentionKey: mention.mentionKey,
+      })),
+    };
+  }
+
+  private async dispatchMentionNotifications(params: {
+    threadId: string;
+    threadSubject: string | null;
+    note: MappedThreadNote;
+    authorUserId: string;
+    mentionedUsers: MentionedUserSummary[];
+  }) {
+    const recipients = params.mentionedUsers.filter(
+      (mentionedUser) => mentionedUser.id !== params.authorUserId,
+    );
+
+    await Promise.all(
+      recipients.map((mentionedUser) =>
+        this.notificationsService.dispatch({
+          userId: mentionedUser.id,
+          organizationId: params.note.organizationId,
+          type: 'mention',
+          title: 'You were mentioned in a note',
+          message: `${params.note.user.fullName} mentioned you on ${params.threadSubject || 'a thread'}`,
+          resourceId: params.threadId,
+          data: {
+            threadId: params.threadId,
+            noteId: params.note.id,
+            authorUserId: params.note.user.id,
+            authorName: params.note.user.fullName,
+            mentionKey: mentionedUser.mentionKey,
+          },
+        }),
+      ),
+    );
   }
 
   // ─── Thread Tags ──────────────────────────────────────────────────────────

@@ -30,4 +30,11 @@ export class IntegrationsController {
   async deleteZoom(@CurrentUser() user: JwtUser) {
     await this.integrationsService.deleteZoom(user);
   }
+
+  @Delete('caldav')
+  @RequirePermission('settings:manage')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async deleteCalDav(@CurrentUser() user: JwtUser) {
+    await this.integrationsService.deleteCalDav(user);
+  }
 }

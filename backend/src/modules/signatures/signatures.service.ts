@@ -105,10 +105,7 @@ export class SignaturesService {
     if (!html) {
       throw new BadRequestException('bodyHtml is required');
     }
-    if (
-      !this.canManageSignatures(user) &&
-      scope !== 'personal'
-    ) {
+    if (!this.canManageSignatures(user) && scope !== 'personal') {
       throw new ForbiddenException(
         'Only signature managers can create organization or team signatures',
       );

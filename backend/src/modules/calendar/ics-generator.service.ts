@@ -1,10 +1,11 @@
 import { Injectable } from '@nestjs/common';
-import ical from 'ical-generator';
+import ical, { ICalAttendeeStatus, ICalEventStatus } from 'ical-generator';
 import { RRule } from 'rrule';
 
 export interface IcsAttendee {
   email: string;
   name?: string;
+  status?: ICalAttendeeStatus;
 }
 
 export interface IcsEventData {
@@ -13,6 +14,7 @@ export interface IcsEventData {
   description?: string;
   startTime: Date;
   endTime: Date;
+  allDay?: boolean;
   timezone?: string;
   location?: string;
   meetingLink?: string;
@@ -22,6 +24,8 @@ export interface IcsEventData {
   attendees: IcsAttendee[];
   recurrenceRule?: string;
   recurrenceEnd?: Date;
+  status?: ICalEventStatus;
+  lastModified?: Date;
 }
 
 @Injectable()
@@ -38,10 +42,13 @@ export class IcsGeneratorService {
       id: event.id,
       start: event.startTime,
       end: event.endTime,
+      allDay: event.allDay ?? false,
       timezone: tz,
       summary: event.title,
       description: event.description,
       location,
+      status: event.status,
+      lastModified: event.lastModified,
       organizer: {
         name: event.organizerName ?? event.organizerEmail,
         email: event.organizerEmail,
@@ -54,6 +61,7 @@ export class IcsGeneratorService {
         email: att.email,
         name: att.name,
         rsvp: true,
+        status: att.status ?? ICalAttendeeStatus.NEEDSACTION,
       });
     }
 

@@ -8,6 +8,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  CopyObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { Readable } from 'stream';
@@ -51,11 +52,21 @@ export class AttachmentStorageService {
     return this.storageType === 's3' && sizeBytes > this.maxDirectBytes;
   }
 
+  isS3Storage(): boolean {
+    return this.storageType === 's3' && !!this.s3;
+  }
+
   /** Generate a unique storage key for a new attachment */
   generateStorageKey(organizationId: string, filename: string): string {
     const id = crypto.randomBytes(16).toString('hex');
     const ext = path.extname(filename);
     return `${organizationId}/${id}${ext}`;
+  }
+
+  generateQuarantineKey(organizationId: string, filename: string): string {
+    const id = crypto.randomBytes(16).toString('hex');
+    const ext = path.extname(filename);
+    return `${organizationId}/quarantine/${id}${ext}`;
   }
 
   /**
@@ -132,6 +143,18 @@ export class AttachmentStorageService {
     return fs.promises.readFile(filePath);
   }
 
+  async getReadStream(storageKey: string): Promise<Readable> {
+    if (this.storageType === 's3' && this.s3) {
+      return this.getS3Stream(storageKey);
+    }
+
+    const filePath = path.join(
+      LOCAL_STORAGE_DIR,
+      storageKey.replace(/\//g, '_'),
+    );
+    return fs.createReadStream(filePath);
+  }
+
   /**
    * Stream a file from S3.
    */
@@ -161,5 +184,46 @@ export class AttachmentStorageService {
       }
     }
     this.logger.log(`[storage] deleted storageKey=${storageKey}`);
+  }
+
+  async move(sourceKey: string, targetKey: string): Promise<string> {
+    if (sourceKey === targetKey) {
+      return targetKey;
+    }
+
+    if (this.storageType === 's3' && this.s3) {
+      const copySource = `${this.bucket}/${sourceKey
+        .split('/')
+        .map((segment) => encodeURIComponent(segment))
+        .join('/')}`;
+
+      await this.s3.send(
+        new CopyObjectCommand({
+          Bucket: this.bucket,
+          CopySource: copySource,
+          Key: targetKey,
+        }),
+      );
+
+      await this.s3.send(
+        new DeleteObjectCommand({ Bucket: this.bucket, Key: sourceKey }),
+      );
+      return targetKey;
+    }
+
+    const sourcePath = path.join(
+      LOCAL_STORAGE_DIR,
+      sourceKey.replace(/\//g, '_'),
+    );
+    const targetPath = path.join(
+      LOCAL_STORAGE_DIR,
+      targetKey.replace(/\//g, '_'),
+    );
+
+    if (fs.existsSync(sourcePath)) {
+      await fs.promises.rename(sourcePath, targetPath);
+    }
+
+    return targetKey;
   }
 }

@@ -99,6 +99,13 @@ type IntegrationStatus = {
     lastCheckedAt?: string | null;
 };
 
+type CalDavStatus = IntegrationStatus & {
+    url?: string | null;
+    username?: string | null;
+    calendarName?: string | null;
+    lastError?: string | null;
+};
+
 const COMMON_TIMEZONES = ['UTC', 'Europe/Amsterdam', 'Europe/London', 'America/New_York', 'America/Los_Angeles', 'Asia/Tokyo', 'Asia/Dubai'];
 const auditActionVariant: Record<string, 'success' | 'warning' | 'error' | 'info' | 'neutral'> = {
     SETTINGS_UPDATED: 'info',
@@ -729,7 +736,16 @@ const SettingsPage: React.FC = () => {
     const [calDavUsername, setCalDavUsername] = useState('');
     const [calDavPassword, setCalDavPassword] = useState('');
     const [calDavSyncing, setCalDavSyncing] = useState(false);
+    const [calDavDisconnecting, setCalDavDisconnecting] = useState(false);
     const [calDavMessage, setCalDavMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+    const [calDavStatus, setCalDavStatus] = useState<CalDavStatus>({
+        connected: false,
+        url: null,
+        username: null,
+        calendarName: null,
+        lastCheckedAt: null,
+        lastError: null,
+    });
 
     const fetchUsers = async () => {
         try {
@@ -993,6 +1009,17 @@ const SettingsPage: React.FC = () => {
                     lastCheckedAt: data.zoom?.lastCheckedAt || null,
                 },
             });
+            const nextCalDavStatus: CalDavStatus = {
+                connected: Boolean(data.caldav?.connected),
+                url: data.caldav?.url || null,
+                username: data.caldav?.username || null,
+                calendarName: data.caldav?.calendarName || null,
+                lastCheckedAt: data.caldav?.lastCheckedAt || null,
+                lastError: data.caldav?.lastError || null,
+            };
+            setCalDavStatus(nextCalDavStatus);
+            setCalDavUrl(nextCalDavStatus.url || '');
+            setCalDavUsername(nextCalDavStatus.username || '');
         } catch (error) {
             console.error('Failed to fetch integrations status:', error);
         }
@@ -1222,20 +1249,26 @@ const SettingsPage: React.FC = () => {
     };
 
     const syncCalDav = async () => {
-        if (!calDavUrl.trim() || !calDavUsername.trim() || !calDavPassword) {
-            setCalDavMessage({ type: 'error', text: 'CalDAV URL, username, and password are required.' });
+        const nextUrl = calDavUrl.trim();
+        const nextUsername = calDavUsername.trim();
+        if (!nextUrl || !nextUsername || (!calDavPassword && !calDavStatus.connected)) {
+            setCalDavMessage({ type: 'error', text: 'CalDAV URL and username are required. Enter a password the first time you connect.' });
             return;
         }
 
         setCalDavSyncing(true);
         setCalDavMessage(null);
         try {
-            await api.post('/calendar/sync/caldav', {
-                calDavUrl: calDavUrl.trim(),
-                username: calDavUsername.trim(),
-                password: calDavPassword,
+            const response = await api.post('/calendar/sync/caldav', {
+                calDavUrl: nextUrl,
+                username: nextUsername,
+                password: calDavPassword || undefined,
             });
-            setCalDavMessage({ type: 'success', text: 'CalDAV sync started successfully.' });
+            const synced = Number(response.data?.synced || 0);
+            const deleted = Number(response.data?.deleted || 0);
+            setCalDavMessage({ type: 'success', text: `CalDAV sync finished. Synced ${synced} event${synced === 1 ? '' : 's'} and marked ${deleted} missing event${deleted === 1 ? '' : 's'} as cancelled.` });
+            setCalDavPassword('');
+            await fetchIntegrationStatus();
         } catch (error: any) {
             setCalDavMessage({
                 type: 'error',
@@ -1243,6 +1276,33 @@ const SettingsPage: React.FC = () => {
             });
         } finally {
             setCalDavSyncing(false);
+        }
+    };
+
+    const disconnectCalDav = async () => {
+        setCalDavDisconnecting(true);
+        setCalDavMessage(null);
+        try {
+            await api.delete('/integrations/caldav');
+            setCalDavStatus({
+                connected: false,
+                url: null,
+                username: null,
+                calendarName: null,
+                lastCheckedAt: null,
+                lastError: null,
+            });
+            setCalDavUrl('');
+            setCalDavUsername('');
+            setCalDavPassword('');
+            setCalDavMessage({ type: 'success', text: 'CalDAV connection removed.' });
+        } catch (error: any) {
+            setCalDavMessage({
+                type: 'error',
+                text: error?.response?.data?.message || 'Failed to disconnect CalDAV.',
+            });
+        } finally {
+            setCalDavDisconnecting(false);
         }
     };
     const savePartial = (updates: Partial<OrganizationSettingsSnapshot>) => {
@@ -3300,20 +3360,52 @@ const SettingsPage: React.FC = () => {
                                     </div>
 
                                     <div className="rounded-lg border border-(--color-card-border) p-3 mb-4">
-                                        <h5 className="text-xs font-semibold uppercase tracking-wide text-(--color-text-muted) mb-2">CalDAV (generic providers)</h5>
-                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                                            <input value={calDavUrl} onChange={(e) => setCalDavUrl(e.target.value)} placeholder="CalDAV URL" className="px-3 py-2 rounded-lg border border-(--color-card-border) text-sm" />
-                                            <input value={calDavUsername} onChange={(e) => setCalDavUsername(e.target.value)} placeholder="Username" className="px-3 py-2 rounded-lg border border-(--color-card-border) text-sm" />
-                                            <input type="password" value={calDavPassword} onChange={(e) => setCalDavPassword(e.target.value)} placeholder="Password" className="px-3 py-2 rounded-lg border border-(--color-card-border) text-sm" />
+                                        <div className="mb-2 flex items-start justify-between gap-3">
+                                            <div>
+                                                <h5 className="text-xs font-semibold uppercase tracking-wide text-(--color-text-muted)">CalDAV (generic providers)</h5>
+                                                <p className="mt-1 text-xs text-(--color-text-muted)">
+                                                    {calDavStatus.connected
+                                                        ? `${calDavStatus.calendarName || 'Calendar connected'}${calDavStatus.lastCheckedAt ? ` • Last sync ${new Date(calDavStatus.lastCheckedAt).toLocaleString()}` : ''}`
+                                                        : 'Connect Apple Calendar, Nextcloud, or any CalDAV-compatible provider.'}
+                                                </p>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <StatusBadge label={calDavStatus.connected ? 'Connected' : 'Not Connected'} variant={calDavStatus.connected ? 'success' : 'neutral'} />
+                                                {calDavStatus.connected && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => disconnectCalDav().catch(console.error)}
+                                                        disabled={calDavDisconnecting}
+                                                        className="text-xs font-medium text-(--color-text-muted) hover:text-red-600 transition-colors disabled:opacity-60"
+                                                    >
+                                                        {calDavDisconnecting ? 'Disconnecting...' : 'Disconnect'}
+                                                    </button>
+                                                )}
+                                            </div>
                                         </div>
-                                        <div className="mt-2 flex items-center justify-between gap-3">
-                                            {calDavMessage ? (
-                                                <span className={`text-xs ${calDavMessage.type === 'success' ? 'text-emerald-700' : 'text-red-700'}`}>{calDavMessage.text}</span>
-                                            ) : <span className="text-xs text-(--color-text-muted)">Sync external calendars via CalDAV.</span>}
-                                            <button type="button" onClick={() => syncCalDav().catch(console.error)} disabled={calDavSyncing} className="inline-flex items-center justify-center rounded-lg border border-(--color-card-border) px-3 py-1.5 text-xs font-medium text-(--color-primary) hover:bg-(--color-background) disabled:opacity-60">
-                                                {calDavSyncing ? 'Syncing...' : 'Sync CalDAV'}
-                                            </button>
-                                        </div>
+                                        <form
+                                            className="space-y-2"
+                                            onSubmit={(event) => {
+                                                event.preventDefault();
+                                                void syncCalDav();
+                                            }}
+                                        >
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                <input value={calDavUrl} onChange={(e) => setCalDavUrl(e.target.value)} placeholder="CalDAV URL" autoComplete="url" className="px-3 py-2 rounded-lg border border-(--color-card-border) text-sm" />
+                                                <input value={calDavUsername} onChange={(e) => setCalDavUsername(e.target.value)} placeholder="Username" autoComplete="username" className="px-3 py-2 rounded-lg border border-(--color-card-border) text-sm" />
+                                                <input type="password" value={calDavPassword} onChange={(e) => setCalDavPassword(e.target.value)} placeholder={calDavStatus.connected ? 'Password (leave blank to reuse saved secret)' : 'Password or app password'} autoComplete="current-password" className="px-3 py-2 rounded-lg border border-(--color-card-border) text-sm" />
+                                            </div>
+                                            <div className="flex items-center justify-between gap-3">
+                                                {calDavMessage ? (
+                                                    <span className={`text-xs ${calDavMessage.type === 'success' ? 'text-emerald-700' : 'text-red-700'}`}>{calDavMessage.text}</span>
+                                                ) : calDavStatus.lastError ? (
+                                                    <span className="text-xs text-amber-700">{calDavStatus.lastError}</span>
+                                                ) : <span className="text-xs text-(--color-text-muted)">Sync external calendars via CalDAV.</span>}
+                                                <button type="submit" disabled={calDavSyncing} className="inline-flex items-center justify-center rounded-lg border border-(--color-card-border) px-3 py-1.5 text-xs font-medium text-(--color-primary) hover:bg-(--color-background) disabled:opacity-60">
+                                                    {calDavSyncing ? 'Syncing...' : 'Sync CalDAV'}
+                                                </button>
+                                            </div>
+                                        </form>
                                     </div>
 
                                     <div className="rounded-lg border border-(--color-card-border) p-3">
@@ -3561,7 +3653,7 @@ const SettingsPage: React.FC = () => {
                                                     </label>
                                                 </div>
                                                 <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-                                                    {['in_app', 'email', 'desktop'].map((channel) => (
+                                                    {['in_app', 'email', 'push', 'desktop'].map((channel) => (
                                                         <label key={channel} className="flex items-center gap-2 text-xs text-(--color-text-primary)">
                                                             <input
                                                                 type="checkbox"

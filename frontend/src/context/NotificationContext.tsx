@@ -1,6 +1,16 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import api from '../lib/api';
 import { useWebSocket } from './WebSocketContext';
+import { playDesktopNotificationSound } from '../lib/pushNotifications';
+import { resolveNotificationTarget } from '../lib/notificationRouting';
+
+type NotificationChannels = {
+    in_app?: boolean;
+    email?: boolean;
+    push?: boolean;
+    desktop?: boolean;
+};
 
 export type Notification = {
     id: string;
@@ -8,13 +18,18 @@ export type Notification = {
     title: string;
     message?: string | null;
     resourceId?: string | null;
+    showDesktop?: boolean;
     readAt?: string | null;
     createdAt: string;
-    channels?: {
-        in_app?: boolean;
-        email?: boolean;
-        desktop?: boolean;
+    channels?: NotificationChannels;
+    data?: {
+        channels?: NotificationChannels;
+        [key: string]: unknown;
     };
+};
+
+type IncomingNotification = Notification & {
+    notificationId?: string;
 };
 
 type NotificationContextType = {
@@ -35,6 +50,8 @@ const sortByCreatedDesc = (items: Notification[]) => [...items].sort(
 
 export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const { socket } = useWebSocket();
+    const navigate = useNavigate();
+    const desktopNotificationSeenRef = useRef<Map<string, number>>(new Map());
     const [notifications, setNotifications] = useState<Notification[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -86,9 +103,9 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
         const handleIncoming = (notification: Notification) => {
             setNotifications((prev) => sortByCreatedDesc([notification, ...prev.filter((item) => item.id !== notification.id)]));
 
-            const desktopAllowed = desktopEnabledByType[notification.type] || notification.channels?.desktop;
+            const desktopAllowed = shouldShowDesktopChannel(notification, desktopEnabledByType);
             if (desktopAllowed && canShowDesktopNotification(quietHours)) {
-                maybeShowDesktopNotification(notification);
+                maybeShowDesktopNotification(notification, navigate, desktopNotificationSeenRef.current);
             }
         };
 
@@ -100,6 +117,34 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({ 
             socket.off('notification', handleIncoming);
         };
     }, [desktopEnabledByType, quietHours, socket]);
+
+    useEffect(() => {
+        if (!('serviceWorker' in navigator)) {
+            return;
+        }
+
+        const handleServiceWorkerMessage = (event: MessageEvent) => {
+            if (event.data?.type !== 'sermuno:push-notification') {
+                return;
+            }
+
+            const payload = normalizeIncomingNotification(event.data.payload);
+            if (!payload) {
+                return;
+            }
+
+            setNotifications((prev) => sortByCreatedDesc([payload, ...prev.filter((item) => item.id !== payload.id)]));
+            const desktopAllowed = shouldShowDesktopChannel(payload, desktopEnabledByType);
+            if (desktopAllowed && canShowDesktopNotification(quietHours)) {
+                maybeShowDesktopNotification(payload, navigate, desktopNotificationSeenRef.current);
+            }
+        };
+
+        navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+        return () => {
+            navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+        };
+    }, [desktopEnabledByType, navigate, quietHours]);
 
     const markAllAsRead = useCallback(async () => {
         try {
@@ -171,12 +216,125 @@ const canShowDesktopNotification = (quietHours: { enabled?: boolean; start?: str
     return !(timeStr >= start || timeStr < end);
 };
 
-const maybeShowDesktopNotification = (notification: Notification) => {
+const getNotificationChannels = (notification: Notification): NotificationChannels => {
+    if (notification.channels && typeof notification.channels === 'object') {
+        return notification.channels;
+    }
+    if (notification.data?.channels && typeof notification.data.channels === 'object') {
+        return notification.data.channels;
+    }
+    return {};
+};
+
+const normalizeIncomingNotification = (payload: unknown): Notification | null => {
+    if (!payload || typeof payload !== 'object') {
+        return null;
+    }
+
+    const raw = payload as IncomingNotification;
+    const id = typeof raw.id === 'string' && raw.id.trim()
+        ? raw.id
+        : typeof raw.notificationId === 'string' && raw.notificationId.trim()
+            ? raw.notificationId
+            : '';
+
+    if (!id) {
+        return null;
+    }
+
+    return {
+        ...raw,
+        id,
+        createdAt: typeof raw.createdAt === 'string' && raw.createdAt.trim()
+            ? raw.createdAt
+            : new Date().toISOString(),
+    };
+};
+
+const shouldShowDesktopChannel = (
+    notification: Notification,
+    desktopEnabledByType: Record<string, boolean>,
+) => {
+    if (typeof notification.showDesktop === 'boolean') {
+        return notification.showDesktop;
+    }
+    const channels = getNotificationChannels(notification);
+    if (typeof channels.desktop === 'boolean') {
+        return channels.desktop;
+    }
+    return Boolean(desktopEnabledByType[notification.type]);
+};
+
+const maybeShowDesktopNotification = (
+    notification: Notification,
+    navigate: ReturnType<typeof useNavigate>,
+    recentlySeen: Map<string, number>,
+) => {
+    const now = Date.now();
+    const lastSeenAt = recentlySeen.get(notification.id) ?? 0;
+    if (lastSeenAt && now - lastSeenAt < 5000) {
+        return;
+    }
+
+    recentlySeen.set(notification.id, now);
+    for (const [id, seenAt] of recentlySeen.entries()) {
+        if (now - seenAt > 30000) {
+            recentlySeen.delete(id);
+        }
+    }
+
     try {
-        new Notification(notification.title, {
+        const targetUrl = new URL(resolveNotificationTarget(notification), window.location.origin).toString();
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.getRegistration().then((registration) => {
+                if (!registration) {
+                    const fallback = new Notification(notification.title, {
+                        body: notification.message || '',
+                        tag: notification.id,
+                        silent: true,
+                    });
+                    playDesktopNotificationSound();
+                    fallback.onclick = () => {
+                        window.focus();
+                        navigate(resolveNotificationTarget(notification));
+                    };
+                    return;
+                }
+
+                registration.showNotification(notification.title, {
+                    body: notification.message || '',
+                    tag: notification.id,
+                    silent: true,
+                    data: { url: targetUrl },
+                });
+                playDesktopNotificationSound();
+            }).catch(() => {
+                const fallback = new Notification(notification.title, {
+                    body: notification.message || '',
+                    tag: notification.id,
+                    silent: true,
+                });
+                playDesktopNotificationSound();
+                fallback.onclick = () => {
+                    window.focus();
+                    navigate(resolveNotificationTarget(notification));
+                };
+            });
+            return;
+        }
+
+        const desktopNotification = new Notification(notification.title, {
             body: notification.message || '',
             tag: notification.id,
+            silent: true,
+            data: { url: targetUrl },
         });
+        playDesktopNotificationSound();
+        desktopNotification.onclick = () => {
+            window.focus();
+            navigate(resolveNotificationTarget(notification));
+        };
     } catch {
         // noop
     }

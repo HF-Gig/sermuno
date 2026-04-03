@@ -10,6 +10,8 @@ import type {
   EscalationRule,
 } from '../../modules/sla/dto/sla.dto';
 import { ThreadStatus, MessageDirection } from '@prisma/client';
+import { NotificationsService } from '../../modules/notifications/notifications.service';
+import { WebhooksService } from '../../modules/webhooks/webhooks.service';
 
 export interface SlaCheckJobData {
   organizationId: string;
@@ -25,6 +27,8 @@ export class SlaCheckProcessor extends WorkerHost {
   constructor(
     private readonly prisma: PrismaService,
     private readonly slaService: SlaService,
+    private readonly notifications: NotificationsService,
+    private readonly webhooks: WebhooksService,
   ) {
     super();
   }
@@ -91,7 +95,8 @@ export class SlaCheckProcessor extends WorkerHost {
         targets,
         businessHours,
       );
-      const deadline = deadlines.firstResponseDueAt ?? deadlines.resolutionDueAt;
+      const deadline =
+        deadlines.firstResponseDueAt ?? deadlines.resolutionDueAt;
       const isBreached = Boolean(deadline && deadline <= new Date());
 
       await this.prisma.thread.update({
@@ -102,6 +107,17 @@ export class SlaCheckProcessor extends WorkerHost {
           slaBreached: isBreached,
         },
       });
+
+      if (deadline && !isBreached) {
+        await this.dispatchSlaWarningIfDue({
+          organizationId,
+          threadId: thread.id,
+          assignedUserId: thread.assignedUserId,
+          mailboxId: thread.mailboxId,
+          deadlineAt: deadline,
+          policyId: policy.id,
+        });
+      }
 
       if (!deadline || !isBreached || thread.slaBreached) continue;
 
@@ -121,6 +137,15 @@ export class SlaCheckProcessor extends WorkerHost {
         },
       });
 
+      await this.dispatchSlaBreach({
+        organizationId,
+        threadId: thread.id,
+        assignedUserId: thread.assignedUserId,
+        mailboxId: thread.mailboxId,
+        deadlineAt: deadline,
+        policyId: policy.id,
+      });
+
       // Update breach count on the policy
       await this.prisma.slaPolicy.update({
         where: { id: policy.id },
@@ -134,7 +159,14 @@ export class SlaCheckProcessor extends WorkerHost {
         );
         if (escalationDeadline > new Date()) continue;
 
-        await this.applyEscalation(thread.id, organizationId, policy.id, rule);
+        await this.applyEscalation(
+          thread.id,
+          organizationId,
+          policy.id,
+          rule,
+          thread.assignedUserId,
+          thread.mailboxId,
+        );
       }
     }
   }
@@ -144,6 +176,8 @@ export class SlaCheckProcessor extends WorkerHost {
     organizationId: string,
     slaPolicyId: string,
     rule: EscalationRule,
+    assignedUserId: string | null,
+    mailboxId: string,
   ): Promise<void> {
     try {
       switch (rule.action) {
@@ -159,7 +193,35 @@ export class SlaCheckProcessor extends WorkerHost {
 
         case 'escalate':
         case 'notify':
-          // notify / escalate: log the event; actual notification dispatch handled in Phase 5
+          await this.dispatchEscalationNotification({
+            threadId,
+            organizationId,
+            assignedUserId,
+            targetUserId: rule.targetUserId,
+            targetTeamId: rule.targetTeamId,
+            mailboxId,
+            action: rule.action,
+            afterMinutes: rule.afterMinutes,
+          });
+
+          if (rule.channel === 'webhook') {
+            await this.webhooks
+              .dispatch(organizationId, 'sla.breach', {
+                threadId,
+                mailboxId,
+                slaPolicyId,
+                escalationAction: rule.action,
+                afterMinutes: rule.afterMinutes,
+                channel: rule.channel,
+                targetUserId: rule.targetUserId ?? null,
+                targetTeamId: rule.targetTeamId ?? null,
+              })
+              .catch((error) => {
+                this.logger.error(
+                  `[sla-check] Escalation webhook failed for thread ${threadId}: ${String(error)}`,
+                );
+              });
+          }
           break;
       }
 
@@ -186,5 +248,189 @@ export class SlaCheckProcessor extends WorkerHost {
         `[sla-check] Escalation failed for thread ${threadId}: ${String(err)}`,
       );
     }
+  }
+
+  private async dispatchSlaWarningIfDue(params: {
+    organizationId: string;
+    threadId: string;
+    assignedUserId: string | null;
+    mailboxId: string;
+    deadlineAt: Date;
+    policyId: string;
+  }) {
+    const thresholdMinutes = 30;
+    const minutesUntilBreach = Math.floor(
+      (params.deadlineAt.getTime() - Date.now()) / 60_000,
+    );
+    if (minutesUntilBreach > thresholdMinutes) {
+      return;
+    }
+
+    const alreadyWarned = await this.prisma.notification.findFirst({
+      where: {
+        organizationId: params.organizationId,
+        type: 'sla_warning',
+        resourceId: params.threadId,
+      },
+      select: { id: true },
+    });
+    if (alreadyWarned) {
+      return;
+    }
+
+    const recipients = await this.getSlaRecipients(
+      params.organizationId,
+      params.assignedUserId,
+    );
+
+    await Promise.all(
+      recipients.map((recipientId) =>
+        this.notifications
+          .dispatch({
+            userId: recipientId,
+            organizationId: params.organizationId,
+            type: 'sla_warning',
+            title: 'SLA warning',
+            message: `Thread ${params.threadId} is due in ${Math.max(minutesUntilBreach, 0)} minute(s).`,
+            resourceId: params.threadId,
+            data: {
+              threadId: params.threadId,
+              mailboxId: params.mailboxId,
+              policyId: params.policyId,
+              minutesUntilBreach: Math.max(minutesUntilBreach, 0),
+              deadlineAt: params.deadlineAt.toISOString(),
+            },
+          })
+          .catch(() => undefined),
+      ),
+    );
+
+    await this.webhooks
+      .dispatch(params.organizationId, 'sla.warning', {
+        threadId: params.threadId,
+        mailboxId: params.mailboxId,
+        policyId: params.policyId,
+        deadlineAt: params.deadlineAt.toISOString(),
+        minutesUntilBreach: Math.max(minutesUntilBreach, 0),
+      })
+      .catch(() => undefined);
+  }
+
+  private async dispatchSlaBreach(params: {
+    organizationId: string;
+    threadId: string;
+    assignedUserId: string | null;
+    mailboxId: string;
+    deadlineAt: Date;
+    policyId: string;
+  }) {
+    const recipients = await this.getSlaRecipients(
+      params.organizationId,
+      params.assignedUserId,
+    );
+
+    await Promise.all(
+      recipients.map((recipientId) =>
+        this.notifications
+          .dispatch({
+            userId: recipientId,
+            organizationId: params.organizationId,
+            type: 'sla_breach',
+            title: 'SLA breached',
+            message: `Thread ${params.threadId} breached its SLA target.`,
+            resourceId: params.threadId,
+            data: {
+              threadId: params.threadId,
+              mailboxId: params.mailboxId,
+              policyId: params.policyId,
+              deadlineAt: params.deadlineAt.toISOString(),
+            },
+          })
+          .catch(() => undefined),
+      ),
+    );
+
+    await this.webhooks
+      .dispatch(params.organizationId, 'sla.breach', {
+        threadId: params.threadId,
+        mailboxId: params.mailboxId,
+        policyId: params.policyId,
+        deadlineAt: params.deadlineAt.toISOString(),
+      })
+      .catch(() => undefined);
+  }
+
+  private async dispatchEscalationNotification(params: {
+    threadId: string;
+    organizationId: string;
+    assignedUserId: string | null;
+    targetUserId?: string;
+    targetTeamId?: string;
+    mailboxId: string;
+    action: 'notify' | 'escalate';
+    afterMinutes: number;
+  }) {
+    const recipientIds = new Set<string>();
+    if (params.targetUserId) {
+      recipientIds.add(params.targetUserId);
+    }
+    if (params.assignedUserId) {
+      recipientIds.add(params.assignedUserId);
+    }
+
+    if (params.targetTeamId) {
+      const members = await this.prisma.teamMember.findMany({
+        where: { teamId: params.targetTeamId },
+        select: { userId: true },
+      });
+      for (const member of members) {
+        recipientIds.add(member.userId);
+      }
+    }
+
+    if (recipientIds.size === 0) {
+      return;
+    }
+
+    await Promise.all(
+      [...recipientIds].map((recipientId) =>
+        this.notifications
+          .dispatch({
+            userId: recipientId,
+            organizationId: params.organizationId,
+            type: 'sla_breach',
+            title: `SLA ${params.action}`,
+            message: `Escalation triggered for thread ${params.threadId} after ${params.afterMinutes} minute(s).`,
+            resourceId: params.threadId,
+            data: {
+              threadId: params.threadId,
+              mailboxId: params.mailboxId,
+              escalationAction: params.action,
+              afterMinutes: params.afterMinutes,
+            },
+          })
+          .catch(() => undefined),
+      ),
+    );
+  }
+
+  private async getSlaRecipients(
+    organizationId: string,
+    assignedUserId: string | null,
+  ): Promise<string[]> {
+    if (assignedUserId) {
+      return [assignedUserId];
+    }
+
+    const managers = await this.prisma.user.findMany({
+      where: {
+        organizationId,
+        deletedAt: null,
+        isActive: true,
+        role: { in: ['ADMIN', 'MANAGER'] },
+      },
+      select: { id: true },
+    });
+    return managers.map((entry) => entry.id);
   }
 }

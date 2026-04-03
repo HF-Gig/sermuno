@@ -5,6 +5,8 @@ import type { Job } from 'bullmq';
 import * as nodemailer from 'nodemailer';
 import { PrismaService } from '../../database/prisma.service';
 import { NOTIFICATION_DISPATCH_QUEUE } from '../queues/notification-dispatch.queue';
+import { PushNotificationsService } from '../../modules/notifications/push-notifications.service';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 export interface NotificationDispatchJobData {
   notificationId?: string;
@@ -31,6 +33,8 @@ export class NotificationDispatchProcessor extends WorkerHost {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    private readonly pushNotifications: PushNotificationsService,
+    private readonly featureFlags: FeatureFlagsService,
   ) {
     super();
   }
@@ -51,7 +55,13 @@ export class NotificationDispatchProcessor extends WorkerHost {
     );
 
     try {
-      let notification: { title: string; message: string | null } | null = null;
+      let notification: {
+        title: string;
+        message: string | null;
+        type: string;
+        resourceId: string | null;
+        data: unknown;
+      } | null = null;
 
       if (notificationId) {
         notification = await this.prisma.notification.findUnique({
@@ -82,6 +92,44 @@ export class NotificationDispatchProcessor extends WorkerHost {
               attachments,
             });
           }
+          break;
+        case 'push':
+          if (!this.featureFlags.isEnabled('ENABLE_PUSH_NOTIFICATIONS')) {
+            this.logger.log(
+              '[notification-dispatch] Push feature disabled; skipping push dispatch',
+            );
+            return;
+          }
+          if (
+            !notification ||
+            !notificationId ||
+            !userId ||
+            !job.data.organizationId
+          ) {
+            this.logger.warn(
+              '[notification-dispatch] Missing notification, notificationId, userId, or organizationId for push dispatch',
+            );
+            return;
+          }
+          await this.pushNotifications.deliverToUser({
+            userId,
+            organizationId: job.data.organizationId,
+            payload: {
+              notificationId,
+              title: notification.title,
+              message: notification.message,
+              type: notification.type ?? 'notification',
+              resourceId: notification.resourceId ?? null,
+              url: this.pushNotifications.resolveNotificationUrl(
+                notification.type,
+                notification.resourceId,
+              ),
+              data:
+                notification.data && typeof notification.data === 'object'
+                  ? (notification.data as Record<string, unknown>)
+                  : undefined,
+            },
+          });
           break;
         default:
           return;

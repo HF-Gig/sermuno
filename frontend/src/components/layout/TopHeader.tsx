@@ -5,6 +5,7 @@ import { useNotifications } from '../../context/NotificationContext';
 import { useTranslation } from 'react-i18next';
 import api, { resolveAvatarUrl } from '../../lib/api';
 import { ORGANIZATION_UPDATED_EVENT } from '../../lib/organizationEvents';
+import { resolveNotificationTarget } from '../../lib/notificationRouting';
 
 const resolveOrganizationLogoUrl = (logoUrl?: string | null) => {
     if (!logoUrl) return undefined;
@@ -44,31 +45,6 @@ const toRelativeTime = (isoDate?: string) => {
     const days = Math.floor(hours / 24);
     if (days < 7) return `${days}d`;
     return date.toLocaleDateString();
-};
-
-const resolveNotificationTarget = (type?: string, resourceId?: string | null) => {
-    const normalizedType = String(type || '').toLowerCase();
-    const normalizedResourceId = resourceId ? String(resourceId) : '';
-
-    if (!normalizedResourceId) {
-        if (normalizedType.startsWith('calendar')) return '/calendar';
-        if (normalizedType.startsWith('message') || normalizedType.startsWith('thread')) return '/inbox';
-        return '/notifications';
-    }
-
-    if (normalizedType.startsWith('calendar')) {
-        return `/calendar?eventId=${encodeURIComponent(normalizedResourceId)}`;
-    }
-
-    if (normalizedType.startsWith('message')) {
-        return `/inbox?t${encodeURIComponent(normalizedResourceId)}`;
-    }
-
-    if (normalizedType.startsWith('thread') || normalizedType.startsWith('sla')) {
-        return `/inbox/t${encodeURIComponent(normalizedResourceId)}`;
-    }
-
-    return '/notifications';
 };
 
 const TopHeader: React.FC = () => {
@@ -135,7 +111,7 @@ const TopHeader: React.FC = () => {
             await markAsRead(notification.id);
         }
         setIsNotifOpen(false);
-        navigate(resolveNotificationTarget(notification?.type, notification?.resourceId));
+        navigate(resolveNotificationTarget(notification));
     };
 
     return (

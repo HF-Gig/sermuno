@@ -19,6 +19,7 @@ import type { Express } from 'express';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import { AttachmentScanService } from './attachment-scan.service';
 import { AttachmentStorageService } from './attachment-storage.service';
 import { PrismaService } from '../../database/prisma.service';
 
@@ -27,6 +28,7 @@ import { PrismaService } from '../../database/prisma.service';
 export class AttachmentsController {
   constructor(
     private readonly storage: AttachmentStorageService,
+    private readonly attachmentScan: AttachmentScanService,
     private readonly prisma: PrismaService,
   ) {}
 
@@ -43,31 +45,10 @@ export class AttachmentsController {
   ) {
     if (!file) throw new BadRequestException('No file uploaded');
     if (!messageId) throw new BadRequestException('messageId is required');
-
-    // Verify message belongs to org
-    const message = await this.prisma.message.findFirst({
-      where: { id: messageId, thread: { organizationId: user.organizationId } },
-      select: { id: true },
+    return this.attachmentScan.createDirectUploadAttachment(user, {
+      messageId,
+      file,
     });
-    if (!message) throw new NotFoundException('Message not found');
-
-    const storageKey = this.storage.generateStorageKey(
-      user.organizationId,
-      file.originalname,
-    );
-    await this.storage.upload(storageKey, file.buffer, file.mimetype);
-
-    const attachment = await this.prisma.attachment.create({
-      data: {
-        message: { connect: { id: messageId } },
-        filename: file.originalname,
-        contentType: file.mimetype,
-        sizeBytes: file.size,
-        storageKey,
-      },
-    });
-
-    return attachment;
   }
 
   /**
@@ -110,24 +91,13 @@ export class AttachmentsController {
         'messageId, storageKey, filename are required',
       );
     }
-
-    const message = await this.prisma.message.findFirst({
-      where: { id: messageId, thread: { organizationId: user.organizationId } },
-      select: { id: true },
+    return this.attachmentScan.confirmUploadedAttachment(user, {
+      messageId,
+      storageKey,
+      filename,
+      contentType: contentType ?? null,
+      sizeBytes: sizeBytes ?? 0,
     });
-    if (!message) throw new NotFoundException('Message not found');
-
-    const attachment = await this.prisma.attachment.create({
-      data: {
-        message: { connect: { id: messageId } },
-        filename,
-        contentType: contentType ?? null,
-        sizeBytes: sizeBytes ?? 0,
-        storageKey,
-      },
-    });
-
-    return attachment;
   }
 
   /**
@@ -143,8 +113,12 @@ export class AttachmentsController {
       },
     });
     if (!attachment) throw new NotFoundException('Attachment not found');
+    await this.attachmentScan.ensureAttachmentDownloadAllowed(
+      attachment,
+      user.sub,
+    );
 
-    const url = this.storage.requiresPresign(attachment.sizeBytes)
+    const url = this.storage.isS3Storage()
       ? await this.storage.presignedGetUrl(attachment.storageKey)
       : `/attachments/${encodeURIComponent(attachment.id)}/download`;
 
@@ -169,25 +143,34 @@ export class AttachmentsController {
       },
     });
     if (!attachment) throw new NotFoundException('Attachment not found');
+    const approvedAttachment =
+      await this.attachmentScan.ensureAttachmentDownloadAllowed(
+        attachment,
+        user.sub,
+      );
 
     const disposition = inline === 'true' ? 'inline' : 'attachment';
 
     // S3: redirect to pre-signed GET URL
-    if (this.storage.requiresPresign(attachment.sizeBytes)) {
-      const url = await this.storage.presignedGetUrl(attachment.storageKey);
+    if (this.storage.isS3Storage()) {
+      const url = await this.storage.presignedGetUrl(
+        approvedAttachment.storageKey,
+      );
       res.redirect(url);
       return;
     }
 
-    // Local or small S3: stream directly
-    const buffer = await this.storage.getLocalBuffer(attachment.storageKey);
+    // Local storage: stream directly
+    const buffer = await this.storage.getLocalBuffer(
+      approvedAttachment.storageKey,
+    );
     res.setHeader(
       'Content-Type',
-      attachment.contentType ?? 'application/octet-stream',
+      approvedAttachment.contentType ?? 'application/octet-stream',
     );
     res.setHeader(
       'Content-Disposition',
-      `${disposition}; filename="${attachment.filename}"`,
+      `${disposition}; filename="${approvedAttachment.filename}"`,
     );
     res.send(buffer);
   }

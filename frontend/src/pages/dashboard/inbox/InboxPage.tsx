@@ -216,6 +216,20 @@ type AssigneeOption = { id: string; label: string; type: 'user' | 'team' };
 type RecurrencePreset = 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly';
 type ScheduledStatePreset = 'no_change' | 'new' | 'in_progress' | 'waiting' | 'resolved';
 type MailboxNavItem = { id: string; name: string; email: string; unreadCount: number; provider?: string };
+type MentionedUser = {
+    id: string;
+    fullName: string;
+    email: string;
+    avatarUrl?: string | null;
+    mentionKey: string;
+};
+type InternalNote = {
+    id: string;
+    body: string;
+    createdAt: string;
+    user?: { id?: string; fullName?: string; email?: string; avatarUrl?: string | null };
+    mentionedUsers?: MentionedUser[];
+};
 
 type SidebarCounts = {
     [id: string]: number;
@@ -240,6 +254,14 @@ const toThreadRouteCode = (threadId: string): string => {
         hash = (hash * 31 + base.charCodeAt(i)) % 1000000;
     }
     return String(hash).padStart(6, '0');
+};
+
+const normalizeThreadApiId = (threadId: string): string => {
+    const raw = String(threadId || '').trim();
+    if (/^t\d+$/.test(raw)) {
+        return raw.slice(1);
+    }
+    return raw;
 };
 
 const emptySidebarCounts: SidebarCounts = {};
@@ -379,7 +401,7 @@ const InboxPage: React.FC = () => {
     const [unreadCount, setUnreadCount] = useState(3);
 
     const [activeTab, setActiveTab] = useState<'notes' | 'activity'>('notes');
-    const [internalNotes, setInternalNotes] = useState<Array<{ id: string; body: string; createdAt: string; user?: { fullName?: string; email?: string; avatarUrl?: string } }>>([]);
+    const [internalNotes, setInternalNotes] = useState<InternalNote[]>([]);
     const [isAddingNote, setIsAddingNote] = useState(false);
     const [newNote, setNewNote] = useState('');
     const [noteError, setNoteError] = useState('');
@@ -1125,7 +1147,7 @@ const InboxPage: React.FC = () => {
         internalNotes.map((note) => ({
             id: note.id,
             type: 'internal-note',
-            threadId: String(openThread?.id || '').replace('t', ''),
+            threadId: normalizeThreadApiId(String(openThread?.id || '')),
             fromEmail: note.user?.email || 'internal-note',
             toEmail: '',
             subject: openThread?.subject || '',
@@ -1135,6 +1157,7 @@ const InboxPage: React.FC = () => {
             direction: 'OUTBOUND' as const,
             isRead: true,
             user: note.user || { fullName: user?.fullName, email: user?.email, avatarUrl: user?.avatarUrl },
+            mentionedUsers: Array.isArray(note.mentionedUsers) ? note.mentionedUsers : [],
         }))
     ), [internalNotes, openThread?.id, openThread?.subject, user?.fullName, user?.email, user?.avatarUrl]);
 
@@ -1446,7 +1469,7 @@ const InboxPage: React.FC = () => {
     const handleDeleteNote = async (noteId: string) => {
         if (!actualOpenThread) return;
         try {
-            await api.delete(`/threads/${String(actualOpenThread.id).replace('t', '')}/notes/${noteId}`);
+            await api.delete(`/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/notes/${noteId}`);
             setInternalNotes(prev => prev.filter(note => note.id !== noteId));
         } catch (err) {
             console.error('Failed to delete note:', err);
@@ -1460,7 +1483,7 @@ const InboxPage: React.FC = () => {
         setIsSavingNote(true);
         try {
             const response = await api.patch(
-                `/threads/${String(actualOpenThread.id).replace('t', '')}/notes/${editingNoteId}`,
+                `/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/notes/${editingNoteId}`,
                 { body: plainText }
             );
             setInternalNotes(prev => prev.map(note =>
@@ -1482,8 +1505,17 @@ const InboxPage: React.FC = () => {
         if (!plainText || !actualOpenThread) return;
         setIsSavingNote(true);
         try {
-            const response = await api.post(`/threads/${String(actualOpenThread.id).replace('t', '')}/notes`, { body: plainText });
-            setInternalNotes(prev => [...prev, response.data]);
+            const response = await api.post(`/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/notes`, { body: plainText });
+            setInternalNotes(prev => {
+                const existingIndex = prev.findIndex(note => note.id === response.data.id);
+                if (existingIndex === -1) {
+                    return [...prev, response.data];
+                }
+
+                const next = [...prev];
+                next[existingIndex] = response.data;
+                return next;
+            });
             setNoteHtml('');
         } catch (err) {
             console.error('Failed to save note:', err);
@@ -2740,6 +2772,19 @@ const InboxPage: React.FC = () => {
                                                     </div>
                                                 )}
                                                 <div className="prose prose-sm max-w-none break-words" dangerouslySetInnerHTML={{ __html: normalizeMessageBody(msg.bodyHtml, msg.bodyText) }} />
+                                                {isInternalNote && Array.isArray(msg.mentionedUsers) && msg.mentionedUsers.length > 0 && (
+                                                    <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-[#fae8b7] pt-2 text-[11px] text-[var(--color-text-muted)]">
+                                                        <span className="font-semibold text-[var(--color-text-primary)]">Mentions:</span>
+                                                        {msg.mentionedUsers.map((mentionedUser: MentionedUser) => (
+                                                            <span
+                                                                key={mentionedUser.id}
+                                                                className="inline-flex items-center rounded-full border border-[#fae8b7] bg-white/80 px-2 py-0.5"
+                                                            >
+                                                                @{mentionedUser.mentionKey} {mentionedUser.fullName}
+                                                            </span>
+                                                        ))}
+                                                    </div>
+                                                )}
                                                 {messageAttachments.length > 0 && (
                                                     <div className="mt-3 flex flex-wrap gap-1.5">
                                                         {messageAttachments.map((attachment: any, index: number) => (
