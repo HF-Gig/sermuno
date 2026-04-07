@@ -185,7 +185,7 @@ const TemplatesPage: React.FC = () => {
                     ) : null}
                 />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={6} cols={4} showHeader={false} />
+                    <TablePageSkeleton cols={4} showHeader={false} />
                 </div>
             </div>
         );
@@ -312,3 +312,4 @@ const TemplatesPage: React.FC = () => {
 };
 
 export default TemplatesPage;
+

@@ -3,16 +3,20 @@ import {
   Logger,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import * as archiver from 'archiver';
 import { stringify } from 'csv-stringify/sync';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
 import type { CreateExportJobDto } from './dto/export-import.dto';
 
-// Columns we can safely SELECT from export_jobs (format + expiresAt missing in DB)
+// Columns returned from export_jobs
 const EXPORT_JOB_SELECT = {
   id: true,
   organizationId: true,
@@ -24,6 +28,10 @@ const EXPORT_JOB_SELECT = {
   payload: true,
   artifactUrl: true,
   expiresAt: true,
+  downloadCount: true,
+  maxDownloads: true,
+  progressPercentage: true,
+  checksum: true,
   error: true,
   createdAt: true,
   updatedAt: true,
@@ -50,23 +58,35 @@ const EXPORT_TYPES = [
   'analytics_export',
 ] as const;
 
+type ExportDownloadTokenPayload = {
+  exportJobId: string;
+  expiresAt: number;
+  organizationId: string;
+  userId: string;
+  version: 1;
+};
+
 /** Temporary artifact storage dir (local filesystem) */
 const ARTIFACT_DIR = path.join(process.cwd(), 'export-artifacts');
 
 @Injectable()
 export class ExportImportService {
   private readonly logger = new Logger(ExportImportService.name);
+  private readonly downloadTokenTtlSeconds = 120;
 
-  constructor(private readonly prisma: PrismaService) {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly config: ConfigService,
+  ) {
     // Ensure artifact dir exists
     if (!fs.existsSync(ARTIFACT_DIR)) {
       fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Export
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async createExport(dto: CreateExportJobDto, user: JwtUser) {
     const requestedType = (dto as unknown as { type?: string }).type;
@@ -106,6 +126,10 @@ export class ExportImportService {
           resources as unknown as import('@prisma/client').Prisma.InputJsonValue,
         resourceCounts:
           {} as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        downloadCount: 0,
+        maxDownloads: 5,
+        progressPercentage: 0,
+        checksum: null,
         payload: {
           format,
           from: dto.from,
@@ -150,40 +174,153 @@ export class ExportImportService {
   async downloadExport(
     id: string,
     user: JwtUser,
-  ): Promise<{ filePath: string; filename: string }> {
+  ): Promise<{
+    filePath: string;
+    filename: string;
+    checksum: string | null;
+    jobId: string;
+  }> {
     const job = await this.getExport(id, user);
-    if (job.status !== 'done') {
-      if (job.status !== 'completed') {
-        throw new BadRequestException(
-          `Export job status is '${job.status}' — not ready for download`,
-        );
-      }
+    await this.assertDownloadableExport(job.id, job.status, job.expiresAt);
+    const payload = (job.payload as Record<string, string> | null) ?? null;
+    return this.prepareDownloadResponse(job.id, payload, job.checksum ?? null);
+  }
+
+  async createDownloadUrl(
+    id: string,
+    user: JwtUser,
+  ): Promise<{ expiresAt: string; token: string; filename: string }> {
+    const job = await this.getExport(id, user);
+    await this.assertDownloadableExport(job.id, job.status, job.expiresAt);
+    const payload = (job.payload as Record<string, string> | null) ?? null;
+    const filename = this.buildExportFilename(job.id, payload?.format ?? null);
+    const expiresAt = new Date(Date.now() + this.downloadTokenTtlSeconds * 1000);
+    const token = this.signDownloadToken({
+      exportJobId: job.id,
+      expiresAt: expiresAt.getTime(),
+      organizationId: user.organizationId,
+      userId: user.sub,
+      version: 1,
+    });
+
+    return {
+      expiresAt: expiresAt.toISOString(),
+      filename,
+      token,
+    };
+  }
+
+  async downloadExportWithToken(
+    id: string,
+    token: string,
+  ): Promise<{
+    filePath: string;
+    filename: string;
+    checksum: string | null;
+    jobId: string;
+  }> {
+    const payload = this.verifyDownloadToken(token);
+    if (payload.exportJobId !== id) {
+      throw new BadRequestException('Download token does not match export id');
     }
-    if (job.expiresAt && job.expiresAt.getTime() <= Date.now()) {
+    const job = await this.prisma.exportJob.findFirst({
+      where: {
+        id,
+        organizationId: payload.organizationId,
+      },
+      select: EXPORT_JOB_SELECT,
+    });
+    if (!job) {
+      throw new NotFoundException('Export job not found');
+    }
+
+    await this.assertDownloadableExport(job.id, job.status, job.expiresAt);
+    const exportPayload = (job.payload as Record<string, string> | null) ?? null;
+    return this.prepareDownloadResponse(
+      job.id,
+      exportPayload,
+      job.checksum ?? null,
+    );
+  }
+
+  private async prepareDownloadResponse(
+    id: string,
+    payload: Record<string, string> | null,
+    checksum: string | null,
+  ): Promise<{
+    filePath: string;
+    filename: string;
+    checksum: string | null;
+    jobId: string;
+  }> {
+    const reserved = await this.reserveDownloadSlot(id);
+    if (!reserved) {
+      throw new ForbiddenException('Export download limit reached');
+    }
+
+    const job = await this.prisma.exportJob.findUnique({
+      where: { id },
+      select: { artifactUrl: true },
+    });
+    if (!job?.artifactUrl) {
+      await this.rollbackDownloadReservation(id);
+      throw new BadRequestException('Export artifact not available');
+    }
+
+    const filePath = job.artifactUrl;
+    if (!fs.existsSync(filePath)) {
+      await this.rollbackDownloadReservation(id);
+      throw new NotFoundException('Export file not found on disk');
+    }
+
+    return {
+      filePath,
+      filename: this.buildExportFilename(id, payload?.format ?? null),
+      checksum,
+      jobId: id,
+    };
+  }
+
+  private buildExportFilename(id: string, format: string | null): string {
+    const normalizedFormat = String(format || 'json').toLowerCase();
+    const extension = normalizedFormat === 'eml' ? 'zip' : normalizedFormat;
+    return `export-${id}.${extension}`;
+  }
+
+  private async assertDownloadableExport(
+    id: string,
+    status: string,
+    expiresAt: Date | null,
+  ): Promise<void> {
+    if (status !== 'done' && status !== 'completed') {
+      throw new BadRequestException(
+        `Export job status is '${status}' - not ready for download`,
+      );
+    }
+    if (expiresAt && expiresAt.getTime() <= Date.now()) {
       await this.prisma.exportJob.update({
         where: { id },
         data: { status: 'expired' },
       });
       throw new BadRequestException('Export has expired');
     }
-    if (!job.artifactUrl) {
-      throw new BadRequestException('Export artifact not available');
-    }
-    const filePath = job.artifactUrl;
-    if (!fs.existsSync(filePath)) {
-      throw new NotFoundException('Export file not found on disk');
-    }
-    const payload = job.payload as Record<string, string> | null;
-    const format = payload?.format ?? 'json';
-    return {
-      filePath,
-      filename: `export-${id}.${format === 'eml' ? 'zip' : format}`,
-    };
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  async rollbackDownloadReservation(id: string): Promise<void> {
+    await this.prisma.exportJob.updateMany({
+      where: {
+        id,
+        downloadCount: { gt: 0 },
+      },
+      data: {
+        downloadCount: { decrement: 1 },
+      },
+    });
+  }
+
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Import
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async createImport(user: JwtUser, fileBuffer: Buffer, originalName: string) {
     const ext = path.extname(originalName).toLowerCase().replace('.', '');
@@ -224,9 +361,9 @@ export class ExportImportService {
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Internal: export runner
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private async runExport(
     jobId: string,
@@ -237,7 +374,10 @@ export class ExportImportService {
   ): Promise<void> {
     await this.prisma.exportJob.updateMany({
       where: { id: jobId },
-      data: { status: 'processing' },
+      data: {
+        status: 'processing',
+        progressPercentage: 10,
+      },
     });
 
     try {
@@ -252,6 +392,10 @@ export class ExportImportService {
         },
         include: { messages: true },
         take: 10000,
+      });
+      await this.prisma.exportJob.updateMany({
+        where: { id: jobId },
+        data: { progressPercentage: 40 },
       });
 
       let filePath: string;
@@ -269,18 +413,122 @@ export class ExportImportService {
         default:
           filePath = await this.buildJson(jobId, threads);
       }
+      await this.prisma.exportJob.updateMany({
+        where: { id: jobId },
+        data: { progressPercentage: 80 },
+      });
+
+      const checksum = this.computeFileChecksum(filePath);
+      await this.prisma.exportJob.updateMany({
+        where: { id: jobId },
+        data: {
+          checksum,
+          progressPercentage: 95,
+        },
+      });
 
       await this.prisma.exportJob.updateMany({
         where: { id: jobId },
-        data: { status: 'completed', artifactUrl: filePath },
+        data: {
+          status: 'completed',
+          artifactUrl: filePath,
+          checksum,
+          progressPercentage: 100,
+        },
       });
     } catch (err) {
       await this.prisma.exportJob.updateMany({
         where: { id: jobId },
-        data: { status: 'failed', error: String(err) },
+        data: {
+          status: 'failed',
+          error: String(err),
+          progressPercentage: 100,
+        },
       });
       throw err;
     }
+  }
+
+  private async reserveDownloadSlot(id: string): Promise<boolean> {
+    const updatedRows = await this.prisma.$executeRaw`
+      UPDATE "export_jobs"
+      SET "downloadCount" = "downloadCount" + 1
+      WHERE "id" = ${id}
+        AND "downloadCount" < "maxDownloads"
+    `;
+    return Number(updatedRows) > 0;
+  }
+
+  private computeFileChecksum(filePath: string): string {
+    return crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(filePath))
+      .digest('hex');
+  }
+
+  private signDownloadToken(payload: ExportDownloadTokenPayload): string {
+    const serializedPayload = Buffer.from(
+      JSON.stringify(payload),
+      'utf8',
+    ).toString('base64url');
+    const signature = crypto
+      .createHmac('sha256', this.getDownloadTokenSecret())
+      .update(serializedPayload)
+      .digest('base64url');
+
+    return `${serializedPayload}.${signature}`;
+  }
+
+  private verifyDownloadToken(token: string): ExportDownloadTokenPayload {
+    const [serializedPayload, signature] = String(token || '').split('.');
+    if (!serializedPayload || !signature) {
+      throw new BadRequestException('Invalid download token');
+    }
+
+    const expectedSignature = crypto
+      .createHmac('sha256', this.getDownloadTokenSecret())
+      .update(serializedPayload)
+      .digest('base64url');
+    const providedSignature = Buffer.from(signature, 'utf8');
+    const expectedSignatureBuffer = Buffer.from(expectedSignature, 'utf8');
+    if (
+      providedSignature.length !== expectedSignatureBuffer.length ||
+      !crypto.timingSafeEqual(providedSignature, expectedSignatureBuffer)
+    ) {
+      throw new ForbiddenException('Download token signature is invalid');
+    }
+
+    let payload: ExportDownloadTokenPayload;
+    try {
+      payload = JSON.parse(
+        Buffer.from(serializedPayload, 'base64url').toString('utf8'),
+      ) as ExportDownloadTokenPayload;
+    } catch {
+      throw new BadRequestException('Download token payload is invalid');
+    }
+
+    if (payload.version !== 1) {
+      throw new BadRequestException('Download token version is not supported');
+    }
+    if (!payload.expiresAt || payload.expiresAt <= Date.now()) {
+      throw new ForbiddenException('Download token has expired');
+    }
+
+    return payload;
+  }
+
+  private getDownloadTokenSecret(): string {
+    const configuredSecret =
+      this.config.get<string>('encryption.key') ??
+      this.config.get<string>('jwt.secret') ??
+      '';
+    if (configuredSecret.trim()) {
+      return configuredSecret;
+    }
+
+    throw new ServiceUnavailableException(
+      'Export download token signing is not configured',
+    );
   }
 
   private async buildJson(jobId: string, threads: unknown[]): Promise<string> {
@@ -432,9 +680,9 @@ export class ExportImportService {
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Internal: import runner
-  // ─────────────────────────────────────────────────────────────────────────
+  // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private async runImport(
     jobId: string,
@@ -514,3 +762,4 @@ export class ExportImportService {
     return Math.max(0, lines.length - 1); // minus header
   }
 }
+

@@ -10,11 +10,17 @@ import { PrismaService } from '../../database/prisma.service';
 import { CrmService } from '../../modules/crm/crm.service';
 import type { Prisma } from '@prisma/client';
 import { EventsGateway } from '../../modules/websockets/events.gateway';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { RulesEngineService } from '../../modules/rules/rules-engine.service';
 import {
   resolveEmailSyncProviderPolicy,
   sharedEmailSyncRateLimiter,
   type EmailSyncProviderPolicy,
 } from './email-sync-provider-policy';
+import {
+  EmailSyncAdaptiveThrottle,
+  type EmailSyncAdaptiveThrottleOptions,
+} from './email-sync-adaptive-throttle';
 
 export interface EmailSyncJobData {
   mailboxId: string;
@@ -58,26 +64,48 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   return chunks;
 }
 
+class KillSwitchActivatedError extends Error {
+  constructor(
+    readonly flag: 'DISABLE_IMAP_SYNC',
+    readonly stage: string,
+  ) {
+    super(`${flag} active at ${stage}`);
+  }
+}
+
 @Processor(EMAIL_SYNC_QUEUE, {
   concurrency: 2,
 })
 export class EmailSyncProcessor extends WorkerHost {
   private readonly logger = new Logger(EmailSyncProcessor.name);
+  private readonly adaptiveThrottle = new EmailSyncAdaptiveThrottle();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly featureFlags: FeatureFlagsService,
     @Optional() private readonly crmService: CrmService | null,
     @Optional() private readonly eventsGateway: EventsGateway | null,
+    @Optional() private readonly rulesEngine: RulesEngineService | null,
   ) {
     super();
   }
 
   async process(job: Job<EmailSyncJobData>): Promise<void> {
     const { mailboxId, organizationId, streamingMode } = job.data;
+    const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
     this.logger.log(
       `[email-sync] mailbox=${mailboxId} org=${organizationId} streaming=${streamingMode ?? false}`,
     );
+    if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
+      await this.markMailboxSyncSkippedByKillSwitch(
+        mailboxId,
+        organizationId,
+        'IMAP sync skipped because DISABLE_IMAP_SYNC is active',
+      );
+      return;
+    }
+    await this.awaitAdaptiveThrottle(adaptiveBucketKey, mailboxId, 'job-start');
 
     const mailbox = await this.prisma.mailbox.findFirst({
       where: { id: mailboxId, organizationId, deletedAt: null },
@@ -230,6 +258,10 @@ export class EmailSyncProcessor extends WorkerHost {
         providerSyncPolicy,
       );
       if (outlookSynced) {
+        this.adaptiveThrottle.recordSuccess(
+          adaptiveBucketKey,
+          this.adaptiveOptions(),
+        );
         await this.prisma.mailbox.update({
           where: { id: mailboxId },
           data: {
@@ -273,7 +305,11 @@ export class EmailSyncProcessor extends WorkerHost {
     });
 
     try {
-      await this.acquireProviderRequestSlot(providerSyncPolicy);
+      await this.acquireProviderRequestSlot(
+        mailboxId,
+        providerSyncPolicy,
+        'imap-connect',
+      );
       await client.connect();
       await this.syncAllFolders(
         client,
@@ -281,6 +317,10 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         streamingMode ?? false,
         providerSyncPolicy,
+      );
+      this.adaptiveThrottle.recordSuccess(
+        adaptiveBucketKey,
+        this.adaptiveOptions(),
       );
 
       await this.prisma.mailbox.update({
@@ -301,6 +341,15 @@ export class EmailSyncProcessor extends WorkerHost {
         lastSyncAt: new Date().toISOString(),
       });
     } catch (err) {
+      if (err instanceof KillSwitchActivatedError) {
+        await this.markMailboxSyncSkippedByKillSwitch(
+          mailboxId,
+          organizationId,
+          `IMAP sync skipped at ${err.stage} because ${err.flag} is active`,
+        );
+        return;
+      }
+
       const errorDetails = (() => {
         if (!err || typeof err !== 'object') return String(err);
         const e = err as {
@@ -331,12 +380,125 @@ export class EmailSyncProcessor extends WorkerHost {
   }
 
   private async acquireProviderRequestSlot(
+    mailboxId: string,
     providerSyncPolicy: EmailSyncProviderPolicy,
+    stage = 'provider-slot',
   ): Promise<void> {
+    if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
+      throw new KillSwitchActivatedError('DISABLE_IMAP_SYNC', stage);
+    }
+
+    await this.awaitAdaptiveThrottle(
+      this.adaptiveBucketKey(mailboxId),
+      mailboxId,
+      stage,
+    );
     await sharedEmailSyncRateLimiter.acquire(
       providerSyncPolicy.key,
       providerSyncPolicy,
     );
+  }
+
+  private adaptiveBucketKey(mailboxId: string): string {
+    return `email-sync:${mailboxId}`;
+  }
+
+  private adaptiveOptions(): EmailSyncAdaptiveThrottleOptions {
+    return {
+      enableBackpressure: this.featureFlags.isEnabled('ENABLE_BACKPRESSURE'),
+      enableSmartBackoff: this.featureFlags.isEnabled('ENABLE_SMART_BACKOFF'),
+      backpressure: {
+        highWatermark: this.readNumberConfig(
+          'backpressure.heapHighWatermark',
+          0.85,
+        ),
+        recoveryWatermark: this.readNumberConfig(
+          'backpressure.heapRecoveryWatermark',
+          0.7,
+        ),
+        minDelayMs: Math.max(
+          0,
+          Math.round(
+            this.readNumberConfig('backpressure.minDelayMs', STREAM_DELAY_MS),
+          ),
+        ),
+        maxDelayMs: Math.max(
+          0,
+          Math.round(this.readNumberConfig('backpressure.maxDelayMs', 2000)),
+        ),
+      },
+      smartBackoff: {
+        baseDelayMs: Math.max(
+          1,
+          Math.round(this.readNumberConfig('smartBackoff.baseDelayMs', 100)),
+        ),
+        maxDelayMs: Math.max(
+          1,
+          Math.round(this.readNumberConfig('smartBackoff.maxDelayMs', 5000)),
+        ),
+        windowSize: Math.max(
+          1,
+          Math.round(this.readNumberConfig('smartBackoff.windowSize', 20)),
+        ),
+        errorRateWeight: Math.max(
+          0,
+          this.readNumberConfig('smartBackoff.errorRateWeight', 4),
+        ),
+        consecutiveWeight: Math.max(
+          0,
+          this.readNumberConfig('smartBackoff.consecutiveWeight', 1),
+        ),
+      },
+    };
+  }
+
+  private readNumberConfig(path: string, fallback: number): number {
+    const raw = this.configService.get<number | string | undefined>(path);
+    if (raw === undefined || raw === null || raw === '') return fallback;
+
+    const parsed =
+      typeof raw === 'number' ? raw : Number.parseFloat(String(raw));
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  private async awaitAdaptiveThrottle(
+    adaptiveBucketKey: string,
+    mailboxId: string,
+    stage: string,
+  ): Promise<number> {
+    const delay = this.adaptiveThrottle.computeDelay(
+      adaptiveBucketKey,
+      this.adaptiveOptions(),
+    );
+
+    if (delay.totalDelayMs > 0) {
+      this.logger.debug(
+        `[email-sync] mailbox=${mailboxId} stage=${stage} adaptiveDelayMs=${delay.totalDelayMs} backpressure=${delay.backpressureDelayMs} smart=${delay.smartBackoffDelayMs} heapRatio=${delay.heapRatio.toFixed(3)}`,
+      );
+      await sleep(delay.totalDelayMs);
+    }
+
+    return delay.totalDelayMs;
+  }
+
+  private async applyChunkDelay(
+    adaptiveBucketKey: string,
+    mailboxId: string,
+    streamingMode: boolean,
+    stage: string,
+  ): Promise<void> {
+    const adaptiveDelayMs = this.adaptiveThrottle.computeDelay(
+      adaptiveBucketKey,
+      this.adaptiveOptions(),
+    ).totalDelayMs;
+    const totalDelayMs = Math.max(streamingMode ? STREAM_DELAY_MS : 0, adaptiveDelayMs);
+
+    if (totalDelayMs > 0) {
+      this.logger.debug(
+        `[email-sync] mailbox=${mailboxId} stage=${stage} chunkDelayMs=${totalDelayMs}`,
+      );
+      await sleep(totalDelayMs);
+    }
   }
 
   private resolveFetchBatchSize(
@@ -358,12 +520,26 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     errorMessage: string,
   ) {
+    const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
+    const adaptiveOptions = this.adaptiveOptions();
+    this.adaptiveThrottle.recordFailure(adaptiveBucketKey, adaptiveOptions);
+
     const current = await this.prisma.mailbox.findUnique({
       where: { id: mailboxId },
       select: { syncErrorCount: true },
     });
     const newErrorCount = (current?.syncErrorCount ?? 0) + 1;
-    const backoffMinutes = Math.min(Math.pow(2, newErrorCount), 60);
+    const baseBackoffMinutes = Math.min(Math.pow(2, newErrorCount), 60);
+    const smartBackoffDelayMs = adaptiveOptions.enableSmartBackoff
+      ? this.adaptiveThrottle.computeDelay(adaptiveBucketKey, adaptiveOptions)
+          .smartBackoffDelayMs
+      : 0;
+    const smartBackoffMinutes =
+      smartBackoffDelayMs > 0 ? Math.ceil(smartBackoffDelayMs / 60000) : 0;
+    const backoffMinutes = Math.min(
+      60,
+      Math.max(baseBackoffMinutes, smartBackoffMinutes),
+    );
     const nextRetryAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
 
     await this.prisma.mailbox.update({
@@ -382,6 +558,44 @@ export class EmailSyncProcessor extends WorkerHost {
       organizationId,
       syncStatus: 'FAILED',
     });
+  }
+
+  private async markMailboxSyncSkippedByKillSwitch(
+    mailboxId: string,
+    organizationId: string,
+    message: string,
+  ): Promise<void> {
+    this.logger.warn(
+      `[email-sync] mailbox=${mailboxId} org=${organizationId} ${message}`,
+    );
+
+    await this.prisma.mailbox
+      .update({
+        where: { id: mailboxId },
+        data: {
+          syncStatus: 'FAILED',
+          nextRetryAt: null,
+          lastSyncError: message,
+        },
+      })
+      .catch(() => undefined);
+
+    this.eventsGateway?.emitToOrganization(organizationId, 'mailbox:synced', {
+      mailboxId,
+      organizationId,
+      syncStatus: 'FAILED',
+    });
+  }
+
+  private isThreadingDisabled(mailboxId: string, stage: string): boolean {
+    if (!this.featureFlags.get('DISABLE_THREADING')) {
+      return false;
+    }
+
+    this.logger.warn(
+      `[email-sync] DISABLE_THREADING active; skipped ${stage} mailbox=${mailboxId}`,
+    );
+    return true;
   }
 
   // ─── Token refresh ────────────────────────────────────────────────────────
@@ -614,6 +828,7 @@ export class EmailSyncProcessor extends WorkerHost {
     streamingMode: boolean,
     providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<boolean> {
+    const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
     const apiHeaders = {
       Authorization: `Bearer ${accessToken}`,
       Accept: 'application/json',
@@ -647,7 +862,12 @@ export class EmailSyncProcessor extends WorkerHost {
           displayName?: string;
           Id?: string;
           DisplayName?: string;
-        }>(candidate.folderUrl(pageSize), apiHeaders, providerSyncPolicy)) {
+        }>(
+          mailboxId,
+          candidate.folderUrl(pageSize),
+          apiHeaders,
+          providerSyncPolicy,
+        )) {
           folderRows.push(
             ...folderPage
               .map((folder) => ({
@@ -660,6 +880,9 @@ export class EmailSyncProcessor extends WorkerHost {
           );
         }
       } catch (err) {
+        if (err instanceof KillSwitchActivatedError) {
+          throw err;
+        }
         const { status, body } = this.outlookApiErrorDetails(err);
         this.logger.warn(
           `[email-sync] ${candidate.name} folders read failed mailbox=${mailboxId} status=${status}: ${body.slice(0, 260)}`,
@@ -726,6 +949,7 @@ export class EmailSyncProcessor extends WorkerHost {
           for await (const messagePage of this.iterateOutlookApiCollection<
             Record<string, unknown>
           >(
+            mailboxId,
             candidate.messagesUrl(folder.id, pageSize),
             apiHeaders,
             providerSyncPolicy,
@@ -745,10 +969,18 @@ export class EmailSyncProcessor extends WorkerHost {
                 );
                 if (created) createdCount += 1;
               }
-              if (streamingMode) await sleep(STREAM_DELAY_MS);
+              await this.applyChunkDelay(
+                adaptiveBucketKey,
+                mailboxId,
+                streamingMode,
+                'outlook-message-chunk',
+              );
             }
           }
         } catch (err) {
+          if (err instanceof KillSwitchActivatedError) {
+            throw err;
+          }
           const { status, body } = this.outlookApiErrorDetails(err);
           this.logger.warn(
             `[email-sync] ${candidate.name} messages read failed mailbox=${mailboxId} folder=${folder.displayName} status=${status}: ${body.slice(0, 260)}`,
@@ -782,6 +1014,7 @@ export class EmailSyncProcessor extends WorkerHost {
   }
 
   private async *iterateOutlookApiCollection<T>(
+    mailboxId: string,
     initialUrl: string,
     headers: Record<string, string>,
     providerSyncPolicy: EmailSyncProviderPolicy,
@@ -789,7 +1022,11 @@ export class EmailSyncProcessor extends WorkerHost {
     let nextUrl: string | null = initialUrl;
 
     while (nextUrl) {
-      await this.acquireProviderRequestSlot(providerSyncPolicy);
+      await this.acquireProviderRequestSlot(
+        mailboxId,
+        providerSyncPolicy,
+        'outlook-page',
+      );
       const response = await fetch(nextUrl, { headers });
       if (!response.ok) {
         throw {
@@ -880,6 +1117,10 @@ export class EmailSyncProcessor extends WorkerHost {
       select: { id: true },
     });
     if (existing) return false;
+
+    if (this.isThreadingDisabled(mailboxId, 'outlook-thread-match-create')) {
+      return false;
+    }
 
     const fromEmail = String(
       fromObj.emailAddress?.address ||
@@ -993,6 +1234,22 @@ export class EmailSyncProcessor extends WorkerHost {
       },
     });
 
+    if (direction === 'INBOUND') {
+      await this.evaluateRulesForInboundMessage({
+        organizationId,
+        threadId: thread.id,
+        fromEmail,
+        toAddresses,
+        ccAddresses,
+        subject,
+        bodyText,
+        bodyHtml,
+        hasAttachments: Boolean(
+          message.hasAttachments ?? message.HasAttachments,
+        ),
+      });
+    }
+
     this.eventsGateway?.emitToOrganization(organizationId, 'thread:updated', {
       threadId: thread.id,
       mailboxId,
@@ -1021,8 +1278,13 @@ export class EmailSyncProcessor extends WorkerHost {
     streamingMode: boolean,
     providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<void> {
+    const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
     // List all IMAP folders
-    await this.acquireProviderRequestSlot(providerSyncPolicy);
+    await this.acquireProviderRequestSlot(
+      mailboxId,
+      providerSyncPolicy,
+      'imap-list-folders',
+    );
     const folderList = await client.list();
     this.logger.log(
       `[email-sync] mailbox=${mailboxId} found ${folderList.length} IMAP folders`,
@@ -1060,7 +1322,18 @@ export class EmailSyncProcessor extends WorkerHost {
           streamingMode,
           providerSyncPolicy,
         );
+        this.adaptiveThrottle.recordSuccess(
+          adaptiveBucketKey,
+          this.adaptiveOptions(),
+        );
       } catch (err) {
+        this.adaptiveThrottle.recordFailure(
+          adaptiveBucketKey,
+          this.adaptiveOptions(),
+        );
+        if (err instanceof KillSwitchActivatedError) {
+          throw err;
+        }
         // Log but don't abort — continue with other folders
         this.logger.warn(
           `[email-sync] mailbox=${mailboxId} folder=${path} sync error: ${String(err)}`,
@@ -1078,11 +1351,19 @@ export class EmailSyncProcessor extends WorkerHost {
     streamingMode: boolean,
     providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<void> {
+    const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
     let lock: { release: () => void } | null = null;
     try {
-      await this.acquireProviderRequestSlot(providerSyncPolicy);
+      await this.acquireProviderRequestSlot(
+        mailboxId,
+        providerSyncPolicy,
+        `imap-lock:${folderPath}`,
+      );
       lock = await client.getMailboxLock(folderPath);
     } catch (err) {
+      if (err instanceof KillSwitchActivatedError) {
+        throw err;
+      }
       this.logger.warn(
         `[email-sync] mailbox=${mailboxId} could not lock folder=${folderPath}: ${String(err)}`,
       );
@@ -1127,7 +1408,11 @@ export class EmailSyncProcessor extends WorkerHost {
       let messageUids: number[] = [];
 
       try {
-        await this.acquireProviderRequestSlot(providerSyncPolicy);
+        await this.acquireProviderRequestSlot(
+          mailboxId,
+          providerSyncPolicy,
+          `imap-search-incremental:${folderPath}`,
+        );
         const incrementalSearch = await client.search(
           { uid: `${lastUidNext}:*` },
           { uid: true },
@@ -1136,11 +1421,18 @@ export class EmailSyncProcessor extends WorkerHost {
           ? incrementalSearch
           : [];
         messageUids = [...incrementalUids].sort((left, right) => left - right);
-      } catch {
+      } catch (err) {
+        if (err instanceof KillSwitchActivatedError) {
+          throw err;
+        }
         this.logger.warn(
           `[email-sync] mailbox=${mailboxId} folder=${folderPath} incremental fetch failed; retrying full scan`,
         );
-        await this.acquireProviderRequestSlot(providerSyncPolicy);
+        await this.acquireProviderRequestSlot(
+          mailboxId,
+          providerSyncPolicy,
+          `imap-search-full:${folderPath}`,
+        );
         const fullScanSearch = await client.search(
           { all: true },
           { uid: true },
@@ -1184,7 +1476,11 @@ export class EmailSyncProcessor extends WorkerHost {
           source?: Buffer;
         }> = [];
 
-        await this.acquireProviderRequestSlot(providerSyncPolicy);
+        await this.acquireProviderRequestSlot(
+          mailboxId,
+          providerSyncPolicy,
+          `imap-fetch:${folderPath}`,
+        );
         for await (const msg of client.fetch(
           uidBatch,
           {
@@ -1207,16 +1503,21 @@ export class EmailSyncProcessor extends WorkerHost {
 
         for (const chunk of chunks) {
           for (const msg of chunk) {
-            await this.upsertMessage(
+            const created = await this.upsertMessage(
               msg,
               mailboxId,
               organizationId,
               folder.id,
               folderType,
             );
-            processedCount += 1;
+            if (created) processedCount += 1;
           }
-          if (streamingMode) await sleep(STREAM_DELAY_MS);
+          await this.applyChunkDelay(
+            adaptiveBucketKey,
+            mailboxId,
+            streamingMode,
+            `imap-message-chunk:${folderPath}`,
+          );
         }
       }
 
@@ -1231,7 +1532,9 @@ export class EmailSyncProcessor extends WorkerHost {
               : undefined,
           syncStatus: 'SUCCESS',
           lastSyncedAt: new Date(),
-          messageCount: { increment: processedCount },
+          ...(processedCount > 0
+            ? { messageCount: { increment: processedCount } }
+            : {}),
         },
       });
     } finally {
@@ -1258,7 +1561,7 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     folderId: string,
     folderType: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const env = msg.envelope;
     const fromEmail = env.from?.[0]?.address ?? 'unknown@example.com';
     const fromName = env.from?.[0]?.name ?? '';
@@ -1297,7 +1600,11 @@ export class EmailSyncProcessor extends WorkerHost {
       where: { mailboxId, folderId, imapUid: msg.uid },
       select: { id: true },
     });
-    if (existing) return;
+    if (existing) return false;
+
+    if (this.isThreadingDisabled(mailboxId, 'imap-thread-match-create')) {
+      return false;
+    }
 
     const direction: 'INBOUND' | 'OUTBOUND' =
       folderType === 'sent' ? 'OUTBOUND' : 'INBOUND';
@@ -1338,6 +1645,21 @@ export class EmailSyncProcessor extends WorkerHost {
       },
     });
 
+    if (direction === 'INBOUND') {
+      await this.evaluateRulesForInboundMessage({
+        organizationId,
+        threadId: thread.id,
+        fromEmail,
+        toAddresses,
+        ccAddresses: [],
+        subject,
+        bodyText,
+        bodyHtml,
+        hasAttachments: false,
+        inReplyTo,
+      });
+    }
+
     this.eventsGateway?.emitToOrganization(organizationId, 'thread:updated', {
       threadId: thread.id,
       mailboxId,
@@ -1352,6 +1674,47 @@ export class EmailSyncProcessor extends WorkerHost {
             `[email-sync] CRM auto-create failed: ${String(err)}`,
           ),
         );
+    }
+
+    return true;
+  }
+
+  private async evaluateRulesForInboundMessage(input: {
+    organizationId: string;
+    threadId: string;
+    fromEmail: string;
+    toAddresses: string[];
+    ccAddresses: string[];
+    subject: string;
+    bodyText: string;
+    bodyHtml: string | null;
+    hasAttachments: boolean;
+    inReplyTo?: string;
+  }): Promise<void> {
+    if (!this.rulesEngine) {
+      return;
+    }
+
+    const context = {
+      from: input.fromEmail,
+      to: input.toAddresses.join(','),
+      cc: input.ccAddresses.join(','),
+      subject: input.subject,
+      body: input.bodyText || (input.bodyHtml ?? ''),
+      has_attachments: input.hasAttachments ? 'true' : 'false',
+      is_reply: input.inReplyTo ? 'true' : 'false',
+    };
+
+    try {
+      await this.rulesEngine.evaluate(
+        input.organizationId,
+        input.threadId,
+        context,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `[email-sync] rules evaluation failed thread=${input.threadId}: ${String(err)}`,
+      );
     }
   }
 

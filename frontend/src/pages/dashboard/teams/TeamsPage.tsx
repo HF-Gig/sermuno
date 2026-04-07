@@ -7,6 +7,7 @@ import PageHeader from '../../../components/ui/PageHeader';
 import Modal from '../../../components/ui/Modal';
 import { hasPermission } from '../../../hooks/usePermission';
 import { useAuth } from '../../../context/AuthContext';
+import { useAdaptiveGridCount } from '../../../hooks/useAdaptiveCount';
 
 interface Mailbox { id: string; name: string; email: string; teamId: string | null; }
 interface TeamRule { id: string; name: string; trigger: string; priorityLevel: number; isActive: boolean; conditions: any; actions: any; }
@@ -210,10 +211,17 @@ const TeamsPage = () => {
 
     const inputCls = "w-full px-3 py-2 border border-[var(--color-input-border)] rounded-lg text-sm focus:ring-2 focus:ring-[var(--color-primary)]/20 focus:outline-none bg-white transition-colors";
     const selectCls = inputCls;
+    const teamSkeletonCards = useAdaptiveGridCount({
+        columns: 3,
+        rowHeight: 260,
+        minRows: 1,
+        maxRows: 2,
+        viewportOffset: 320,
+    });
 
     const teamsSkeleton = (
         <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3 animate-pulse">
-            {Array.from({ length: 6 }).map((_, index) => (
+            {Array.from({ length: teamSkeletonCards }, (_, index) => (
                 <div key={index} className="rounded-lg border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)]">
                     <div className="mb-4 flex items-start justify-between">
                         <div className="h-10 w-10 rounded-lg bg-[var(--color-background)]" />

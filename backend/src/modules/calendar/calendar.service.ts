@@ -23,6 +23,9 @@ import type { CreateCalendarEventDto } from './dto/calendar-event.dto';
 import type { UpdateCalendarEventDto } from './dto/calendar-event.dto';
 import type { RsvpDto, IngestRsvpDto, SendInviteDto } from './dto/rsvp.dto';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import type { RequestMeta } from '../../common/http/request-meta';
+import { AuditService } from '../audit/audit.service';
+import { WebhooksService } from '../webhooks/webhooks.service';
 
 @Injectable()
 export class CalendarService {
@@ -40,6 +43,8 @@ export class CalendarService {
     @Inject(forwardRef(() => 'NOTIFICATIONS_SERVICE'))
     private readonly notifications: NotificationsService | null,
     private readonly eventsGateway: EventsGateway,
+    private readonly auditService: AuditService,
+    private readonly webhooks: WebhooksService,
   ) {}
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -57,7 +62,11 @@ export class CalendarService {
     });
   }
 
-  async create(dto: CreateCalendarEventDto, user: JwtUser) {
+  async create(
+    dto: CreateCalendarEventDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     let meetingLink: string | null | undefined = undefined;
     let meetingId: string | null | undefined = undefined;
     let meetingPassword: string | null | undefined = undefined;
@@ -153,13 +162,20 @@ export class CalendarService {
     });
     await this.auditLog(
       user,
-      'calendar_event.created',
-      'Event',
+      'CALENDAR_EVENT_CREATED',
+      'calendar_event',
       event.id,
       null,
       createdEvent,
+      meta,
     );
     if (createdEvent) {
+      await this.dispatchCalendarEventWebhook(
+        user.organizationId,
+        'calendar.event_created',
+        createdEvent,
+        'created',
+      );
       this.eventsGateway.emitToOrganization(
         user.organizationId,
         'calendar:event_updated',
@@ -333,6 +349,14 @@ export class CalendarService {
       existing,
       finalUpdated,
     );
+    if (finalUpdated) {
+      await this.dispatchCalendarEventWebhook(
+        user.organizationId,
+        'calendar.event_updated',
+        finalUpdated,
+        'updated',
+      );
+    }
     this.eventsGateway.emitToOrganization(
       user.organizationId,
       'calendar:event_updated',
@@ -391,6 +415,12 @@ export class CalendarService {
       'calendar:event_updated',
       { eventId: id, action: 'deleted' },
     );
+    await this.dispatchCalendarEventWebhook(
+      user.organizationId,
+      'calendar.event_cancelled',
+      event,
+      'cancelled',
+    );
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -406,7 +436,12 @@ export class CalendarService {
   // Invite / ICS
   // ──────────────────────────────────────────────────────────────────────────
 
-  async sendInvite(eventId: string, dto: SendInviteDto, user: JwtUser) {
+  async sendInvite(
+    eventId: string,
+    dto: SendInviteDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const event = await this.findOne(eventId, user);
     const organizer = await this.prisma.user.findUnique({
       where: { id: user.sub },
@@ -553,11 +588,12 @@ export class CalendarService {
 
     await this.auditLog(
       user,
-      'calendar_event.invited',
-      'Event',
+      'CALENDAR_INVITE_SENT',
+      'calendar_event',
       eventId,
       null,
       { attendees: allEmails },
+      meta,
     );
     this.eventsGateway.emitToOrganization(
       user.organizationId,
@@ -611,6 +647,13 @@ export class CalendarService {
         email: userRecord.email,
         status: dto.status,
       },
+    );
+    await this.dispatchCalendarRsvpWebhook(
+      event.organizationId,
+      event,
+      result,
+      dto.status,
+      'api_rsvp',
     );
     return result;
   }
@@ -682,7 +725,7 @@ export class CalendarService {
         where: { eventId: event.id, email },
       });
       if (att) {
-        await this.prisma.eventAttendee.update({
+        const updatedAttendee = await this.prisma.eventAttendee.update({
           where: { id: att.id },
           data: { rsvpStatus: status },
         });
@@ -694,6 +737,13 @@ export class CalendarService {
             email,
             status,
           },
+        );
+        await this.dispatchCalendarRsvpWebhook(
+          event.organizationId,
+          event,
+          updatedAttendee,
+          status,
+          'ingest_rsvp',
         );
         updated++;
       }
@@ -833,6 +883,100 @@ export class CalendarService {
   // Private helpers
   // ──────────────────────────────────────────────────────────────────────────
 
+  private async dispatchCalendarEventWebhook(
+    organizationId: string,
+    eventType:
+      | 'calendar.event_created'
+      | 'calendar.event_updated'
+      | 'calendar.event_cancelled',
+    event: {
+      id: string;
+      title: string;
+      startTime: Date;
+      endTime: Date;
+      organizationId: string;
+      organizerId: string;
+      status: string;
+      externalId: string | null;
+      attendees?: Array<{
+        id: string;
+        email: string;
+        name: string | null;
+        userId: string | null;
+        contactId: string | null;
+        rsvpStatus: string;
+      }>;
+    },
+    action: 'created' | 'updated' | 'cancelled',
+  ) {
+    await this.webhooks.dispatch(organizationId, eventType, {
+      event: {
+        id: event.id,
+        title: event.title,
+        startTime: event.startTime.toISOString(),
+        endTime: event.endTime.toISOString(),
+        organizationId: event.organizationId,
+        organizerId: event.organizerId,
+        status: event.status,
+        externalId: event.externalId,
+      },
+      attendees: (event.attendees ?? []).map((attendee) => ({
+        id: attendee.id,
+        email: attendee.email,
+        name: attendee.name,
+        userId: attendee.userId,
+        contactId: attendee.contactId,
+        rsvpStatus: attendee.rsvpStatus,
+      })),
+      action,
+      occurredAt: new Date().toISOString(),
+    });
+  }
+
+  private async dispatchCalendarRsvpWebhook(
+    organizationId: string,
+    event: {
+      id: string;
+      title: string;
+      startTime: Date;
+      endTime: Date;
+      organizationId: string;
+      organizerId: string;
+      status: string;
+      externalId: string | null;
+    },
+    attendee: {
+      id: string;
+      email: string;
+      name: string | null;
+      userId: string | null;
+    },
+    responseStatus: string,
+    source: 'api_rsvp' | 'ingest_rsvp',
+  ) {
+    await this.webhooks.dispatch(organizationId, 'calendar.rsvp_received', {
+      event: {
+        id: event.id,
+        title: event.title,
+        startTime: event.startTime.toISOString(),
+        endTime: event.endTime.toISOString(),
+        organizationId: event.organizationId,
+        organizerId: event.organizerId,
+        status: event.status,
+        externalId: event.externalId,
+      },
+      attendee: {
+        id: attendee.id,
+        email: attendee.email,
+        name: attendee.name,
+        userId: attendee.userId,
+      },
+      responseStatus,
+      source,
+      occurredAt: new Date().toISOString(),
+    });
+  }
+
   private async upsertAttendees(
     eventId: string,
     attendees: {
@@ -939,19 +1083,20 @@ export class CalendarService {
     entityId: string,
     previousValue: object | null,
     newValue: object | null,
+    meta: RequestMeta = {},
   ) {
     try {
-      await this.prisma.auditLog.create({
-        data: {
-          organizationId: user.organizationId,
-          userId: user.sub,
-          action,
-          entityType,
-          entityId,
-          previousValue:
-            (previousValue as Prisma.InputJsonValue) ?? Prisma.JsonNull,
-          newValue: (newValue as Prisma.InputJsonValue) ?? Prisma.JsonNull,
-        },
+      await this.auditService.log({
+        organizationId: user.organizationId,
+        userId: user.sub,
+        action,
+        entityType,
+        entityId,
+        previousValue:
+          (previousValue as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+        newValue: (newValue as Prisma.InputJsonValue) ?? Prisma.JsonNull,
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
       });
     } catch (err) {
       this.logger.warn(`[calendar] Audit log failed: ${String(err)}`);

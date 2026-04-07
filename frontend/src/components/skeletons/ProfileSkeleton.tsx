@@ -1,7 +1,15 @@
 import React from 'react';
 import { SkeletonBlock, SkeletonAvatar, SkeletonButton } from '../ui/Skeleton';
+import { useAdaptiveRows } from '../../hooks/useAdaptiveCount';
 
 export function ProfileSkeleton() {
+  const fieldRows = useAdaptiveRows({
+    rowHeight: 66,
+    minRows: 4,
+    maxRows: 7,
+    viewportOffset: 380,
+  });
+
   return (
     <div className="p-6 space-y-6 max-w-2xl">
       {/* Avatar + name header */}
@@ -13,7 +21,7 @@ export function ProfileSkeleton() {
         </div>
       </div>
       {/* Form fields */}
-      {[1,2,3,4].map(i => (
+      {Array.from({ length: fieldRows }, (_, i) => (
         <div key={i} className="animate-pulse space-y-1.5">
           <SkeletonBlock className="h-3.5 w-28" />
           <SkeletonBlock className="h-9 w-full rounded-lg" />

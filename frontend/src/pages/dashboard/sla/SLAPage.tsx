@@ -260,7 +260,7 @@ const SLAPage: React.FC = () => {
                     ) : null}
                 />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={5} cols={4} showHeader={false} />
+                    <TablePageSkeleton cols={4} showHeader={false} />
                 </div>
             </div>
         );
@@ -438,3 +438,4 @@ const SLAPage: React.FC = () => {
 };
 
 export default SLAPage;
+

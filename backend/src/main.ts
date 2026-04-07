@@ -16,6 +16,7 @@ async function bootstrap() {
   app.enableCors({
     origin: corsOrigins.split(',').map((o) => o.trim()),
     credentials: true,
+    exposedHeaders: ['X-Export-Checksum-SHA256', 'Content-Disposition'],
   });
 
   // Serve legacy local uploads paths used by frontend profile/org images

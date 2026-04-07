@@ -2,16 +2,25 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service';
+import { Prisma } from '@prisma/client';
 import {
   SetupOrganizationDto,
   UpdateOrganizationDto,
 } from './dto/organization.dto';
+import type { RequestMeta } from '../../common/http/request-meta';
+import { AuditService } from '../audit/audit.service';
 
 @Injectable()
 export class OrganizationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(OrganizationsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly auditService: AuditService,
+  ) {}
 
   async getMe(organizationId: string): Promise<object> {
     const org = await this.prisma.organization.findUnique({
@@ -24,6 +33,8 @@ export class OrganizationsService {
   async setup(
     organizationId: string,
     dto: SetupOrganizationDto,
+    actorUserId?: string,
+    meta: RequestMeta = {},
   ): Promise<object> {
     const org = await this.prisma.organization.findUnique({
       where: { id: organizationId },
@@ -47,12 +58,41 @@ export class OrganizationsService {
         logoUrl: dto.logoUrl,
       },
     });
+
+    await this.logAuditSafe({
+      organizationId,
+      userId: actorUserId,
+      action: 'SETTINGS_UPDATED',
+      entityType: 'organization',
+      entityId: organizationId,
+      previousValue: {
+        name: org.name,
+        defaultTimezone: org.defaultTimezone,
+        defaultLocale: org.defaultLocale,
+        emailFooter: org.emailFooter,
+        enforceMfa: org.enforceMfa,
+        logoUrl: org.logoUrl,
+      },
+      newValue: {
+        name: updated.name,
+        defaultTimezone: updated.defaultTimezone,
+        defaultLocale: updated.defaultLocale,
+        emailFooter: updated.emailFooter,
+        enforceMfa: updated.enforceMfa,
+        logoUrl: updated.logoUrl,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
     return updated;
   }
 
   async update(
     organizationId: string,
     dto: UpdateOrganizationDto,
+    actorUserId?: string,
+    meta: RequestMeta = {},
   ): Promise<object> {
     const org = await this.prisma.organization.findUnique({
       where: { id: organizationId },
@@ -81,6 +121,59 @@ export class OrganizationsService {
         }),
       },
     });
+
+    await this.logAuditSafe({
+      organizationId,
+      userId: actorUserId,
+      action: 'SETTINGS_UPDATED',
+      entityType: 'organization',
+      entityId: organizationId,
+      previousValue: {
+        name: org.name,
+        defaultTimezone: org.defaultTimezone,
+        defaultLocale: org.defaultLocale,
+        emailFooter: org.emailFooter,
+        enforceMfa: org.enforceMfa,
+        logoUrl: org.logoUrl,
+        maxMailboxes: org.maxMailboxes,
+        maxUsers: org.maxUsers,
+        maxStorageGb: org.maxStorageGb,
+      },
+      newValue: {
+        name: updated.name,
+        defaultTimezone: updated.defaultTimezone,
+        defaultLocale: updated.defaultLocale,
+        emailFooter: updated.emailFooter,
+        enforceMfa: updated.enforceMfa,
+        logoUrl: updated.logoUrl,
+        maxMailboxes: updated.maxMailboxes,
+        maxUsers: updated.maxUsers,
+        maxStorageGb: updated.maxStorageGb,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
     return updated;
+  }
+
+  private async logAuditSafe(input: {
+    organizationId: string;
+    userId?: string;
+    action: string;
+    entityType: string;
+    entityId?: string;
+    previousValue?: Prisma.InputJsonValue;
+    newValue?: Prisma.InputJsonValue;
+    ipAddress?: string;
+    userAgent?: string;
+  }) {
+    try {
+      await this.auditService.log(input);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to write organization audit log for ${input.action}: ${(error as Error).message}`,
+      );
+    }
   }
 }

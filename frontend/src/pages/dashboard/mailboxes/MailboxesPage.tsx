@@ -7,6 +7,7 @@ import PageHeader from '../../../components/ui/PageHeader';
 import Modal from '../../../components/ui/Modal';
 import { useAuth } from '../../../context/AuthContext';
 import { hasPermission } from '../../../hooks/usePermission';
+import { useAdaptiveGridCount } from '../../../hooks/useAdaptiveCount';
 
 interface Team { id: string; name: string; }
 interface User { id: string; fullName: string; email: string; }
@@ -80,10 +81,17 @@ const MailboxesPage = () => {
     };
 
     const resetForm = () => setFormData({ name: '', email: '', provider: 'SMTP', authorizedTeamIds: [], authorizedUserIds: [], smtpHost: '', smtpPort: '465', smtpSecure: true, smtpUser: '', smtpPass: '', imapHost: '', imapPort: '993', imapSecure: true, imapUser: '', imapPass: '' });
+    const mailboxSkeletonCards = useAdaptiveGridCount({
+        columns: 3,
+        rowHeight: 210,
+        minRows: 1,
+        maxRows: 3,
+        viewportOffset: 330,
+    });
 
     const mailboxesSkeleton = (
         <div className="grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-3 animate-pulse">
-            {Array.from({ length: 6 }).map((_, index) => (
+            {Array.from({ length: mailboxSkeletonCards }, (_, index) => (
                 <div key={index} className="rounded-lg border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)]">
                     <div className="mb-3 flex items-start justify-between">
                         <div className="h-10 w-10 rounded-lg bg-[var(--color-background)]" />

@@ -713,6 +713,10 @@ model ExportJob {
   resourceCounts Json         @default("{}")
   payload        Json?
   artifactUrl    String?
+  downloadCount  Int          @default(0)
+  maxDownloads   Int          @default(5)
+  progressPercentage Int      @default(0)
+  checksum       String?
   expiresAt      DateTime?
   error          String?
   createdAt      DateTime     @default(now())

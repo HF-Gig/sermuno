@@ -194,8 +194,31 @@ export default () => ({
     enableCalendar: process.env.ENABLE_CALENDAR !== 'false',
     enableWebhooks: process.env.ENABLE_WEBHOOKS !== 'false',
     enableStreamingSync: process.env.ENABLE_STREAMING_SYNC === 'true',
+    enableBackpressure: process.env.ENABLE_BACKPRESSURE === 'true',
+    enableSmartBackoff: process.env.ENABLE_SMART_BACKOFF === 'true',
     enablePushNotifications: process.env.ENABLE_PUSH_NOTIFICATIONS === 'true',
     enableSlackNotifications: process.env.ENABLE_SLACK_NOTIFICATIONS === 'true',
     enableCrmAutoCreate: process.env.ENABLE_CRM_AUTO_CREATE !== 'false',
+  },
+  backpressure: {
+    heapHighWatermark: parseFloat(
+      process.env.BACKPRESSURE_HEAP_HIGH_WATERMARK ?? '0.85',
+    ),
+    heapRecoveryWatermark: parseFloat(
+      process.env.BACKPRESSURE_HEAP_RECOVERY_WATERMARK ?? '0.7',
+    ),
+    minDelayMs: parseInt(process.env.BACKPRESSURE_MIN_DELAY_MS ?? '50', 10),
+    maxDelayMs: parseInt(process.env.BACKPRESSURE_MAX_DELAY_MS ?? '2000', 10),
+  },
+  smartBackoff: {
+    baseDelayMs: parseInt(process.env.SMART_BACKOFF_BASE_DELAY_MS ?? '100', 10),
+    maxDelayMs: parseInt(process.env.SMART_BACKOFF_MAX_DELAY_MS ?? '5000', 10),
+    windowSize: parseInt(process.env.SMART_BACKOFF_WINDOW_SIZE ?? '20', 10),
+    errorRateWeight: parseFloat(
+      process.env.SMART_BACKOFF_ERROR_RATE_WEIGHT ?? '4',
+    ),
+    consecutiveWeight: parseFloat(
+      process.env.SMART_BACKOFF_CONSECUTIVE_WEIGHT ?? '1',
+    ),
   },
 });

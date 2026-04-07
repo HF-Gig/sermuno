@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   BadRequestException,
   InternalServerErrorException,
+  ServiceUnavailableException,
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -16,9 +17,11 @@ import type {
   UpdateThreadDto,
   ComposeThreadDto,
   ReplyThreadDto,
+  ForwardThreadDto,
   AssignThreadDto,
   CreateNoteDto,
   UpdateNoteDto,
+  NoteMentionSuggestionsQueryDto,
 } from './dto/thread.dto';
 import {
   ThreadStatus,
@@ -33,6 +36,9 @@ import sanitizeHtml from 'sanitize-html';
 import { SlaService } from '../sla/sla.service';
 import type { BusinessHours, SlaTargets } from '../sla/dto/sla.dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import { AuditService } from '../audit/audit.service';
+import type { RequestMeta } from '../../common/http/request-meta';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 const ALGORITHM = 'aes-256-gcm';
 
@@ -118,10 +124,59 @@ export class ThreadsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly featureFlags: FeatureFlagsService,
     private readonly eventsGateway: EventsGateway,
     private readonly slaService: SlaService,
     private readonly notificationsService: NotificationsService,
+    private readonly auditService: AuditService,
   ) {}
+
+  private async getUserTeamIds(userId: string): Promise<string[]> {
+    const teamRows = await this.prisma.teamMember.findMany({
+      where: { userId },
+      select: { teamId: true },
+    });
+
+    return Array.from(new Set(teamRows.map((row) => row.teamId)));
+  }
+
+  private buildMailboxReadAccessWhere(userId: string, teamIds: string[]) {
+    return {
+      canRead: true,
+      OR: [
+        { userId },
+        ...(teamIds.length > 0 ? [{ teamId: { in: teamIds } }] : []),
+      ],
+    } satisfies Prisma.MailboxAccessWhereInput;
+  }
+
+  private buildReadableMailboxWhere(userId: string, teamIds: string[]) {
+    return {
+      deletedAt: null,
+      OR: [
+        { mailboxAccess: { none: {} } },
+        {
+          mailboxAccess: {
+            some: this.buildMailboxReadAccessWhere(userId, teamIds),
+          },
+        },
+      ],
+    } satisfies Prisma.MailboxWhereInput;
+  }
+
+  private async buildReadableThreadWhere(
+    user: JwtUser,
+    extra: Prisma.ThreadWhereInput = {},
+    providedTeamIds?: string[],
+  ): Promise<Prisma.ThreadWhereInput> {
+    const teamIds = providedTeamIds ?? (await this.getUserTeamIds(user.sub));
+
+    return {
+      organizationId: user.organizationId,
+      ...extra,
+      mailbox: this.buildReadableMailboxWhere(user.sub, teamIds),
+    };
+  }
 
   private async buildSlaThreadData(params: {
     threadId: string;
@@ -291,6 +346,12 @@ export class ThreadsService {
     return /^re:/i.test(clean) ? clean : `Re: ${clean}`;
   }
 
+  private normalizeForwardSubject(subject?: string | null): string {
+    const clean = String(subject || '').trim();
+    if (!clean) return 'Fwd: (no subject)';
+    return /^(fwd?:|fw:)/i.test(clean) ? clean : `Fwd: ${clean}`;
+  }
+
   private normalizeMessageId(value?: string | null): string | undefined {
     const raw = String(value || '').trim();
     if (!raw) return undefined;
@@ -325,6 +386,15 @@ export class ThreadsService {
     references?: string[];
     threadId: string;
   }): Promise<{ providerMessageId?: string; fromEmail: string }> {
+    if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
+      this.logger.warn(
+        `[threads] DISABLE_SMTP_SEND active; blocked provider send thread=${params.threadId} mailbox=${params.mailbox.id}`,
+      );
+      throw new ServiceUnavailableException(
+        'Email sending is temporarily disabled by an emergency kill switch',
+      );
+    }
+
     const globalHost = this.configService.get<string>('smtp.host') ?? '';
     const globalPort = this.configService.get<number>('smtp.port') ?? 587;
     const globalUser = this.configService.get<string>('smtp.user') ?? '';
@@ -510,38 +580,50 @@ export class ThreadsService {
     const page = Math.max(Number(query.page ?? 1), 1);
     const limit = Math.min(Number(query.limit ?? 50), 200);
     const skip = (page - 1) * limit;
+    const teamIds = await this.getUserTeamIds(user.sub);
 
-    const where: Prisma.ThreadWhereInput = {
-      organizationId: user.organizationId,
-      mailbox: { deletedAt: null },
-      ...(query.mailboxId && { mailboxId: query.mailboxId }),
-      ...(query.status && { status: query.status as ThreadStatus }),
-      ...(query.priority && { priority: query.priority as ThreadPriority }),
-      ...(query.assignedUserId && { assignedUserId: query.assignedUserId }),
-      ...(query.folderId && {
-        messages: { some: { folderId: query.folderId } },
-      }),
-      ...(query.tagId && { tags: { some: { tagId: query.tagId } } }),
-      ...(query.tag && {
-        tags: {
-          some: {
-            tag: {
-              name: { contains: query.tag, mode: 'insensitive' as const },
+    const where = await this.buildReadableThreadWhere(
+      user,
+      {
+        ...(query.mailboxId && { mailboxId: query.mailboxId }),
+        ...(query.status && { status: query.status as ThreadStatus }),
+        ...(query.priority && { priority: query.priority as ThreadPriority }),
+        ...(query.assignedUserId && { assignedUserId: query.assignedUserId }),
+        ...(query.mentioned && {
+          notes: {
+            some: {
+              mentions: {
+                some: { mentionedUserId: user.sub },
+              },
             },
           },
-        },
-      }),
-      ...(query.search && {
-        OR: [
-          { subject: { contains: query.search, mode: 'insensitive' as const } },
-          {
-            contact: {
-              email: { contains: query.search, mode: 'insensitive' as const },
+        }),
+        ...(query.folderId && {
+          messages: { some: { folderId: query.folderId } },
+        }),
+        ...(query.tagId && { tags: { some: { tagId: query.tagId } } }),
+        ...(query.tag && {
+          tags: {
+            some: {
+              tag: {
+                name: { contains: query.tag, mode: 'insensitive' as const },
+              },
             },
           },
-        ],
-      }),
-    };
+        }),
+        ...(query.search && {
+          OR: [
+            { subject: { contains: query.search, mode: 'insensitive' as const } },
+            {
+              contact: {
+                email: { contains: query.search, mode: 'insensitive' as const },
+              },
+            },
+          ],
+        }),
+      },
+      teamIds,
+    );
 
     const assigned = String(query.assigned || '').toLowerCase();
     if (assigned === 'me') {
@@ -550,11 +632,6 @@ export class ThreadsService {
       where.assignedUserId = null;
       where.assignedToTeamId = null;
     } else if (assigned === 'team') {
-      const teamRows = await this.prisma.teamMember.findMany({
-        where: { userId: user.sub },
-        select: { teamId: true },
-      });
-      const teamIds = teamRows.map((row) => row.teamId);
       where.assignedToTeamId = { in: teamIds };
     }
 
@@ -700,17 +777,14 @@ export class ThreadsService {
   }
 
   async getInboxCounts(query: ThreadInboxCountsDto, user: JwtUser) {
-    const baseWhere: Prisma.ThreadWhereInput = {
-      organizationId: user.organizationId,
-      mailbox: { deletedAt: null },
-      ...(query.mailboxId && { mailboxId: query.mailboxId }),
-    };
-
-    const teamRows = await this.prisma.teamMember.findMany({
-      where: { userId: user.sub },
-      select: { teamId: true },
-    });
-    const teamIds = teamRows.map((row) => row.teamId);
+    const teamIds = await this.getUserTeamIds(user.sub);
+    const baseWhere = await this.buildReadableThreadWhere(
+      user,
+      {
+        ...(query.mailboxId && { mailboxId: query.mailboxId }),
+      },
+      teamIds,
+    );
 
     const now = new Date();
     const soonThreshold = new Date(now.getTime() + 60 * 60 * 1000);
@@ -752,6 +826,18 @@ export class ThreadsService {
       this.prisma.thread.count({
         where: { ...baseWhere, status: ThreadStatus.ARCHIVED },
       }),
+      this.prisma.thread.count({
+        where: {
+          ...baseWhere,
+          notes: {
+            some: {
+              mentions: {
+                some: { mentionedUserId: user.sub },
+              },
+            },
+          },
+        },
+      }),
     ]);
 
     let tagCounts: Record<string, number> = {};
@@ -761,9 +847,13 @@ export class ThreadsService {
         by: ['tagId'],
         where: {
           thread: {
-            organizationId: user.organizationId,
-            mailbox: { deletedAt: null },
-            ...(query.mailboxId ? { mailboxId: query.mailboxId } : {}),
+            ...(await this.buildReadableThreadWhere(
+              user,
+              {
+                ...(query.mailboxId ? { mailboxId: query.mailboxId } : {}),
+              },
+              teamIds,
+            )),
           },
           tag: {
             deletedAt: null,
@@ -789,6 +879,7 @@ export class ThreadsService {
         'priority-low': counts[6],
         'sla-at-risk': counts[7],
         'sla-breached': counts[8],
+        mentioned: counts[11],
       },
       mailbox: {
         starred: counts[9],
@@ -799,8 +890,9 @@ export class ThreadsService {
   }
 
   async findOne(id: string, user: JwtUser) {
+    const where = await this.buildReadableThreadWhere(user, { id });
     const thread = await this.prisma.thread.findFirst({
-      where: { id, organizationId: user.organizationId },
+      where,
       include: {
         assignedUser: { select: { id: true, fullName: true, email: true } },
         assignedTeam: { select: { id: true, name: true } },
@@ -815,9 +907,37 @@ export class ThreadsService {
     return thread;
   }
 
-  async bulkUpdate(dto: BulkUpdateThreadsDto, user: JwtUser) {
+  async bulkUpdate(
+    dto: BulkUpdateThreadsDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
+    const accessibleThreads =
+      (await this.prisma.thread.findMany({
+        where: await this.buildReadableThreadWhere(user, {
+          id: { in: dto.ids },
+        }),
+        select: { id: true, status: true },
+      })) ?? [];
+    const accessibleThreadIds = accessibleThreads.map((thread) => thread.id);
+
+    if (accessibleThreadIds.length === 0) {
+      return { updated: 0 };
+    }
+
+    const previousStatusByThread = new Map<string, ThreadStatus>();
+    accessibleThreads.forEach((thread) => {
+      const currentStatus = (thread as { status?: ThreadStatus }).status;
+      if (currentStatus) {
+        previousStatusByThread.set(thread.id, currentStatus);
+      }
+    });
+
     await this.prisma.thread.updateMany({
-      where: { id: { in: dto.ids }, organizationId: user.organizationId },
+      where: {
+        id: { in: accessibleThreadIds },
+        organizationId: user.organizationId,
+      },
       data: {
         ...(dto.status && { status: dto.status as ThreadStatus }),
         ...(dto.assignedUserId !== undefined && {
@@ -828,14 +948,34 @@ export class ThreadsService {
         }),
       },
     });
+    if (dto.status) {
+      await Promise.all(
+        accessibleThreadIds.map((threadId) =>
+          this.logAuditSafe({
+            organizationId: user.organizationId,
+            userId: user.sub,
+            action: 'STATUS_CHANGE',
+            entityType: 'thread',
+            entityId: threadId,
+            previousValue: { status: previousStatusByThread.get(threadId) },
+            newValue: { status: dto.status },
+            ipAddress: meta.ipAddress,
+            userAgent: meta.userAgent,
+          }),
+        ),
+      );
+    }
+
     return { updated: dto.ids.length };
   }
 
-  async update(id: string, dto: UpdateThreadDto, user: JwtUser) {
-    const thread = await this.prisma.thread.findFirst({
-      where: { id, organizationId: user.organizationId },
-    });
-    if (!thread) throw new NotFoundException('Thread not found');
+  async update(
+    id: string,
+    dto: UpdateThreadDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
+    const thread = await this.findOne(id, user);
 
     const rawSlaPolicyId = (dto as { slaPolicyId?: string | null }).slaPolicyId;
     const data: Prisma.ThreadUpdateInput = {
@@ -876,15 +1016,29 @@ export class ThreadsService {
       data,
     });
 
-    this.eventsGateway.emitToOrganization(
-      user.organizationId,
-      'thread:updated',
-      {
-        threadId: updated.id,
-        mailboxId: updated.mailboxId,
-        type: 'status_changed',
-      },
-    );
+    if (updated.status !== thread.status) {
+      await this.logAuditSafe({
+        organizationId: user.organizationId,
+        userId: user.sub,
+        action: 'STATUS_CHANGE',
+        entityType: 'thread',
+        entityId: updated.id,
+        previousValue: {
+          status: thread.status,
+        },
+        newValue: {
+          status: updated.status,
+        },
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+      });
+    }
+
+    void this.eventsGateway.emitToMailbox(updated.mailboxId, 'thread:updated', {
+      threadId: updated.id,
+      mailboxId: updated.mailboxId,
+      type: 'status_changed',
+    });
 
     return updated;
   }
@@ -896,20 +1050,20 @@ export class ThreadsService {
       data: { starred },
     });
 
-    this.eventsGateway.emitToOrganization(
-      user.organizationId,
-      'thread:updated',
-      {
-        threadId: updated.id,
-        mailboxId: updated.mailboxId,
-        type: 'status_changed',
-      },
-    );
+    void this.eventsGateway.emitToMailbox(updated.mailboxId, 'thread:updated', {
+      threadId: updated.id,
+      mailboxId: updated.mailboxId,
+      type: 'status_changed',
+    });
 
     return updated;
   }
 
-  async archive(threadId: string, user: JwtUser) {
+  async archive(
+    threadId: string,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const thread = await this.findOne(threadId, user);
     const updated = await this.prisma.thread.update({
       where: { id: threadId },
@@ -920,20 +1074,32 @@ export class ThreadsService {
       },
     });
 
-    this.eventsGateway.emitToOrganization(
-      user.organizationId,
-      'thread:updated',
-      {
-        threadId: updated.id,
-        mailboxId: updated.mailboxId,
-        type: 'status_changed',
-      },
-    );
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'STATUS_CHANGE',
+      entityType: 'thread',
+      entityId: updated.id,
+      previousValue: { status: thread.status },
+      newValue: { status: updated.status },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    void this.eventsGateway.emitToMailbox(updated.mailboxId, 'thread:updated', {
+      threadId: updated.id,
+      mailboxId: updated.mailboxId,
+      type: 'status_changed',
+    });
 
     return updated;
   }
 
-  async unarchive(threadId: string, user: JwtUser) {
+  async unarchive(
+    threadId: string,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const thread = await this.findOne(threadId, user);
     const restoredStatus = this.parseThreadStatus(thread.previousStatus);
     const updated = await this.prisma.thread.update({
@@ -945,15 +1111,23 @@ export class ThreadsService {
       },
     });
 
-    this.eventsGateway.emitToOrganization(
-      user.organizationId,
-      'thread:updated',
-      {
-        threadId: updated.id,
-        mailboxId: updated.mailboxId,
-        type: 'status_changed',
-      },
-    );
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'STATUS_CHANGE',
+      entityType: 'thread',
+      entityId: updated.id,
+      previousValue: { status: thread.status },
+      newValue: { status: updated.status },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    void this.eventsGateway.emitToMailbox(updated.mailboxId, 'thread:updated', {
+      threadId: updated.id,
+      mailboxId: updated.mailboxId,
+      type: 'status_changed',
+    });
 
     return updated;
   }
@@ -991,9 +1165,15 @@ export class ThreadsService {
     return { thread, message };
   }
 
-  async reply(threadId: string, dto: ReplyThreadDto, user: JwtUser) {
+  async reply(
+    threadId: string,
+    dto: ReplyThreadDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
+    const where = await this.buildReadableThreadWhere(user, { id: threadId });
     const thread = await this.prisma.thread.findFirst({
-      where: { id: threadId, organizationId: user.organizationId },
+      where,
       select: {
         id: true,
         subject: true,
@@ -1167,12 +1347,159 @@ export class ThreadsService {
         });
     }
 
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'REPLY_SENT',
+      entityType: 'thread',
+      entityId: thread.id,
+      previousValue: null,
+      newValue: {
+        messageId: message.id,
+        to,
+        cc,
+        bcc,
+        subject: message.subject,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
     return message;
   }
 
-  async assign(threadId: string, dto: AssignThreadDto, user: JwtUser) {
+  async forward(
+    threadId: string,
+    dto: ForwardThreadDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
+    const where = await this.buildReadableThreadWhere(user, { id: threadId });
     const thread = await this.prisma.thread.findFirst({
-      where: { id: threadId, organizationId: user.organizationId },
+      where,
+      select: {
+        id: true,
+        subject: true,
+        mailboxId: true,
+        mailbox: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            provider: true,
+            smtpHost: true,
+            smtpPort: true,
+            smtpSecure: true,
+            smtpUser: true,
+            smtpPass: true,
+            oauthProvider: true,
+            oauthAccessToken: true,
+            oauthRefreshToken: true,
+            googleAccessToken: true,
+            googleRefreshToken: true,
+            syncStatus: true,
+            lastSyncError: true,
+          },
+        },
+      },
+    });
+    if (!thread) throw new NotFoundException('Thread not found');
+
+    const latestMessage = await this.prisma.message.findFirst({
+      where: { threadId, deletedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        subject: true,
+        bodyText: true,
+        bodyHtml: true,
+      },
+    });
+
+    const to = this.sanitizeEmails(dto.to);
+    const cc = this.sanitizeEmails(dto.cc);
+    const bcc = this.sanitizeEmails(dto.bcc);
+    if (!to.length) {
+      throw new BadRequestException(
+        'No valid recipient found for this forward.',
+      );
+    }
+
+    const subject = this.normalizeForwardSubject(
+      dto.subject || thread.subject || latestMessage?.subject,
+    );
+    const bodyHtml = dto.bodyHtml || undefined;
+    const fallbackBodyText = latestMessage?.bodyText
+      ? `---------- Forwarded message ----------\n${latestMessage.bodyText}`
+      : undefined;
+    const bodyText =
+      dto.bodyText ||
+      (dto.bodyHtml
+        ? dto.bodyHtml
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+        : fallbackBodyText);
+
+    const sendResult = await this.sendReplyThroughProvider({
+      mailbox: thread.mailbox,
+      actor: user,
+      to,
+      cc,
+      bcc,
+      subject,
+      bodyHtml,
+      bodyText,
+      threadId,
+    });
+
+    const message = await this.prisma.message.create({
+      data: {
+        threadId,
+        mailboxId: thread.mailboxId,
+        direction: MessageDirection.OUTBOUND,
+        fromEmail: sendResult.fromEmail,
+        to: to as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        cc: cc as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        bcc: bcc as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        subject,
+        bodyHtml,
+        bodyText: bodyText || undefined,
+        messageId: sendResult.providerMessageId,
+        isOutbound: true,
+        isDraft: false,
+      },
+    });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'FORWARD_SENT',
+      entityType: 'thread',
+      entityId: thread.id,
+      previousValue: null,
+      newValue: {
+        messageId: message.id,
+        to,
+        cc,
+        bcc,
+        subject: message.subject,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    return message;
+  }
+
+  async assign(
+    threadId: string,
+    dto: AssignThreadDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
+    const where = await this.buildReadableThreadWhere(user, { id: threadId });
+    const thread = await this.prisma.thread.findFirst({
+      where,
     });
     if (!thread) throw new NotFoundException('Thread not found');
 
@@ -1200,16 +1527,30 @@ export class ThreadsService {
       },
     });
 
-    this.eventsGateway.emitToOrganization(
-      user.organizationId,
-      'thread:assigned',
-      {
-        threadId: updated.id,
-        mailboxId: updated.mailboxId,
-        assignedUserId: updated.assignedUserId ?? null,
-        assignedToTeamId: updated.assignedToTeamId ?? null,
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'ASSIGN',
+      entityType: 'thread',
+      entityId: updated.id,
+      previousValue: {
+        assignedUserId: thread.assignedUserId,
+        assignedToTeamId: thread.assignedToTeamId,
       },
-    );
+      newValue: {
+        assignedUserId: updated.assignedUserId,
+        assignedToTeamId: updated.assignedToTeamId,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    void this.eventsGateway.emitToMailbox(updated.mailboxId, 'thread:assigned', {
+      threadId: updated.id,
+      mailboxId: updated.mailboxId,
+      assignedUserId: updated.assignedUserId ?? null,
+      assignedToTeamId: updated.assignedToTeamId ?? null,
+    });
 
     const hasNewUserAssignment =
       dto.userId !== undefined &&
@@ -1252,7 +1593,7 @@ export class ThreadsService {
   }
 
   async getNotes(threadId: string, user: JwtUser) {
-    await this.findOne(threadId, user); // assert thread belongs to org
+    await this.findOne(threadId, user);
     const notes = await this.prisma.threadNote.findMany({
       where: { threadId, organizationId: user.organizationId },
       include: THREAD_NOTE_WITH_MENTIONS_INCLUDE,
@@ -1261,11 +1602,63 @@ export class ThreadsService {
     return notes.map((note) => this.mapThreadNote(note));
   }
 
-  async createNote(threadId: string, dto: CreateNoteDto, user: JwtUser) {
+  async getNoteMentionSuggestions(
+    threadId: string,
+    query: NoteMentionSuggestionsQueryDto,
+    user: JwtUser,
+  ) {
+    const thread = await this.findOne(threadId, user);
+    const normalizedQuery = String(query.query || '')
+      .trim()
+      .toLowerCase();
+    const limit = Math.min(Math.max(Number(query.limit ?? 50), 1), 200);
+    const mentionableUsers = await this.getMentionableUsers(
+      user.organizationId,
+      thread.mailboxId,
+    );
+
+    return mentionableUsers
+      .filter((mentionedUser) => mentionedUser.id !== user.sub)
+      .filter((mentionedUser) => {
+        if (!normalizedQuery) return true;
+
+        const aliases = this.getMentionKeysForUser(mentionedUser);
+        return (
+          aliases.some((alias) => alias.includes(normalizedQuery)) ||
+          mentionedUser.fullName.toLowerCase().includes(normalizedQuery) ||
+          mentionedUser.email.toLowerCase().includes(normalizedQuery)
+        );
+      })
+      .sort((left, right) => {
+        const leftAliases = this.getMentionKeysForUser(left);
+        const rightAliases = this.getMentionKeysForUser(right);
+        const leftStarts =
+          leftAliases.some((alias) => alias.startsWith(normalizedQuery)) ||
+          left.fullName.toLowerCase().startsWith(normalizedQuery);
+        const rightStarts =
+          rightAliases.some((alias) => alias.startsWith(normalizedQuery)) ||
+          right.fullName.toLowerCase().startsWith(normalizedQuery);
+
+        if (leftStarts !== rightStarts) {
+          return leftStarts ? -1 : 1;
+        }
+
+        return left.fullName.localeCompare(right.fullName);
+      })
+      .slice(0, limit);
+  }
+
+  async createNote(
+    threadId: string,
+    dto: CreateNoteDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const thread = await this.findOne(threadId, user);
     const cleanBody = this.sanitizeNoteBody(dto.body);
     const resolvedMentions = await this.resolveMentionedUsers(
       user.organizationId,
+      thread.mailboxId,
       cleanBody,
     );
 
@@ -1314,14 +1707,28 @@ export class ThreadsService {
       );
     }
 
-    this.eventsGateway.emitToOrganization(
-      user.organizationId,
-      'thread:note_added',
-      {
-        threadId,
-        note: mappedNote,
+    void this.eventsGateway.emitToMailbox(thread.mailboxId, 'thread:note_added', {
+      threadId,
+      note: mappedNote,
+    });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'NOTE_ADD',
+      entityType: 'thread',
+      entityId: threadId,
+      previousValue: null,
+      newValue: {
+        noteId: mappedNote.id,
+        body: mappedNote.body,
+        mentionedUserIds: mappedNote.mentionedUsers.map(
+          (mentionedUser) => mentionedUser.id,
+        ),
       },
-    );
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
 
     return mappedNote;
   }
@@ -1357,6 +1764,7 @@ export class ThreadsService {
     const cleanBody = this.sanitizeNoteBody(dto.body);
     const resolvedMentions = await this.resolveMentionedUsers(
       user.organizationId,
+      thread.mailboxId,
       cleanBody,
     );
     const existingMentionedUserIds = new Set(
@@ -1453,25 +1861,101 @@ export class ThreadsService {
     return [...keys];
   }
 
-  private toMentionKey(email: string) {
-    return email.trim().toLowerCase().split('@')[0] || '';
-  }
+  private normalizeMentionToken(value: string) {
+    const normalized = value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._+-]+/g, ' ')
+      .trim();
 
-  private async resolveMentionedUsers(
-    organizationId: string,
-    body: string,
-  ): Promise<MentionedUserSummary[]> {
-    const mentionKeys = this.extractMentionKeys(body);
-    if (mentionKeys.length === 0) {
-      return [];
+    if (!normalized) {
+      return '';
     }
 
-    const requestedKeys = new Set(mentionKeys);
+    return normalized
+      .split(/\s+/)
+      .filter(Boolean)
+      .join('.')
+      .replace(/[._+-]{2,}/g, '.')
+      .replace(/^[._+-]+|[._+-]+$/g, '')
+      .slice(0, 64);
+  }
+
+  private toEmailMentionKey(email: string) {
+    return this.normalizeMentionToken(email.trim().toLowerCase().split('@')[0] || '');
+  }
+
+  private toMentionKey(fullName: string, email: string) {
+    const nameMentionKey = this.normalizeMentionToken(fullName);
+    if (nameMentionKey) {
+      return nameMentionKey;
+    }
+
+    return this.toEmailMentionKey(email);
+  }
+
+  private composeMentionKey(base: string, suffix: string) {
+    return `${base}.${suffix}`
+      .toLowerCase()
+      .replace(/[^a-z0-9._+-]+/g, '.')
+      .replace(/[._+-]{2,}/g, '.')
+      .replace(/^[._+-]+|[._+-]+$/g, '')
+      .slice(0, 64);
+  }
+
+  private getMentionKeysForUser(mentionedUser: MentionedUserSummary) {
+    return Array.from(
+      new Set([
+        mentionedUser.mentionKey,
+        this.toEmailMentionKey(mentionedUser.email),
+      ].filter(Boolean)),
+    );
+  }
+
+  private async getMentionableUsers(
+    organizationId: string,
+    mailboxId: string,
+  ): Promise<MentionedUserSummary[]> {
+    const mailboxAccessRows =
+      (await this.prisma.mailboxAccess.findMany({
+        where: { mailboxId, canRead: true },
+        select: { userId: true, teamId: true },
+      })) ?? [];
+
+    let readableUserIds: string[] | null = null;
+    if (mailboxAccessRows.length > 0) {
+      const directUserIds = mailboxAccessRows
+        .map((row) => row.userId)
+        .filter((userId): userId is string => Boolean(userId));
+      const teamIds = mailboxAccessRows
+        .map((row) => row.teamId)
+        .filter((teamId): teamId is string => Boolean(teamId));
+      const teamMembers =
+        teamIds.length > 0
+          ? await this.prisma.teamMember.findMany({
+              where: { teamId: { in: teamIds } },
+              select: { userId: true },
+            })
+          : [];
+
+      readableUserIds = Array.from(
+        new Set([
+          ...directUserIds,
+          ...teamMembers.map((membership) => membership.userId),
+        ]),
+      );
+
+      if (readableUserIds.length === 0) {
+        return [];
+      }
+    }
+
     const users = await this.prisma.user.findMany({
       where: {
         organizationId,
         deletedAt: null,
         isActive: true,
+        ...(readableUserIds ? { id: { in: readableUserIds } } : {}),
       },
       select: {
         id: true,
@@ -1481,33 +1965,126 @@ export class ThreadsService {
       },
     });
 
-    const uniqueMatches = new Map<string, MentionedUserSummary>();
-    const ambiguousKeys = new Set<string>();
+    const usersByBaseKey = new Map<
+      string,
+      Array<{
+        id: string;
+        fullName: string;
+        email: string;
+        avatarUrl: string | null;
+        baseMentionKey: string;
+        emailMentionKey: string;
+      }>
+    >();
 
-    for (const candidate of users) {
-      const mentionKey = this.toMentionKey(candidate.email);
-      if (!mentionKey || !requestedKeys.has(mentionKey)) {
-        continue;
+    users.forEach((candidate) => {
+      const emailMentionKey = this.toEmailMentionKey(candidate.email);
+      const baseMentionKey = this.toMentionKey(candidate.fullName, candidate.email);
+      if (!baseMentionKey && !emailMentionKey) {
+        return;
       }
 
-      if (ambiguousKeys.has(mentionKey)) {
-        continue;
-      }
-
-      if (uniqueMatches.has(mentionKey)) {
-        uniqueMatches.delete(mentionKey);
-        ambiguousKeys.add(mentionKey);
-        continue;
-      }
-
-      uniqueMatches.set(mentionKey, {
+      const groupingKey = baseMentionKey || emailMentionKey;
+      const group = usersByBaseKey.get(groupingKey) ?? [];
+      group.push({
         id: candidate.id,
         fullName: candidate.fullName,
         email: candidate.email,
         avatarUrl: candidate.avatarUrl,
-        mentionKey,
+        baseMentionKey,
+        emailMentionKey,
       });
+      usersByBaseKey.set(groupingKey, group);
+    });
+
+    const mentionableUsers: MentionedUserSummary[] = [];
+    usersByBaseKey.forEach((group, groupingKey) => {
+      if (group.length === 1) {
+        const candidate = group[0];
+        mentionableUsers.push({
+          id: candidate.id,
+          fullName: candidate.fullName,
+          email: candidate.email,
+          avatarUrl: candidate.avatarUrl,
+          mentionKey: candidate.baseMentionKey || candidate.emailMentionKey,
+        });
+        return;
+      }
+
+      const fallbackByKey = new Map<string, typeof group[number]>();
+      const ambiguousFallback = new Set<string>();
+      group.forEach((candidate) => {
+        const fallbackKey = this.composeMentionKey(
+          candidate.baseMentionKey || groupingKey,
+          candidate.emailMentionKey,
+        );
+        if (!fallbackKey || ambiguousFallback.has(fallbackKey)) {
+          return;
+        }
+
+        const existing = fallbackByKey.get(fallbackKey);
+        if (existing && existing.id !== candidate.id) {
+          fallbackByKey.delete(fallbackKey);
+          ambiguousFallback.add(fallbackKey);
+          return;
+        }
+
+        if (!existing) {
+          fallbackByKey.set(fallbackKey, candidate);
+        }
+      });
+
+      fallbackByKey.forEach((candidate, mentionKey) => {
+        mentionableUsers.push({
+          id: candidate.id,
+          fullName: candidate.fullName,
+          email: candidate.email,
+          avatarUrl: candidate.avatarUrl,
+          mentionKey,
+        });
+      });
+    });
+
+    return mentionableUsers.sort((left, right) =>
+      left.fullName.localeCompare(right.fullName),
+    );
+  }
+
+  private async resolveMentionedUsers(
+    organizationId: string,
+    mailboxId: string,
+    body: string,
+  ): Promise<MentionedUserSummary[]> {
+    const mentionKeys = this.extractMentionKeys(body);
+    if (mentionKeys.length === 0) {
+      return [];
     }
+
+    const mentionableUsers = await this.getMentionableUsers(
+      organizationId,
+      mailboxId,
+    );
+    const uniqueMatches = new Map<string, MentionedUserSummary>();
+    const ambiguousKeys = new Set<string>();
+
+    mentionableUsers.forEach((mentionedUser) => {
+      this.getMentionKeysForUser(mentionedUser).forEach((mentionKey) => {
+        if (ambiguousKeys.has(mentionKey)) {
+          return;
+        }
+
+        const existing = uniqueMatches.get(mentionKey);
+        if (existing && existing.id !== mentionedUser.id) {
+          uniqueMatches.delete(mentionKey);
+          ambiguousKeys.add(mentionKey);
+          return;
+        }
+
+        if (!existing) {
+          uniqueMatches.set(mentionKey, mentionedUser);
+        }
+      });
+    });
 
     return mentionKeys
       .map((mentionKey) => uniqueMatches.get(mentionKey))
@@ -1570,17 +2147,41 @@ export class ThreadsService {
 
   // ─── Thread Tags ──────────────────────────────────────────────────────────
 
-  async addTag(threadId: string, tagId: string, user: JwtUser) {
+  async addTag(
+    threadId: string,
+    tagId: string,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     await this.findOne(threadId, user);
     // Upsert to avoid duplicates
-    return this.prisma.threadTag.upsert({
+    const record = await this.prisma.threadTag.upsert({
       where: { threadId_tagId: { threadId, tagId } },
       create: { threadId, tagId },
       update: {},
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'TAG_ADD',
+      entityType: 'thread',
+      entityId: threadId,
+      previousValue: null,
+      newValue: { tagId },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    return record;
   }
 
-  async removeTag(threadId: string, tagId: string, user: JwtUser) {
+  async removeTag(
+    threadId: string,
+    tagId: string,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     await this.findOne(threadId, user);
     const record = await this.prisma.threadTag.findUnique({
       where: { threadId_tagId: { threadId, tagId } },
@@ -1589,14 +2190,32 @@ export class ThreadsService {
     await this.prisma.threadTag.delete({
       where: { threadId_tagId: { threadId, tagId } },
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'TAG_REMOVE',
+      entityType: 'thread',
+      entityId: threadId,
+      previousValue: { tagId },
+      newValue: null,
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
     return { message: 'Tag removed' };
   }
 
   // ─── Snooze ───────────────────────────────────────────────────────────────
 
-  async snoozeThread(threadId: string, snoozedUntil: Date, user: JwtUser) {
+  async snoozeThread(
+    threadId: string,
+    snoozedUntil: Date,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const thread = await this.findOne(threadId, user);
-    return this.prisma.thread.update({
+    const updated = await this.prisma.thread.update({
       where: { id: threadId },
       data: {
         snoozedUntil,
@@ -1604,13 +2223,31 @@ export class ThreadsService {
         status: ThreadStatus.SNOOZED,
       },
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'STATUS_CHANGE',
+      entityType: 'thread',
+      entityId: updated.id,
+      previousValue: { status: thread.status },
+      newValue: { status: updated.status },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    return updated;
   }
 
-  async unsnoozeThread(threadId: string, user: JwtUser) {
+  async unsnoozeThread(
+    threadId: string,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const thread = await this.findOne(threadId, user);
     const restoredStatus =
       (thread.previousStatus as ThreadStatus) ?? ThreadStatus.OPEN;
-    return this.prisma.thread.update({
+    const updated = await this.prisma.thread.update({
       where: { id: threadId },
       data: {
         snoozedUntil: null,
@@ -1618,5 +2255,45 @@ export class ThreadsService {
         status: restoredStatus,
       },
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'STATUS_CHANGE',
+      entityType: 'thread',
+      entityId: updated.id,
+      previousValue: { status: thread.status },
+      newValue: { status: updated.status },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    return updated;
+  }
+
+  private async logAuditSafe(input: {
+    organizationId: string;
+    userId?: string;
+    action: string;
+    entityType: string;
+    entityId?: string;
+    previousValue?: Prisma.InputJsonValue | null;
+    newValue?: Prisma.InputJsonValue | null;
+    ipAddress?: string;
+    userAgent?: string;
+  }) {
+    const { previousValue, newValue, ...baseAudit } = input;
+    try {
+      await this.auditService.log({
+        ...baseAudit,
+        ...(previousValue !== undefined &&
+          previousValue !== null && { previousValue }),
+        ...(newValue !== undefined && newValue !== null && { newValue }),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to write thread audit log for ${input.action}: ${(error as Error).message}`,
+      );
+    }
   }
 }

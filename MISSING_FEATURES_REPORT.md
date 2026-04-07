@@ -70,22 +70,22 @@ CalDAV     | CalDAV protocol | For other providers (Apple, Nextcloud, etc.)
 
 ## 3. @MENTION SYSTEM (Section 2.12)
 
-The notification type `mention` is defined but there is NO actual mention functionality.
+This item is no longer missing. The @mention flow is already implemented for thread notes and has been verified against the live API and database behavior.
 
-### What's missing:
+### Verified implementation:
 
-- No @mention parsing in thread notes or messages
-- No UI or API logic to detect `@username` in text
-- No linking of mentions to users
-- No mention notification triggering when someone is @mentioned
-- The notification type exists but is never triggered by anything
+- `@username` parsing is implemented for internal thread notes (`POST /threads/:id/notes`)
+- Mention keys resolve to active users in the same organization by email local-part
+- Mention links are stored in `thread_note_mentions`
+- `mention` notifications are dispatched for newly mentioned users
+- Note responses return `mentionedUsers`, which the inbox UI consumes and renders
 
-### What needs to be built:
+### Key References:
 
-- Parse @mentions in thread notes (POST /threads/:id/notes)
-- Resolve @mentions to user IDs
-- Trigger `mention` notification when a user is @mentioned
-- Return mentioned user IDs in note/message response
+- backend/src/modules/threads/threads.service.ts
+- backend/src/modules/notifications/notifications.service.ts
+- backend/prisma/schema.prisma
+- frontend/src/pages/dashboard/inbox/InboxPage.tsx
 
 ---
 
@@ -360,7 +360,7 @@ Logging: LOG_LEVEL (debug/info/warn/error), LOG_FORMAT (pretty/json)
 | --- | ------------------------------------------ | -------- | ------ |
 | 1   | Push & Desktop Notifications               | HIGH     | Large  |
 | 2   | CalDAV Sync                                | MEDIUM   | Large  |
-| 3   | @Mention System                            | MEDIUM   | Medium |
+| 3   | @Mention System (resolved)                 | Done     | Done   |
 | 4   | Virus Scanning                             | LOW      | Medium |
 | 5   | Provider-Specific Rate Limiting            | HIGH     | Medium |
 | 6   | Audit Logging (12+ missing actions)        | HIGH     | Medium |

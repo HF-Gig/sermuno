@@ -25,6 +25,7 @@ import UpgradeBlockerModal from '../../../components/ui/UpgradeBlockerModal';
 import TagsPage from '../tags/TagsPage';
 import { useAuth } from '../../../context/AuthContext';
 import { useWebSocket } from '../../../context/WebSocketContext';
+import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 
 interface Mailbox {
     id: string;
@@ -1778,6 +1779,19 @@ const SettingsPage: React.FC = () => {
         };
     }, [socket, isConnected]);
 
+    const organizationFieldRows = useAdaptiveRows({
+        rowHeight: 72,
+        minRows: 4,
+        maxRows: 8,
+        viewportOffset: 300,
+    });
+    const orgNotificationSkeletonRows = useAdaptiveRows({
+        rowHeight: 72,
+        minRows: 4,
+        maxRows: 10,
+        viewportOffset: 340,
+    });
+
     const organizationSkeleton = (
         <div className="space-y-6 animate-pulse">
             <div className="rounded-2xl border border-(--color-card-border) bg-white p-5 space-y-5">
@@ -1805,7 +1819,7 @@ const SettingsPage: React.FC = () => {
 
                     <div className="space-y-4">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {Array.from({ length: 4 }).map((_, index) => (
+                            {Array.from({ length: organizationFieldRows }, (_, index) => (
                                 <div key={index} className="space-y-2">
                                     <div className="h-4 w-28 rounded bg-(--color-background)" />
                                     <div className="h-11 w-full rounded-lg bg-(--color-background)" />
@@ -3626,7 +3640,7 @@ const SettingsPage: React.FC = () => {
 
                                 {orgNotificationLoading ? (
                                     <div className="space-y-3">
-                                        {Array.from({ length: 5 }).map((_, index) => (
+                                        {Array.from({ length: orgNotificationSkeletonRows }, (_, index) => (
                                             <div key={index} className="rounded-xl border border-(--color-card-border) bg-white p-4">
                                                 <div className="h-4 w-40 rounded bg-(--color-background) animate-pulse" />
                                                 <div className="mt-2 h-3 w-72 rounded bg-(--color-background) animate-pulse" />

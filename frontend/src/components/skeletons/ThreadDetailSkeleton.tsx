@@ -1,7 +1,15 @@
 import React from 'react';
 import { SkeletonBlock, SkeletonBadge } from '../ui/Skeleton';
+import { useAdaptiveRows } from '../../hooks/useAdaptiveCount';
 
 export function ThreadDetailSkeleton() {
+  const messageRows = useAdaptiveRows({
+    rowHeight: 92,
+    minRows: 3,
+    maxRows: 7,
+    viewportOffset: 300,
+  });
+
   return (
     <div className="flex flex-col h-full">
       {/* Thread header */}
@@ -14,7 +22,7 @@ export function ThreadDetailSkeleton() {
       </div>
       {/* Messages */}
       <div className="flex-1 p-5 space-y-5 overflow-hidden">
-        {[1,2,3].map((_, i) => (
+        {Array.from({ length: messageRows }, (_, i) => (
           <div key={i} className="animate-pulse space-y-2">
             <div className="flex items-center gap-2">
               <SkeletonBlock className="h-7 w-7 rounded-full" />

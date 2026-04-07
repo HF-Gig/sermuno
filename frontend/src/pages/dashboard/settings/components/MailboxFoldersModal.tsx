@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Folder, FolderOpen, Inbox, Send, Trash2, AlertCircle, Star } from 'lucide-react';
 import Modal from '../../../../components/ui/Modal';
 import api from '../../../../lib/api';
+import { useAdaptiveRows } from '../../../../hooks/useAdaptiveCount';
 
 interface MailboxFolder {
     id?: string;
@@ -57,6 +58,12 @@ const MailboxFoldersModal: React.FC<MailboxFoldersModalProps> = ({ isOpen, onClo
     const [loading, setLoading] = useState(false);
     const [folders, setFolders] = useState<MailboxFolder[]>([]);
     const [error, setError] = useState<string | null>(null);
+    const folderSkeletonRows = useAdaptiveRows({
+        rowHeight: 52,
+        minRows: 3,
+        maxRows: 8,
+        viewportOffset: 360,
+    });
 
     useEffect(() => {
         if (!isOpen || !mailbox) return;
@@ -110,7 +117,7 @@ const MailboxFoldersModal: React.FC<MailboxFoldersModalProps> = ({ isOpen, onClo
                         <div className="h-3 w-12 rounded-full bg-white" />
                         <div className="h-3 w-10 rounded-full bg-white" />
                     </div>
-                    {Array.from({ length: 4 }).map((_, index) => (
+                    {Array.from({ length: folderSkeletonRows }).map((_, index) => (
                         <div key={index} className="grid grid-cols-[1fr_auto_auto] gap-4 px-3 py-3 border-t border-[var(--color-card-border)] bg-white">
                             <div className="flex items-center gap-2">
                                 <div className="h-4 w-4 rounded bg-[var(--color-background)]" />

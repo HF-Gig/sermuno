@@ -4,6 +4,7 @@ import type { Job } from 'bullmq';
 import { SCHEDULED_MESSAGES_QUEUE } from '../queues/scheduled-messages.queue';
 import { PrismaService } from '../../database/prisma.service';
 import { Prisma } from '@prisma/client';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 export interface ScheduledMessageJobData {
   scheduledMessageId?: string;
@@ -21,12 +22,22 @@ export interface ScheduledMessageJobData {
 export class ScheduledMessagesProcessor extends WorkerHost {
   private readonly logger = new Logger(ScheduledMessagesProcessor.name);
 
-  constructor(private readonly prisma: PrismaService) {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly featureFlags: FeatureFlagsService,
+  ) {
     super();
   }
 
   async process(job: Job<ScheduledMessageJobData>): Promise<void> {
     const { messageId, rrule, scheduledMessageId } = job.data;
+    if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
+      this.logger.warn(
+        `[scheduled-messages] DISABLE_SMTP_SEND active; skipping scheduled message=${messageId}`,
+      );
+      return;
+    }
+
     this.logger.log(
       `[scheduled-messages] Sending scheduled message=${messageId} rrule=${rrule ?? 'none'}`,
     );

@@ -2,6 +2,8 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ServiceUnavailableException,
+  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -24,20 +26,26 @@ import { AttachmentScanStatus, MessageDirection, Prisma } from '@prisma/client';
 import type { EmailSendJobData } from '../../jobs/processors/email-send.processor';
 import type { ScheduledMessageJobData } from '../../jobs/processors/scheduled-messages.processor';
 import { NotificationsService } from '../notifications/notifications.service';
+import type { RequestMeta } from '../../common/http/request-meta';
+import { AuditService } from '../audit/audit.service';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 @Injectable()
 export class MessagesService {
   private readonly s3: S3Client | null = null;
+  private readonly logger = new Logger(MessagesService.name);
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly featureFlags: FeatureFlagsService,
     private readonly attachmentScan: AttachmentScanService,
     @InjectQueue(EMAIL_SEND_QUEUE)
     private readonly emailSendQueue: Queue<EmailSendJobData>,
     @InjectQueue(SCHEDULED_MESSAGES_QUEUE)
     private readonly scheduledQueue: Queue<ScheduledMessageJobData>,
     private readonly notifications: NotificationsService,
+    private readonly auditService: AuditService,
   ) {
     const storageType =
       this.configService.get<string>('attachment.storageType') ?? 'local';
@@ -116,33 +124,99 @@ export class MessagesService {
     return message;
   }
 
-  async bulkRead(dto: BulkReadDto, user: JwtUser) {
+  async bulkRead(dto: BulkReadDto, user: JwtUser, meta: RequestMeta = {}) {
     const ids: string[] = Array.isArray(dto.ids) ? dto.ids : [];
     if (ids.length === 0) return { updated: 0 };
-    await this.prisma.message.updateMany({
+
+    const targetMessages = await this.prisma.message.findMany({
       where: {
         id: { in: ids },
         mailbox: { organizationId: user.organizationId },
       },
-      data: { isRead: dto.isRead ?? true },
+      select: {
+        id: true,
+        isRead: true,
+      },
     });
-    return { updated: ids.length };
+    if (targetMessages.length === 0) {
+      return { updated: 0 };
+    }
+
+    const nextReadState = dto.isRead ?? true;
+    await this.prisma.message.updateMany({
+      where: {
+        id: { in: targetMessages.map((message) => message.id) },
+        mailbox: { organizationId: user.organizationId },
+      },
+      data: { isRead: nextReadState },
+    });
+
+    const action = nextReadState ? 'MARK_READ' : 'MARK_UNREAD';
+    await Promise.all(
+      targetMessages.map((message) =>
+        this.logAuditSafe({
+          organizationId: user.organizationId,
+          userId: user.sub,
+          action,
+          entityType: 'message',
+          entityId: message.id,
+          previousValue: { isRead: message.isRead },
+          newValue: { isRead: nextReadState },
+          ipAddress: meta.ipAddress,
+          userAgent: meta.userAgent,
+        }),
+      ),
+    );
+
+    return { updated: targetMessages.length };
   }
 
-  async move(messageId: string, dto: MoveMessageDto, user: JwtUser) {
+  async move(
+    messageId: string,
+    dto: MoveMessageDto,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
     const message = await this.findOne(messageId, user);
     // Verify folder belongs to the same mailbox
     const folder = await this.prisma.mailboxFolder.findFirst({
       where: { id: dto.folderId, mailboxId: message.mailboxId },
     });
     if (!folder) throw new NotFoundException('Folder not found in mailbox');
-    return this.prisma.message.update({
+    const updated = await this.prisma.message.update({
       where: { id: messageId },
       data: { folderId: dto.folderId },
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'MOVE_FOLDER',
+      entityType: 'message',
+      entityId: updated.id,
+      previousValue: {
+        folderId: message.folderId,
+      },
+      newValue: {
+        folderId: updated.folderId,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    return updated;
   }
 
   async send(dto: SendMessageDto, user: JwtUser) {
+    if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
+      this.logger.warn(
+        `[messages] DISABLE_SMTP_SEND active; blocked send mailbox=${dto.mailboxId} org=${user.organizationId} user=${user.sub}`,
+      );
+      throw new ServiceUnavailableException(
+        'Email sending is temporarily disabled by an emergency kill switch',
+      );
+    }
+
     // Verify mailbox belongs to org
     const mailbox = await this.prisma.mailbox.findFirst({
       where: {
@@ -347,5 +421,25 @@ export class MessagesService {
         in: [AttachmentScanStatus.UNSCANNED, AttachmentScanStatus.CLEAN],
       },
     };
+  }
+
+  private async logAuditSafe(input: {
+    organizationId: string;
+    userId?: string;
+    action: string;
+    entityType: string;
+    entityId?: string;
+    previousValue?: Prisma.InputJsonValue;
+    newValue?: Prisma.InputJsonValue;
+    ipAddress?: string;
+    userAgent?: string;
+  }) {
+    try {
+      await this.auditService.log(input);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to write message audit log for ${input.action}: ${(error as Error).message}`,
+      );
+    }
   }
 }

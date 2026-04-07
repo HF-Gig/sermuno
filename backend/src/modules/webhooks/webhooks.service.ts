@@ -1,4 +1,9 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import * as crypto from 'crypto';
 import * as http from 'http';
 import * as https from 'https';
@@ -22,12 +27,27 @@ export const WEBHOOK_EVENT_TYPES = [
   'sla.warning',
   'sla.breach',
   'rule.triggered',
+  'calendar.event_created',
+  'calendar.event_updated',
+  'calendar.event_cancelled',
+  'calendar.rsvp_received',
   'calendar_event.created',
   'calendar_event.updated',
   'calendar_event.deleted',
 ] as const;
 
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
+
+const WEBHOOK_EVENT_TYPE_SET = new Set<string>(WEBHOOK_EVENT_TYPES);
+
+const WEBHOOK_EVENT_COMPATIBILITY: Record<string, string[]> = {
+  'calendar.event_created': ['calendar_event.created'],
+  'calendar.event_updated': ['calendar_event.updated'],
+  'calendar.event_cancelled': ['calendar_event.deleted'],
+  'calendar_event.created': ['calendar.event_created'],
+  'calendar_event.updated': ['calendar.event_updated'],
+  'calendar_event.deleted': ['calendar.event_cancelled'],
+};
 
 @Injectable()
 export class WebhooksService {
@@ -50,12 +70,13 @@ export class WebhooksService {
   }
 
   async create(dto: CreateWebhookDto, user: JwtUser) {
+    const events = this.validateAndNormalizeEvents(dto.events ?? []);
     const secret = dto.secret ?? crypto.randomBytes(32).toString('hex');
     return this.prisma.webhook.create({
       data: {
         organizationId: user.organizationId,
         url: dto.url,
-        events: (dto.events ?? []) as Prisma.InputJsonValue,
+        events: events as Prisma.InputJsonValue,
         secret,
         headers: (dto.headers ?? {}) as Prisma.InputJsonValue,
         filterMailboxIds: (dto.filterMailboxIds ?? []) as Prisma.InputJsonValue,
@@ -78,13 +99,17 @@ export class WebhooksService {
       where: { id, organizationId: user.organizationId, deletedAt: null },
     });
     if (!wh) throw new NotFoundException('Webhook not found');
+    const normalizedEvents =
+      dto.events !== undefined
+        ? this.validateAndNormalizeEvents(dto.events)
+        : undefined;
 
     return this.prisma.webhook.update({
       where: { id },
       data: {
         ...(dto.url !== undefined && { url: dto.url }),
-        ...(dto.events !== undefined && {
-          events: dto.events as Prisma.InputJsonValue,
+        ...(normalizedEvents !== undefined && {
+          events: normalizedEvents as Prisma.InputJsonValue,
         }),
         ...(dto.secret !== undefined && { secret: dto.secret }),
         ...(dto.isActive !== undefined && { isActive: dto.isActive }),
@@ -181,8 +206,8 @@ export class WebhooksService {
     });
 
     for (const hook of hooks) {
-      const events = hook.events as string[];
-      if (!events.includes(eventType)) continue;
+      const events = this.normalizeHookEvents(hook.events);
+      if (!this.matchesEventType(events, eventType)) continue;
 
       await this.deliverWithRetry(hook, eventType, payload);
     }
@@ -324,5 +349,48 @@ export class WebhooksService {
       },
       {} as Record<string, string>,
     );
+  }
+
+  private validateAndNormalizeEvents(events: string[]): string[] {
+    if (!Array.isArray(events)) {
+      throw new BadRequestException('Webhook events must be an array of strings');
+    }
+
+    const normalized = Array.from(
+      new Set(
+        events
+          .map((event) => (typeof event === 'string' ? event.trim() : ''))
+          .filter(Boolean),
+      ),
+    );
+
+    const unsupported = normalized.filter(
+      (event) => !WEBHOOK_EVENT_TYPE_SET.has(event),
+    );
+
+    if (unsupported.length > 0) {
+      throw new BadRequestException(
+        `Unsupported webhook event(s): ${unsupported.join(', ')}`,
+      );
+    }
+
+    return normalized;
+  }
+
+  private normalizeHookEvents(rawEvents: Prisma.JsonValue): string[] {
+    if (!Array.isArray(rawEvents)) return [];
+    return rawEvents
+      .filter((event): event is string => typeof event === 'string')
+      .map((event) => event.trim())
+      .filter(Boolean);
+  }
+
+  private matchesEventType(
+    subscribedEvents: string[],
+    eventType: WebhookEventType,
+  ): boolean {
+    if (subscribedEvents.includes(eventType)) return true;
+    const compatibleEvents = WEBHOOK_EVENT_COMPATIBILITY[eventType] ?? [];
+    return compatibleEvents.some((event) => subscribedEvents.includes(event));
   }
 }

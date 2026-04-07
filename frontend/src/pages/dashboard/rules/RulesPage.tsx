@@ -387,7 +387,7 @@ const RulesPage: React.FC = () => {
                     ) : null}
                 />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={6} cols={7} showHeader={false} />
+                    <TablePageSkeleton cols={7} showHeader={false} />
                 </div>
             </div>
         );
@@ -689,3 +689,4 @@ const toApiAction = (action: RuleActionForm) => {
 };
 
 export default RulesPage;
+

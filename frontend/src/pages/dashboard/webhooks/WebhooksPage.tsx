@@ -24,7 +24,15 @@ const eventCategoryMap: Record<WebhookCategory, string[]> = {
     'message events': ['message.received', 'message.sent', 'message.updated'],
     'sla events': ['sla.warning', 'sla.breach'],
     'rule events': ['rule.triggered'],
-    'calendar events': ['calendar_event.created', 'calendar_event.updated', 'calendar_event.deleted'],
+    'calendar events': [
+        'calendar.event_created',
+        'calendar.event_updated',
+        'calendar.event_cancelled',
+        'calendar.rsvp_received',
+        'calendar_event.created',
+        'calendar_event.updated',
+        'calendar_event.deleted',
+    ],
 };
 
 const createHeader = (): HeaderRow => ({ id: `${Date.now()}-${Math.random()}`, key: '', value: '' });
@@ -147,7 +155,7 @@ const WebhooksPage: React.FC = () => {
                     )}
                 />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={4} cols={5} showHeader={false} />
+                    <TablePageSkeleton cols={5} showHeader={false} />
                 </div>
             </div>
         );
@@ -269,3 +277,4 @@ const WebhooksPage: React.FC = () => {
 };
 
 export default WebhooksPage;
+

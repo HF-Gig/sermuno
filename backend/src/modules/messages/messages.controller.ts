@@ -11,6 +11,7 @@ import {
   HttpStatus,
   Res,
   StreamableFile,
+  Req,
 } from '@nestjs/common';
 import { MessagesService } from './messages.service';
 import {
@@ -22,7 +23,8 @@ import {
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
+import { extractRequestMeta } from '../../common/http/request-meta';
 
 @UseGuards(JwtAuthGuard)
 @Controller('messages')
@@ -38,8 +40,12 @@ export class MessagesController {
   // PATCH /messages (bulk read/unread)
   @Patch()
   @HttpCode(HttpStatus.OK)
-  bulkRead(@Body() dto: BulkReadDto, @CurrentUser() user: JwtUser) {
-    return this.messagesService.bulkRead(dto, user);
+  bulkRead(
+    @Body() dto: BulkReadDto,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.messagesService.bulkRead(dto, user, extractRequestMeta(req));
   }
 
   // POST /messages/send
@@ -61,8 +67,9 @@ export class MessagesController {
     @Param('id') id: string,
     @Body() dto: MoveMessageDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.messagesService.move(id, dto, user);
+    return this.messagesService.move(id, dto, user, extractRequestMeta(req));
   }
 
   // GET /messages/:id/attachments/:attachmentId/download

@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Download, FileDown, Upload } from 'lucide-react';
+import { Download, FileDown, Upload, Copy, Check } from 'lucide-react';
 import PageHeader from '../../../components/ui/PageHeader';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import api from '../../../lib/api';
@@ -8,6 +8,28 @@ import { TablePageSkeleton } from '../../../components/skeletons/TablePageSkelet
 
 type ExportType = 'gdpr_export' | 'messages_export' | 'threads_export' | 'contacts_export' | 'analytics_export';
 type ExportFormat = 'json' | 'csv' | 'mbox' | 'eml';
+
+type ExportJob = {
+    id: string;
+    status: string;
+    format?: string | null;
+    resources?: string[];
+    payload?: { format?: string | null } | null;
+    createdAt: string;
+    expiresAt?: string | null;
+    progressPercentage?: number | null;
+    downloadCount?: number | null;
+    maxDownloads?: number | null;
+    checksum?: string | null;
+};
+
+type ImportJob = {
+    id: string;
+    status: string;
+    payload?: { originalName?: string | null } | null;
+    createdAt: string;
+    error?: string | null;
+};
 
 const exportTypes: Array<{ value: ExportType; label: string }> = [
     { value: 'gdpr_export', label: 'GDPR Export' },
@@ -24,15 +46,35 @@ const exportFormats: Array<{ value: ExportFormat; label: string }> = [
     { value: 'eml', label: 'EML' },
 ];
 
+const normalizeStatus = (status?: string | null) => {
+    const normalized = String(status || '').toLowerCase();
+    if (normalized === 'done') return 'completed';
+    return normalized || 'pending';
+};
+
+const checksumPreview = (checksum?: string | null) => {
+    if (!checksum) return '--';
+    if (checksum.length <= 16) return checksum;
+    return `${checksum.slice(0, 8)}...${checksum.slice(-8)}`;
+};
+
+const clampProgress = (value: number) => {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(100, Math.round(value)));
+};
+
 const ExportPage: React.FC = () => {
     const { t } = useTranslation();
-    const [jobs, setJobs] = useState<any[]>([]);
-    const [imports, setImports] = useState<any[]>([]);
+    const [jobs, setJobs] = useState<ExportJob[]>([]);
+    const [imports, setImports] = useState<ImportJob[]>([]);
     const [mailboxes, setMailboxes] = useState<any[]>([]);
     const [contacts, setContacts] = useState<any[]>([]);
-    const [loading, setLoading] = useState(true);
+    const [initialLoading, setInitialLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
     const [submitting, setSubmitting] = useState(false);
     const [importSubmitting, setImportSubmitting] = useState(false);
+    const [downloadingJobId, setDownloadingJobId] = useState<string | null>(null);
+    const [copiedChecksumId, setCopiedChecksumId] = useState<string | null>(null);
     const [importFile, setImportFile] = useState<File | null>(null);
     const [error, setError] = useState('');
     const [form, setForm] = useState({
@@ -45,8 +87,8 @@ const ExportPage: React.FC = () => {
         includeAttachments: true,
     });
 
-    const load = async () => {
-        setLoading(true);
+    const loadInitialData = useCallback(async () => {
+        setInitialLoading(true);
         try {
             const [jobsRes, importsRes, mailboxesRes, contactsRes] = await Promise.all([
                 api.get('/export-import/export'),
@@ -62,9 +104,43 @@ const ExportPage: React.FC = () => {
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to load export data.');
         } finally {
-            setLoading(false);
+            setInitialLoading(false);
         }
-    };
+    }, []);
+
+    const refreshJobsAndImports = useCallback(async () => {
+        setRefreshing(true);
+        try {
+            const [jobsRes, importsRes] = await Promise.all([
+                api.get('/export-import/export'),
+                api.get('/export-import/import'),
+            ]);
+            setJobs(Array.isArray(jobsRes.data) ? jobsRes.data : []);
+            setImports(Array.isArray(importsRes.data) ? importsRes.data : []);
+            setError('');
+        } catch (err: any) {
+            setError(err?.response?.data?.message || 'Failed to refresh export jobs.');
+        } finally {
+            setRefreshing(false);
+        }
+    }, []);
+
+    const hasInFlightExports = useMemo(
+        () => jobs.some((job) => ['pending', 'processing'].includes(normalizeStatus(job.status))),
+        [jobs],
+    );
+
+    useEffect(() => {
+        void loadInitialData();
+    }, [loadInitialData]);
+
+    useEffect(() => {
+        if (!hasInFlightExports) return;
+        const intervalId = window.setInterval(() => {
+            void refreshJobsAndImports();
+        }, 3000);
+        return () => window.clearInterval(intervalId);
+    }, [hasInFlightExports, refreshJobsAndImports]);
 
     const createImport = async () => {
         if (!importFile) {
@@ -83,17 +159,13 @@ const ExportPage: React.FC = () => {
                 },
             });
             setImportFile(null);
-            await load();
+            await refreshJobsAndImports();
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to create import.');
         } finally {
             setImportSubmitting(false);
         }
     };
-
-    useEffect(() => {
-        void load();
-    }, []);
 
     const createExport = async () => {
         setSubmitting(true);
@@ -117,7 +189,7 @@ const ExportPage: React.FC = () => {
                 contactId: form.contactId || undefined,
                 includeAttachments: form.includeAttachments,
             });
-            await load();
+            await refreshJobsAndImports();
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to create export.');
         } finally {
@@ -125,12 +197,73 @@ const ExportPage: React.FC = () => {
         }
     };
 
-    if (loading) {
+    const handleDownload = async (job: ExportJob) => {
+        const normalizedStatus = normalizeStatus(job.status);
+        const expiresAt = job.expiresAt ? new Date(job.expiresAt).getTime() : null;
+        const expired = Boolean(expiresAt && expiresAt <= Date.now());
+        const finalStatus = expired ? 'expired' : normalizedStatus;
+        const downloadCount = Number(job.downloadCount ?? 0);
+        const maxDownloads = Number(job.maxDownloads ?? 5);
+
+        if (finalStatus !== 'completed') {
+            setError('Export is not ready for download yet.');
+            return;
+        }
+        if (downloadCount >= maxDownloads) {
+            setError('Download limit reached for this export.');
+            return;
+        }
+
+        setDownloadingJobId(job.id);
+        setError('');
+
+        try {
+            const response = await api.get(`/export-import/export/${job.id}/download-url`);
+            const directUrl = String(response.data?.url || '');
+            const directFilename = String(
+                response.data?.filename || `export-${job.id}.${job.format || job.payload?.format || 'json'}`,
+            );
+            if (!directUrl) {
+                throw new Error('Failed to get direct download URL.');
+            }
+            const link = document.createElement('a');
+            link.href = directUrl;
+            link.setAttribute('download', directFilename);
+            link.setAttribute('rel', 'noopener');
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.setTimeout(() => {
+                void refreshJobsAndImports();
+            }, 1200);
+        } catch (err: any) {
+            if (err?.response?.status === 403) {
+                setError('Download limit reached for this export.');
+            } else {
+                setError(err?.response?.data?.message || err?.message || 'Failed to download export.');
+            }
+        } finally {
+            setDownloadingJobId(null);
+        }
+    };
+
+    const copyChecksum = async (jobId: string, checksum?: string | null) => {
+        if (!checksum) return;
+        try {
+            await navigator.clipboard.writeText(checksum);
+            setCopiedChecksumId(jobId);
+            window.setTimeout(() => setCopiedChecksumId(null), 1200);
+        } catch {
+            setError('Failed to copy checksum to clipboard.');
+        }
+    };
+
+    if (initialLoading) {
         return (
             <div className="max-w-7xl mx-auto space-y-6">
                 <PageHeader title={t('sidebar_export', 'Export & Import')} subtitle="Create organization-scoped exports for GDPR, threads, messages, contacts, and analytics with expiration-aware downloads." />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={5} cols={5} showHeader={false} />
+                    <TablePageSkeleton cols={8} showHeader={false} />
                 </div>
             </div>
         );
@@ -141,6 +274,7 @@ const ExportPage: React.FC = () => {
             <PageHeader title={t('sidebar_export', 'Export & Import')} subtitle="Create organization-scoped exports for GDPR, threads, messages, contacts, and analytics with expiration-aware downloads." />
 
             {error && <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+            {refreshing && <div className="text-xs text-[var(--color-text-muted)]">Refreshing export status...</div>}
 
             <section className="rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)] space-y-5">
                 <div className="flex items-center gap-2">
@@ -190,10 +324,6 @@ const ExportPage: React.FC = () => {
                     Include attachments
                 </label>
 
-                <div className="rounded-xl border border-[var(--color-card-border)] bg-[var(--color-background)]/25 px-4 py-3 text-sm text-[var(--color-text-muted)]">
-                    Downloads are limited and exports expire automatically when the expiration window ends.
-                </div>
-
                 <div className="flex justify-end">
                     <button type="button" onClick={() => void createExport()} disabled={submitting} className="inline-flex items-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white hover:bg-[var(--color-cta-secondary)] disabled:opacity-60">
                         <FileDown className="w-4 h-4" />
@@ -232,11 +362,14 @@ const ExportPage: React.FC = () => {
             </section>
 
             <section className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                <table className="w-full min-w-[980px] text-left">
+                <table className="w-full min-w-[1280px] text-left">
                     <thead>
                         <tr className="border-b border-[var(--color-card-border)] text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
                             <th className="px-4 py-3">Type</th>
                             <th className="px-4 py-3">Format</th>
+                            <th className="px-4 py-3">Progress</th>
+                            <th className="px-4 py-3">Downloads</th>
+                            <th className="px-4 py-3">Checksum</th>
                             <th className="px-4 py-3">Status</th>
                             <th className="px-4 py-3">Created</th>
                             <th className="px-4 py-3">Expires</th>
@@ -245,31 +378,65 @@ const ExportPage: React.FC = () => {
                     </thead>
                     <tbody>
                         {jobs.map((job) => {
-                            const normalizedStatus = job.status === 'done' ? 'completed' : job.status;
+                            const normalizedStatus = normalizeStatus(job.status);
                             const expired = job.expiresAt && new Date(job.expiresAt).getTime() <= Date.now();
                             const finalStatus = expired ? 'expired' : normalizedStatus;
+                            const progress = finalStatus === 'completed' ? 100 : clampProgress(Number(job.progressPercentage ?? 0));
+                            const downloadCount = Number(job.downloadCount ?? 0);
+                            const maxDownloads = Number(job.maxDownloads ?? 5);
+                            const downloadLimitReached = downloadCount >= maxDownloads;
+                            const canDownload = finalStatus === 'completed' && !downloadLimitReached;
+
                             return (
                                 <tr key={job.id} className="border-b border-[var(--color-card-border)]/70 text-sm hover:bg-[var(--color-background)]/35">
                                     <td className="px-4 py-3 text-[var(--color-text-primary)]">{String((job.resources || [])[0] || 'export').replace(/_/g, ' ')}</td>
                                     <td className="px-4 py-3 text-[var(--color-text-muted)] uppercase">{job.format || job.payload?.format || 'json'}</td>
+                                    <td className="px-4 py-3">
+                                        <div className="w-44 space-y-1">
+                                            <div className="h-2 rounded-full bg-[var(--color-background)]">
+                                                <div className="h-2 rounded-full bg-[var(--color-primary)] transition-all" style={{ width: `${progress}%` }} />
+                                            </div>
+                                            <div className="text-xs text-[var(--color-text-muted)]">{progress}%</div>
+                                        </div>
+                                    </td>
+                                    <td className="px-4 py-3 text-[var(--color-text-muted)]">{downloadCount} / {maxDownloads}</td>
+                                    <td className="px-4 py-3">
+                                        {job.checksum ? (
+                                            <div className="flex items-center gap-2">
+                                                <span className="font-mono text-xs text-[var(--color-text-muted)]">{checksumPreview(job.checksum)}</span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => void copyChecksum(job.id, job.checksum)}
+                                                    className="inline-flex items-center justify-center rounded-md border border-[var(--color-card-border)] p-1 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"
+                                                    title="Copy checksum"
+                                                >
+                                                    {copiedChecksumId === job.id ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                                                </button>
+                                            </div>
+                                        ) : (
+                                            <span className="text-xs text-[var(--color-text-muted)]">--</span>
+                                        )}
+                                    </td>
                                     <td className="px-4 py-3"><StatusBadge label={finalStatus} variant={finalStatus === 'completed' ? 'success' : finalStatus === 'failed' || finalStatus === 'expired' ? 'error' : 'warning'} /></td>
                                     <td className="px-4 py-3 text-[var(--color-text-muted)]">{new Date(job.createdAt).toLocaleString()}</td>
                                     <td className="px-4 py-3 text-[var(--color-text-muted)]">{job.expiresAt ? new Date(job.expiresAt).toLocaleString() : '--'}</td>
                                     <td className="px-4 py-3 text-right">
-                                        {finalStatus === 'completed' ? (
-                                            <a href={`${import.meta.env.VITE_API_URL || 'http://localhost:3000'}/export-import/export/${job.id}/download`} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-lg border border-[var(--color-card-border)] px-3 py-1.5 text-sm font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)]">
-                                                <Download className="w-4 h-4" /> Download
-                                            </a>
-                                        ) : (
-                                            <span className="text-sm text-[var(--color-text-muted)]">Unavailable</span>
-                                        )}
+                                        <button
+                                            type="button"
+                                            onClick={() => void handleDownload(job)}
+                                            disabled={!canDownload || downloadingJobId === job.id}
+                                            className="inline-flex items-center gap-2 rounded-lg border border-[var(--color-card-border)] px-3 py-1.5 text-sm font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)] disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                            <Download className="w-4 h-4" />
+                                            {downloadingJobId === job.id ? 'Downloading...' : canDownload ? 'Download' : downloadLimitReached ? 'Limit reached' : 'Unavailable'}
+                                        </button>
                                     </td>
                                 </tr>
                             );
                         })}
                         {jobs.length === 0 && (
                             <tr>
-                                <td colSpan={6} className="px-4 py-10 text-center text-sm text-[var(--color-text-muted)]">No export jobs created yet.</td>
+                                <td colSpan={9} className="px-4 py-10 text-center text-sm text-[var(--color-text-muted)]">No export jobs created yet.</td>
                             </tr>
                         )}
                     </tbody>
@@ -313,3 +480,4 @@ const ExportPage: React.FC = () => {
 };
 
 export default ExportPage;
+

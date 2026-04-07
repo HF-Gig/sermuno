@@ -1,7 +1,15 @@
 import React from 'react';
 import { SkeletonBlock } from '../ui/Skeleton';
+import { useAdaptiveRows } from '../../hooks/useAdaptiveCount';
 
 export function CalendarSkeleton() {
+  const weekRows = useAdaptiveRows({
+    rowHeight: 98,
+    minRows: 5,
+    maxRows: 6,
+    viewportOffset: 340,
+  });
+
   return (
     <div className="p-4 space-y-3">
       {/* Header: month nav + view toggle */}
@@ -20,7 +28,7 @@ export function CalendarSkeleton() {
         ))}
       </div>
       {/* Calendar cells — 5 weeks */}
-      {Array.from({ length: 5 }).map((_, week) => (
+      {Array.from({ length: weekRows }, (_, week) => (
         <div key={week} className="grid grid-cols-7 gap-1">
           {Array.from({ length: 7 }).map((_, day) => (
             <div key={day} className="animate-pulse space-y-1 rounded p-1 min-h-[80px]">

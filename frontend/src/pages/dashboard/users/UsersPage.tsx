@@ -6,6 +6,7 @@ import { useAuth } from '../../../context/AuthContext';
 import PageHeader from '../../../components/ui/PageHeader';
 import Modal from '../../../components/ui/Modal';
 import { canManageUsers, normalizeRole } from '../../../lib/rbac';
+import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 
 interface User {
     id: string; fullName: string; email: string; role: string;
@@ -124,6 +125,18 @@ const UsersPage = () => {
     );
     const pendingInviteIds = useMemo(() => new Set(pendingInvites.map((invite) => invite.id)), [pendingInvites]);
     const activeUsers = canManage ? filteredUsers.filter((u) => !pendingInviteIds.has(u.id)) : filteredUsers;
+    const pendingSkeletonRows = useAdaptiveRows({
+        rowHeight: 54,
+        minRows: 3,
+        maxRows: 8,
+        viewportOffset: 420,
+    });
+    const usersSkeletonRows = useAdaptiveRows({
+        rowHeight: 58,
+        minRows: 3,
+        maxRows: 8,
+        viewportOffset: 420,
+    });
 
     const roleBadgeStyles: Record<string, string> = {
         ADMIN: 'bg-red-50 text-red-700 border-red-100',
@@ -219,7 +232,7 @@ const UsersPage = () => {
                         <tbody className="divide-y divide-[var(--color-card-border)]">
                             {activeTab === 'pending' ? (
                                 pendingLoading ? (
-                                    Array.from({ length: 3 }).map((_, i) => (
+                                    Array.from({ length: pendingSkeletonRows }, (_, i) => (
                                         <tr key={i} className="animate-pulse">
                                             <td colSpan={6} className="px-5 py-4"><div className="w-full h-6 bg-[var(--color-background)]/40 rounded" /></td>
                                         </tr>
@@ -259,7 +272,7 @@ const UsersPage = () => {
                                     </tr>
                                 ))
                             ) : loading ? (
-                                Array.from({ length: 3 }).map((_, i) => (
+                                Array.from({ length: usersSkeletonRows }, (_, i) => (
                                     <tr key={i} className="animate-pulse">
                                         <td className="px-5 py-4"><div className="flex items-center gap-3"><div className="w-9 h-9 bg-[var(--color-background)] rounded-full" /><div className="space-y-1.5"><div className="w-28 h-3.5 bg-[var(--color-background)] rounded" /><div className="w-20 h-3 bg-[var(--color-background)]/60 rounded" /></div></div></td>
                                         <td colSpan={4} className="px-5 py-4"><div className="w-full h-6 bg-[var(--color-background)]/40 rounded" /></td>

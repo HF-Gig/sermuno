@@ -10,6 +10,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  Req,
 } from '@nestjs/common';
 import { ThreadsService } from './threads.service';
 import {
@@ -19,9 +20,11 @@ import {
   UpdateThreadDto,
   ComposeThreadDto,
   ReplyThreadDto,
+  ForwardThreadDto,
   AssignThreadDto,
   CreateNoteDto,
   UpdateNoteDto,
+  NoteMentionSuggestionsQueryDto,
   AddTagDto,
   SnoozeThreadDto,
   StarThreadDto,
@@ -29,6 +32,8 @@ import {
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import type { Request } from 'express';
+import { extractRequestMeta } from '../../common/http/request-meta';
 
 @UseGuards(JwtAuthGuard)
 @Controller('threads')
@@ -53,14 +58,28 @@ export class ThreadsController {
   // PATCH /threads (bulk update)
   @Patch()
   @HttpCode(HttpStatus.OK)
-  bulkUpdate(@Body() dto: BulkUpdateThreadsDto, @CurrentUser() user: JwtUser) {
-    return this.threadsService.bulkUpdate(dto, user);
+  bulkUpdate(
+    @Body() dto: BulkUpdateThreadsDto,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.threadsService.bulkUpdate(dto, user, extractRequestMeta(req));
   }
 
   // POST /threads/compose
   @Post('compose')
   compose(@Body() dto: ComposeThreadDto, @CurrentUser() user: JwtUser) {
     return this.threadsService.compose(dto, user);
+  }
+
+  // GET /threads/:id/mention-suggestions
+  @Get(':id/mention-suggestions')
+  getNoteMentionSuggestions(
+    @Param('id') id: string,
+    @Query() query: NoteMentionSuggestionsQueryDto,
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.threadsService.getNoteMentionSuggestions(id, query, user);
   }
 
   // GET /threads/:id
@@ -75,8 +94,9 @@ export class ThreadsController {
     @Param('id') id: string,
     @Body() dto: UpdateThreadDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.threadsService.update(id, dto, user);
+    return this.threadsService.update(id, dto, user, extractRequestMeta(req));
   }
 
   // PATCH /threads/:id/star
@@ -92,15 +112,23 @@ export class ThreadsController {
   // POST /threads/:id/archive
   @Post(':id/archive')
   @HttpCode(HttpStatus.OK)
-  archive(@Param('id') id: string, @CurrentUser() user: JwtUser) {
-    return this.threadsService.archive(id, user);
+  archive(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.threadsService.archive(id, user, extractRequestMeta(req));
   }
 
   // POST /threads/:id/unarchive
   @Post(':id/unarchive')
   @HttpCode(HttpStatus.OK)
-  unarchive(@Param('id') id: string, @CurrentUser() user: JwtUser) {
-    return this.threadsService.unarchive(id, user);
+  unarchive(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.threadsService.unarchive(id, user, extractRequestMeta(req));
   }
 
   // POST /threads/:id/reply
@@ -109,8 +137,20 @@ export class ThreadsController {
     @Param('id') id: string,
     @Body() dto: ReplyThreadDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.threadsService.reply(id, dto, user);
+    return this.threadsService.reply(id, dto, user, extractRequestMeta(req));
+  }
+
+  // POST /threads/:id/forward
+  @Post(':id/forward')
+  forward(
+    @Param('id') id: string,
+    @Body() dto: ForwardThreadDto,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.threadsService.forward(id, dto, user, extractRequestMeta(req));
   }
 
   // POST /threads/:id/assign
@@ -120,8 +160,9 @@ export class ThreadsController {
     @Param('id') id: string,
     @Body() dto: AssignThreadDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.threadsService.assign(id, dto, user);
+    return this.threadsService.assign(id, dto, user, extractRequestMeta(req));
   }
 
   // GET /threads/:id/notes
@@ -136,8 +177,9 @@ export class ThreadsController {
     @Param('id') id: string,
     @Body() dto: CreateNoteDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.threadsService.createNote(id, dto, user);
+    return this.threadsService.createNote(id, dto, user, extractRequestMeta(req));
   }
 
   // PUT /threads/:id/notes/:noteId
@@ -168,8 +210,14 @@ export class ThreadsController {
     @Param('id') id: string,
     @Body() dto: AddTagDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.threadsService.addTag(id, dto.tagId, user);
+    return this.threadsService.addTag(
+      id,
+      dto.tagId,
+      user,
+      extractRequestMeta(req),
+    );
   }
 
   // DELETE /threads/:id/tags/:tagId
@@ -179,8 +227,14 @@ export class ThreadsController {
     @Param('id') id: string,
     @Param('tagId') tagId: string,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.threadsService.removeTag(id, tagId, user);
+    return this.threadsService.removeTag(
+      id,
+      tagId,
+      user,
+      extractRequestMeta(req),
+    );
   }
 
   // POST /threads/:id/snooze
@@ -189,17 +243,23 @@ export class ThreadsController {
     @Param('id') id: string,
     @Body() dto: SnoozeThreadDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
     return this.threadsService.snoozeThread(
       id,
       new Date(dto.snoozedUntil),
       user,
+      extractRequestMeta(req),
     );
   }
 
   // POST /threads/:id/unsnooze
   @Post(':id/unsnooze')
-  unsnoozeThread(@Param('id') id: string, @CurrentUser() user: JwtUser) {
-    return this.threadsService.unsnoozeThread(id, user);
+  unsnoozeThread(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.threadsService.unsnoozeThread(id, user, extractRequestMeta(req));
   }
 }

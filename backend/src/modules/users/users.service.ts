@@ -20,6 +20,7 @@ import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import { AuditService } from '../audit/audit.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 type UserStatus = 'active' | 'inactive' | 'invited' | 'deleted';
 
@@ -36,6 +37,7 @@ export class UsersService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly auditService: AuditService,
+    private readonly featureFlags: FeatureFlagsService,
   ) {}
 
   // ─── List users ────────────────────────────────────────────────────────────
@@ -476,6 +478,13 @@ export class UsersService {
     fullName?: string;
     role: string;
   }): Promise<boolean> {
+    if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
+      this.logger.warn(
+        `[users] DISABLE_SMTP_SEND active; skipped invite email recipient=${input.email}`,
+      );
+      return false;
+    }
+
     const host = this.config.get<string>('smtp.host') ?? '';
     const from = this.config.get<string>('smtp.from') ?? '';
     const port = this.config.get<number>('smtp.port') ?? 587;

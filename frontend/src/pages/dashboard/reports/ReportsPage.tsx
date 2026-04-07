@@ -5,6 +5,7 @@ import EmptyState from '../../../components/ui/EmptyState';
 import { InlineSkeleton } from '../../../components/ui/Skeleton';
 import api from '../../../lib/api';
 import { useWebSocket } from '../../../context/WebSocketContext';
+import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 
 type OverviewMetrics = {
     totalOpenThreads?: number;
@@ -183,16 +184,29 @@ const ReportsPage: React.FC = () => {
         return <EmptyState icon={Users} title="No analytics data" description="No analytics payload was returned for this organization." />;
     }
 
+    const leaderboardRows = useAdaptiveRows({
+        rowHeight: 46,
+        minRows: 4,
+        maxRows: 8,
+        viewportOffset: 420,
+    });
+    const busyHourBars = useAdaptiveRows({
+        rowHeight: 12,
+        minRows: 18,
+        maxRows: 30,
+        viewportOffset: 480,
+    });
+
     const senderRows = loading
-        ? Array.from({ length: 5 }, (_, index) => ({ email: `sender-${index}@example.com`, count: 0 }))
+        ? Array.from({ length: leaderboardRows }, (_, index) => ({ email: `sender-${index}@example.com`, count: 0 }))
         : (data?.topSenders || []).slice(0, 5);
 
     const domainRows = loading
-        ? Array.from({ length: 5 }, (_, index) => ({ domain: `domain-${index}.com`, count: 0 }))
+        ? Array.from({ length: leaderboardRows }, (_, index) => ({ domain: `domain-${index}.com`, count: 0 }))
         : (data?.topDomains || []).slice(0, 5);
 
     const teamRows = loading
-        ? Array.from({ length: 5 }, (_, index) => ({ userId: `loading-${index}`, name: 'Loading', responseTimeMinutes: 0, resolvedThreads: 0, slaCompliance: 0 }))
+        ? Array.from({ length: leaderboardRows }, (_, index) => ({ userId: `loading-${index}`, name: 'Loading', responseTimeMinutes: 0, resolvedThreads: 0, slaCompliance: 0 }))
         : (data?.teamPerformance || []).slice(0, 5);
 
     const displayVolumeSeries = loading
@@ -200,7 +214,7 @@ const ReportsPage: React.FC = () => {
         : volumeSeries;
 
     const displayBusiestHours = loading
-        ? Array.from({ length: 23 }, (_, hour) => ({ hour, height: `${8 + ((hour + 3) % 8) * 18}px` }))
+        ? Array.from({ length: busyHourBars }, (_, hour) => ({ hour, height: `${8 + ((hour + 3) % 8) * 18}px` }))
         : busiestHours;
 
     return (

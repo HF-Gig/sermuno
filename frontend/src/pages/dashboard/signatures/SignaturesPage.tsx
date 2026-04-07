@@ -240,7 +240,7 @@ const SignaturesPage: React.FC = () => {
                     ) : null}
                 />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={6} cols={8} showHeader={false} />
+                    <TablePageSkeleton cols={8} showHeader={false} />
                 </div>
             </div>
         );
@@ -443,3 +443,4 @@ const SignaturesPage: React.FC = () => {
 };
 
 export default SignaturesPage;
+

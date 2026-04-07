@@ -58,19 +58,21 @@ export class AttachmentsController {
   @Post('presign')
   async presign(
     @CurrentUser() user: JwtUser,
+    @Body('messageId') messageId: string,
     @Body('filename') filename: string,
     @Body('contentType') contentType: string,
     @Body('sizeBytes') sizeBytes: number,
   ) {
+    if (!messageId) throw new BadRequestException('messageId is required');
     if (!filename) throw new BadRequestException('filename is required');
     if (!contentType) throw new BadRequestException('contentType is required');
 
-    const storageKey = this.storage.generateStorageKey(
-      user.organizationId,
+    return this.attachmentScan.createPresignedUpload(user, {
+      contentType,
       filename,
-    );
-    const url = await this.storage.presignedPutUrl(storageKey, contentType);
-    return { storageKey, url };
+      messageId,
+      sizeBytes: sizeBytes ?? 0,
+    });
   }
 
   /**
@@ -85,10 +87,11 @@ export class AttachmentsController {
     @Body('filename') filename: string,
     @Body('contentType') contentType: string,
     @Body('sizeBytes') sizeBytes: number,
+    @Body('uploadToken') uploadToken: string,
   ) {
-    if (!messageId || !storageKey || !filename) {
+    if (!messageId || !storageKey || !filename || !uploadToken) {
       throw new BadRequestException(
-        'messageId, storageKey, filename are required',
+        'messageId, storageKey, filename, uploadToken are required',
       );
     }
     return this.attachmentScan.confirmUploadedAttachment(user, {
@@ -97,6 +100,7 @@ export class AttachmentsController {
       filename,
       contentType: contentType ?? null,
       sizeBytes: sizeBytes ?? 0,
+      uploadToken,
     });
   }
 
@@ -113,14 +117,15 @@ export class AttachmentsController {
       },
     });
     if (!attachment) throw new NotFoundException('Attachment not found');
-    await this.attachmentScan.ensureAttachmentDownloadAllowed(
+    const approvedAttachment =
+      await this.attachmentScan.ensureAttachmentDownloadAllowed(
       attachment,
       user.sub,
     );
 
     const url = this.storage.isS3Storage()
-      ? await this.storage.presignedGetUrl(attachment.storageKey)
-      : `/attachments/${encodeURIComponent(attachment.id)}/download`;
+      ? await this.storage.presignedGetUrl(approvedAttachment.storageKey)
+      : `/attachments/${encodeURIComponent(approvedAttachment.id)}/download`;
 
     return { url, expiresIn: 3600 };
   }

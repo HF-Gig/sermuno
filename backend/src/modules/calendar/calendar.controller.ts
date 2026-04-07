@@ -11,6 +11,7 @@ import {
   HttpCode,
   HttpStatus,
   Res,
+  Req,
 } from '@nestjs/common';
 import { CalendarService } from './calendar.service';
 import { CalendarTemplatesService } from './calendar-templates.service';
@@ -19,7 +20,7 @@ import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import { RequirePermission } from '../../common/decorators/permissions.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import {
   CreateCalendarEventDto,
   UpdateCalendarEventDto,
@@ -29,6 +30,7 @@ import {
   CreateEventFromTemplateDto,
 } from './dto/calendar-template.dto';
 import { RsvpDto, IngestRsvpDto, SendInviteDto } from './dto/rsvp.dto';
+import { extractRequestMeta } from '../../common/http/request-meta';
 
 @UseGuards(JwtAuthGuard, PermissionsGuard)
 @Controller('calendar')
@@ -50,8 +52,12 @@ export class CalendarController {
 
   @Post('events')
   @RequirePermission('calendar:create')
-  create(@Body() dto: CreateCalendarEventDto, @CurrentUser() user: JwtUser) {
-    return this.calendarService.create(dto, user);
+  create(
+    @Body() dto: CreateCalendarEventDto,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.calendarService.create(dto, user, extractRequestMeta(req));
   }
 
   @Get('events/:id')
@@ -83,8 +89,9 @@ export class CalendarController {
     @Param('id') id: string,
     @Body() dto: SendInviteDto,
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.calendarService.sendInvite(id, dto, user);
+    return this.calendarService.sendInvite(id, dto, user, extractRequestMeta(req));
   }
 
   @Get('events/:id/attendees')
@@ -108,8 +115,14 @@ export class CalendarController {
   sendInviteByBody(
     @Body() dto: SendInviteDto & { eventId: string },
     @CurrentUser() user: JwtUser,
+    @Req() req: Request,
   ) {
-    return this.calendarService.sendInvite(dto.eventId, dto, user);
+    return this.calendarService.sendInvite(
+      dto.eventId,
+      dto,
+      user,
+      extractRequestMeta(req),
+    );
   }
 
   @Get('events/:id/rsvp/public')

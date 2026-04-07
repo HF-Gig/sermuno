@@ -1,9 +1,14 @@
-import React, { useMemo, useState, useEffect } from 'react';
-import { Loader2, X } from 'lucide-react';
+import React, { useMemo, useState, useEffect, useRef } from 'react';
+import { Loader2, Paperclip, X } from 'lucide-react';
 import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
 import SaasCalendarPicker from '../ui/SaasCalendarPicker';
 import api from '../../lib/api';
+import {
+    formatAttachmentSize,
+    summarizeAttachmentUploadFailure,
+    uploadAttachmentsForMessage,
+} from '../../lib/attachmentUploads';
 
 interface ComposeDrawerProps {
     isOpen: boolean;
@@ -18,6 +23,10 @@ type MailboxOption = {
 };
 
 type RecurrencePreset = 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly';
+type PendingAttachment = {
+    id: string;
+    file: File;
+};
 
 const weekdayByIndex = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 
@@ -44,6 +53,7 @@ const buildRrule = (preset: RecurrencePreset, scheduledFor: Date | null) => {
 };
 
 const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultMailboxId }) => {
+    const attachmentInputRef = useRef<HTMLInputElement | null>(null);
     const [mailboxes, setMailboxes] = useState<MailboxOption[]>([]);
     const [loadingMailboxes, setLoadingMailboxes] = useState(false);
     const [submitting, setSubmitting] = useState(false);
@@ -57,6 +67,7 @@ const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultM
     const [isScheduleOpen, setIsScheduleOpen] = useState(false);
     const [scheduledAt, setScheduledAt] = useState<Date | null>(null);
     const [recurrencePreset, setRecurrencePreset] = useState<RecurrencePreset>('none');
+    const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
 
     useEffect(() => {
         if (isOpen) {
@@ -69,6 +80,7 @@ const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultM
             setIsScheduleOpen(false);
             setScheduledAt(null);
             setRecurrencePreset('none');
+            setPendingAttachments([]);
             setError(null);
         }
     }, [isOpen, defaultMailboxId]);
@@ -128,6 +140,43 @@ const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultM
         setFormData(prev => ({ ...prev, body: value }));
     };
 
+    const handleAttachmentSelection = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const files = Array.from(event.target.files || []);
+        if (files.length === 0) {
+            event.target.value = '';
+            return;
+        }
+
+        setPendingAttachments((prev) => {
+            const next = [...prev];
+            const existingKeys = new Set(
+                prev.map(({ file }) => `${file.name}:${file.size}:${file.lastModified}`),
+            );
+
+            files.forEach((file) => {
+                const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
+                if (existingKeys.has(fileKey)) return;
+
+                next.push({
+                    id:
+                        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+                            ? crypto.randomUUID()
+                            : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                    file,
+                });
+                existingKeys.add(fileKey);
+            });
+
+            return next;
+        });
+
+        event.target.value = '';
+    };
+
+    const removePendingAttachment = (attachmentId: string) => {
+        setPendingAttachments((prev) => prev.filter((attachment) => attachment.id !== attachmentId));
+    };
+
     const modules = useMemo(() => ({
         toolbar: [
             [{ 'header': [1, 2, false] }],
@@ -160,15 +209,43 @@ const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultM
         setSubmitting(true);
         setError(null);
         try {
-            await api.post('/threads/compose', {
+            const response = await api.post('/threads/compose', {
                 mailboxId: formData.mailboxId,
-                to: formData.to.trim(),
+                to: [formData.to.trim()],
                 subject: formData.subject.trim(),
                 bodyHtml: formData.body,
                 bodyText: formData.body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(),
                 ...(scheduledFor ? { scheduledAt: scheduledFor.toISOString() } : {}),
                 ...(rrule ? { rrule, timezone: detectedTimezone } : {}),
             });
+
+            const createdMessageId = String(response.data?.message?.id || '').trim();
+            if (!createdMessageId) {
+                throw new Error('Compose response did not include a message id.');
+            }
+
+            if (pendingAttachments.length > 0) {
+                const { failed } = await uploadAttachmentsForMessage(
+                    createdMessageId,
+                    pendingAttachments.map((attachment) => attachment.file),
+                );
+
+                if (failed.length > 0) {
+                    setFormData({
+                        mailboxId: defaultMailboxId || '',
+                        to: '',
+                        subject: '',
+                        body: '',
+                    });
+                    setPendingAttachments([]);
+                    setIsScheduleOpen(false);
+                    setScheduledAt(null);
+                    setRecurrencePreset('none');
+                    setError(`Message sent, but ${summarizeAttachmentUploadFailure(failed)}`);
+                    return;
+                }
+            }
+
             window.dispatchEvent(new CustomEvent('sermuno:compose-sent'));
             onClose();
         } catch (err: any) {
@@ -261,6 +338,58 @@ const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultM
                                 onChange={handleChange}
                                 className="block w-full px-3 py-2.5 border border-[var(--color-input-border)] rounded-lg text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] focus:outline-none transition-all shadow-sm sm:text-sm"
                             />
+                        </div>
+
+                        <div className="space-y-2">
+                            <div className="flex items-center justify-between gap-3">
+                                <label className="block text-sm font-medium text-[var(--color-text-primary)]">Attachments</label>
+                                <button
+                                    type="button"
+                                    onClick={() => attachmentInputRef.current?.click()}
+                                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--color-card-border)] bg-white px-3 py-1.5 text-xs font-medium text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-background)]"
+                                >
+                                    <Paperclip className="h-3.5 w-3.5" />
+                                    Add files
+                                </button>
+                                <input
+                                    ref={attachmentInputRef}
+                                    data-testid="compose-attachment-input"
+                                    type="file"
+                                    multiple
+                                    className="hidden"
+                                    onChange={handleAttachmentSelection}
+                                />
+                            </div>
+                            {pendingAttachments.length > 0 ? (
+                                <div className="flex flex-wrap gap-2">
+                                    {pendingAttachments.map((attachment) => (
+                                        <div
+                                            key={attachment.id}
+                                            className="inline-flex max-w-full items-center gap-2 rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)]/40 px-3 py-1.5 text-xs text-[var(--color-text-primary)]"
+                                        >
+                                            <Paperclip className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                                            <span className="max-w-[220px] truncate">{attachment.file.name}</span>
+                                            {formatAttachmentSize(attachment.file.size) ? (
+                                                <span className="shrink-0 text-[var(--color-text-muted)]">
+                                                    ({formatAttachmentSize(attachment.file.size)})
+                                                </span>
+                                            ) : null}
+                                            <button
+                                                type="button"
+                                                onClick={() => removePendingAttachment(attachment.id)}
+                                                className="rounded-full p-0.5 text-[var(--color-text-muted)] transition-colors hover:bg-white hover:text-[var(--color-text-primary)]"
+                                                aria-label={`Remove ${attachment.file.name}`}
+                                            >
+                                                <X className="h-3 w-3" />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <p className="text-xs text-[var(--color-text-muted)]">
+                                    No attachments selected.
+                                </p>
+                            )}
                         </div>
 
                         {/* Body (Editor-like) */}

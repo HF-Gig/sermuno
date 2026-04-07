@@ -4,7 +4,9 @@ import {
   BadRequestException,
   ForbiddenException,
   ConflictException,
+  ServiceUnavailableException,
   Optional,
+  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -23,9 +25,11 @@ import type {
 } from './dto/mailbox.dto';
 import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
 import type { EmailSyncJobData } from '../../jobs/processors/email-sync.processor';
-import { ReadStateMode } from '@prisma/client';
+import { Prisma, ReadStateMode } from '@prisma/client';
 import { EventsGateway } from '../websockets/events.gateway';
 import { AuditService } from '../audit/audit.service';
+import type { RequestMeta } from '../../common/http/request-meta';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 16;
@@ -33,13 +37,16 @@ const TAG_LENGTH = 16;
 
 @Injectable()
 export class MailboxesService {
+  private readonly logger = new Logger(MailboxesService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly featureFlags: FeatureFlagsService,
     @InjectQueue(EMAIL_SYNC_QUEUE)
     private readonly emailSyncQueue: Queue<EmailSyncJobData>,
     @Optional() private readonly eventsGateway: EventsGateway | null,
-    @Optional() private readonly auditService: AuditService | null,
+    private readonly auditService: AuditService,
   ) {}
 
   // ─── Encryption helpers ──────────────────────────────────────────────────
@@ -159,11 +166,11 @@ export class MailboxesService {
     };
   }
 
-  async create(dto: CreateMailboxDto, user: JwtUser) {
+  async create(dto: CreateMailboxDto, user: JwtUser, meta: RequestMeta = {}) {
     const encImapPass = this.encryptIfPresent(dto.imapPass);
     const encSmtpPass = this.encryptIfPresent(dto.smtpPass);
 
-    return this.prisma.mailbox.create({
+    const created = await this.prisma.mailbox.create({
       data: {
         organizationId: user.organizationId,
         name: dto.name,
@@ -194,6 +201,24 @@ export class MailboxesService {
         updatedAt: true,
       },
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'MAILBOX_CREATED',
+      entityType: 'mailbox',
+      entityId: created.id,
+      previousValue: null,
+      newValue: {
+        name: created.name,
+        email: created.email,
+        provider: created.provider,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    return created;
   }
 
   async update(id: string, dto: UpdateMailboxDto, user: JwtUser) {
@@ -241,7 +266,7 @@ export class MailboxesService {
     });
   }
 
-  async remove(id: string, user: JwtUser) {
+  async remove(id: string, user: JwtUser, meta: RequestMeta = {}) {
     const userRole = String(user.role || '').toUpperCase();
     if (userRole !== 'ADMIN' && userRole !== 'MANAGER') {
       throw new ForbiddenException(
@@ -258,6 +283,24 @@ export class MailboxesService {
       where: { id },
       data: { deletedAt: new Date() },
     });
+
+    await this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'MAILBOX_DELETED',
+      entityType: 'mailbox',
+      entityId: id,
+      previousValue: {
+        name: mailbox.name,
+        email: mailbox.email,
+        provider: mailbox.provider,
+        deletedAt: mailbox.deletedAt,
+      },
+      newValue: { deletedAt: new Date().toISOString() },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
     return { message: 'Mailbox deleted' };
   }
 
@@ -482,6 +525,15 @@ export class MailboxesService {
   }
 
   async triggerSync(id: string, user: JwtUser) {
+    if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
+      this.logger.warn(
+        `[mailboxes] DISABLE_IMAP_SYNC active; blocked sync trigger mailbox=${id} org=${user.organizationId}`,
+      );
+      throw new ServiceUnavailableException(
+        'IMAP sync is temporarily disabled by an emergency kill switch',
+      );
+    }
+
     const mailbox = await this.prisma.mailbox.findFirst({
       where: { id, organizationId: user.organizationId, deletedAt: null },
     });
@@ -721,5 +773,31 @@ export class MailboxesService {
     }
 
     return removed;
+  }
+
+  private async logAuditSafe(input: {
+    organizationId: string;
+    userId?: string;
+    action: string;
+    entityType: string;
+    entityId?: string;
+    previousValue?: Prisma.InputJsonValue | null;
+    newValue?: Prisma.InputJsonValue | null;
+    ipAddress?: string;
+    userAgent?: string;
+  }) {
+    const { previousValue, newValue, ...baseAudit } = input;
+    try {
+      await this.auditService.log({
+        ...baseAudit,
+        ...(previousValue !== undefined &&
+          previousValue !== null && { previousValue }),
+        ...(newValue !== undefined && newValue !== null && { newValue }),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Failed to write mailbox audit log for ${input.action}: ${(error as Error).message}`,
+      );
+    }
   }
 }

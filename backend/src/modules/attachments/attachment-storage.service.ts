@@ -7,6 +7,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectCommand,
   CopyObjectCommand,
 } from '@aws-sdk/client-s3';
@@ -14,6 +15,11 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { Readable } from 'stream';
 
 const LOCAL_STORAGE_DIR = path.join(process.cwd(), 'attachment-storage');
+
+export type AttachmentStorageMetadata = {
+  contentType: string | null;
+  sizeBytes: number;
+};
 
 @Injectable()
 export class AttachmentStorageService {
@@ -67,6 +73,12 @@ export class AttachmentStorageService {
     const id = crypto.randomBytes(16).toString('hex');
     const ext = path.extname(filename);
     return `${organizationId}/quarantine/${id}${ext}`;
+  }
+
+  generateStagingKey(organizationId: string, filename: string): string {
+    const id = crypto.randomBytes(16).toString('hex');
+    const ext = path.extname(filename);
+    return `${organizationId}/incoming/${id}${ext}`;
   }
 
   /**
@@ -153,6 +165,33 @@ export class AttachmentStorageService {
       storageKey.replace(/\//g, '_'),
     );
     return fs.createReadStream(filePath);
+  }
+
+  async getMetadata(storageKey: string): Promise<AttachmentStorageMetadata> {
+    if (this.storageType === 's3' && this.s3) {
+      const response = await this.s3.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: storageKey,
+        }),
+      );
+
+      return {
+        contentType: response.ContentType ?? null,
+        sizeBytes: Number(response.ContentLength ?? 0),
+      };
+    }
+
+    const filePath = path.join(
+      LOCAL_STORAGE_DIR,
+      storageKey.replace(/\//g, '_'),
+    );
+    const stat = await fs.promises.stat(filePath);
+
+    return {
+      contentType: null,
+      sizeBytes: Number(stat.size),
+    };
   }
 
   /**

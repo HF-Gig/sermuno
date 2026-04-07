@@ -10,6 +10,7 @@ import { AuditService } from '../modules/audit/audit.service';
 import { WebsocketsModule } from '../modules/websockets/websockets.module';
 import { NotificationsModule } from '../modules/notifications/notifications.module';
 import { WebhooksModule } from '../modules/webhooks/webhooks.module';
+import { RulesModule } from '../modules/rules/rules.module';
 import { FeatureFlagsService } from '../config/feature-flags.service';
 
 import { EMAIL_SYNC_QUEUE } from './queues/email-sync.queue';
@@ -48,6 +49,7 @@ const QUEUE_NAMES = [
     WebsocketsModule,
     NotificationsModule,
     WebhooksModule,
+    RulesModule,
     BullModule.forRootAsync({
       useClass: BullConfigService,
     }),

@@ -8,6 +8,7 @@ import {
   IsNotEmpty,
   IsInt,
   Min,
+  Max,
 } from 'class-validator';
 import { Transform, Type } from 'class-transformer';
 
@@ -37,6 +38,11 @@ export class ListThreadsDto {
   @IsOptional()
   @IsString()
   assigned?: string;
+
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true' || value === '1')
+  @IsBoolean()
+  mentioned?: boolean;
 
   @IsOptional()
   @IsString()
@@ -211,6 +217,34 @@ export class ReplyThreadDto {
   rrule?: string;
 }
 
+export class ForwardThreadDto {
+  @IsArray()
+  @IsString({ each: true })
+  to!: string[];
+
+  @IsArray()
+  @IsString({ each: true })
+  @IsOptional()
+  cc?: string[];
+
+  @IsArray()
+  @IsString({ each: true })
+  @IsOptional()
+  bcc?: string[];
+
+  @IsOptional()
+  @IsString()
+  subject?: string;
+
+  @IsOptional()
+  @IsString()
+  bodyHtml?: string;
+
+  @IsOptional()
+  @IsString()
+  bodyText?: string;
+}
+
 export class AssignThreadDto {
   @IsOptional()
   @IsString()
@@ -231,6 +265,19 @@ export class UpdateNoteDto {
   @IsString()
   @IsNotEmpty()
   body!: string;
+}
+
+export class NoteMentionSuggestionsQueryDto {
+  @IsOptional()
+  @IsString()
+  query?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
 }
 
 export class AddTagDto {

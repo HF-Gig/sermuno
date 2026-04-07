@@ -3,6 +3,7 @@ import { Bell, CheckCheck, RefreshCcw, Search } from 'lucide-react';
 import EmptyState from '../../../components/ui/EmptyState';
 import { InlineSkeleton } from '../../../components/ui/Skeleton';
 import { useNotifications } from '../../../context/NotificationContext';
+import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 
 type NotificationTab = 'all' | 'unread';
 
@@ -16,6 +17,12 @@ const NotificationsPage: React.FC = () => {
     const { notifications, unreadCount, loading, error, markAllAsRead, markAsRead, refresh } = useNotifications();
     const [searchQuery, setSearchQuery] = useState('');
     const [activeTab, setActiveTab] = useState<NotificationTab>('all');
+    const loadingRows = useAdaptiveRows({
+        rowHeight: 82,
+        minRows: 4,
+        maxRows: 10,
+        viewportOffset: 320,
+    });
 
     const filtered = useMemo(() => {
         return notifications.filter((notification) => {
@@ -99,7 +106,7 @@ const NotificationsPage: React.FC = () => {
                 <EmptyState icon={Bell} title="No notifications" description="You're all caught up." />
             ) : (
                 <div className="space-y-2.5">
-                    {(loading ? Array.from({ length: 6 }, (_, index) => ({ id: `loading-${index}`, title: '', message: '', createdAt: '', readAt: null })) : filtered).map((notification) => (
+                    {(loading ? Array.from({ length: loadingRows }, (_, index) => ({ id: `loading-${index}`, title: '', message: '', createdAt: '', readAt: null })) : filtered).map((notification) => (
                         <button
                             key={notification.id}
                             type="button"

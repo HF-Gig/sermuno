@@ -34,6 +34,7 @@ import {
 import { UserRole } from '@prisma/client';
 import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
 import type { EmailSyncJobData } from '../../jobs/processors/email-sync.processor';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 // Permissions per role
 const ROLE_PERMISSIONS: Record<string, string[]> = {
@@ -171,6 +172,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
+    private readonly featureFlags: FeatureFlagsService,
     @InjectQueue(EMAIL_SYNC_QUEUE)
     private readonly emailSyncQueue: Queue<EmailSyncJobData>,
   ) {}
@@ -1123,11 +1125,17 @@ export class AuthService {
       if (mailboxId) {
         const streamingMode =
           this.config.get<boolean>('featureFlags.enableStreamingSync') ?? false;
-        await this.emailSyncQueue.add(
-          'sync',
-          { mailboxId, organizationId: actor.organizationId, streamingMode },
-          { attempts: 3, backoff: { type: 'exponential', delay: 1000 } },
-        );
+        if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
+          this.logger.warn(
+            `[google-oauth] DISABLE_IMAP_SYNC active; skipped auto-sync enqueue mailbox=${mailboxId} org=${actor.organizationId}`,
+          );
+        } else {
+          await this.emailSyncQueue.add(
+            'sync',
+            { mailboxId, organizationId: actor.organizationId, streamingMode },
+            { attempts: 3, backoff: { type: 'exponential', delay: 1000 } },
+          );
+        }
       }
     }
 
@@ -1375,11 +1383,17 @@ export class AuthService {
       if (mailboxId) {
         const streamingMode =
           this.config.get<boolean>('featureFlags.enableStreamingSync') ?? false;
-        await this.emailSyncQueue.add(
-          'sync',
-          { mailboxId, organizationId: actor.organizationId, streamingMode },
-          { attempts: 3, backoff: { type: 'exponential', delay: 1000 } },
-        );
+        if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
+          this.logger.warn(
+            `[microsoft-oauth] DISABLE_IMAP_SYNC active; skipped auto-sync enqueue mailbox=${mailboxId} org=${actor.organizationId}`,
+          );
+        } else {
+          await this.emailSyncQueue.add(
+            'sync',
+            { mailboxId, organizationId: actor.organizationId, streamingMode },
+            { attempts: 3, backoff: { type: 'exponential', delay: 1000 } },
+          );
+        }
       }
     }
 

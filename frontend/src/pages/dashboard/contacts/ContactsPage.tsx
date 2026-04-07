@@ -7,6 +7,7 @@ import { InlineSkeleton } from '../../../components/ui/Skeleton';
 import api from '../../../lib/api';
 import { hasPermission } from '../../../hooks/usePermission';
 import { useAuth } from '../../../context/AuthContext';
+import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 
 type ContactRecord = {
     id: string;
@@ -132,6 +133,30 @@ const ContactsPage: React.FC = () => {
 
     const companyMap = useMemo(() => Object.fromEntries(companies.map((company) => [company.id, company.name])), [companies]);
     const userMap = useMemo(() => Object.fromEntries(users.map((entry) => [entry.id, entry.fullName || entry.email])), [users]);
+    const contactsLoadingRows = useAdaptiveRows({
+        rowHeight: 52,
+        minRows: 6,
+        maxRows: 14,
+        viewportOffset: 340,
+    });
+    const companiesLoadingRows = useAdaptiveRows({
+        rowHeight: 52,
+        minRows: 4,
+        maxRows: 10,
+        viewportOffset: 420,
+    });
+    const contactDetailSkeletonRows = useAdaptiveRows({
+        rowHeight: 46,
+        minRows: 4,
+        maxRows: 10,
+        viewportOffset: 360,
+    });
+    const companyDetailSkeletonRows = useAdaptiveRows({
+        rowHeight: 46,
+        minRows: 3,
+        maxRows: 8,
+        viewportOffset: 420,
+    });
 
     const openContactCreate = () => {
         setEditingContactId(null);
@@ -236,11 +261,11 @@ const ContactsPage: React.FC = () => {
     };
 
     const displayContacts = loading
-        ? Array.from({ length: 6 }, (_, index) => ({ id: `loading-contact-${index}`, email: '', fullName: '', lifecycleStage: '', source: '', assignedToUserId: '', emailCount: 0, threadCount: 0, lastContactedAt: '' } as ContactRecord))
+        ? Array.from({ length: contactsLoadingRows }, (_, index) => ({ id: `loading-contact-${index}`, email: '', fullName: '', lifecycleStage: '', source: '', assignedToUserId: '', emailCount: 0, threadCount: 0, lastContactedAt: '' } as ContactRecord))
         : contacts;
 
     const displayCompanies = loading
-        ? Array.from({ length: 4 }, (_, index) => ({ id: `loading-company-${index}`, tenantId: '', name: '', primaryDomain: '', additionalDomains: [], customFields: {}, contactCount: 0, threadCount: 0 } as CompanyRecord))
+        ? Array.from({ length: companiesLoadingRows }, (_, index) => ({ id: `loading-company-${index}`, tenantId: '', name: '', primaryDomain: '', additionalDomains: [], customFields: {}, contactCount: 0, threadCount: 0 } as CompanyRecord))
         : companies;
 
     return (
@@ -312,7 +337,7 @@ const ContactsPage: React.FC = () => {
                             <div className="space-y-5">
                                 <InlineSkeleton className="h-7 w-32" />
                                 <InlineSkeleton className="h-4 w-40" />
-                                <div className="space-y-3">{Array.from({ length: 6 }).map((_, index) => <div key={index} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3"><InlineSkeleton className="h-4 w-full" /></div>)}</div>
+                                <div className="space-y-3">{Array.from({ length: contactDetailSkeletonRows }, (_, index) => <div key={index} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3"><InlineSkeleton className="h-4 w-full" /></div>)}</div>
                             </div>
                         ) : contactDetail ? (
                             <div className="space-y-5">
@@ -385,7 +410,7 @@ const ContactsPage: React.FC = () => {
                         {loading ? (
                             <div className="space-y-5">
                                 <InlineSkeleton className="h-7 w-32" />
-                                <div className="space-y-3">{Array.from({ length: 4 }).map((_, index) => <div key={index} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3"><InlineSkeleton className="h-4 w-full" /></div>)}</div>
+                                <div className="space-y-3">{Array.from({ length: companyDetailSkeletonRows }, (_, index) => <div key={index} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3"><InlineSkeleton className="h-4 w-full" /></div>)}</div>
                             </div>
                         ) : companyDetail ? (
                             <div className="space-y-5">

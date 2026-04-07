@@ -13,6 +13,8 @@ import { NOTIFICATION_DISPATCH_QUEUE } from '../../jobs/queues/notification-disp
 import { NotificationsModule } from '../notifications/notifications.module';
 import { NotificationsService } from '../notifications/notifications.service';
 import { WebsocketsModule } from '../websockets/websockets.module';
+import { AuditModule } from '../audit/audit.module';
+import { WebhooksModule } from '../webhooks/webhooks.module';
 
 @Module({
   imports: [
@@ -31,6 +33,8 @@ import { WebsocketsModule } from '../websockets/websockets.module';
     }),
     forwardRef(() => NotificationsModule),
     WebsocketsModule,
+    AuditModule,
+    WebhooksModule,
   ],
   controllers: [CalendarController],
   providers: [

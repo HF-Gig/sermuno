@@ -6,6 +6,7 @@ import { UserCircle2, KeyRound, BadgeCheck, ImagePlus, Upload, Trash2, Eye, EyeO
 import api, { resolveAvatarUrl } from '../../../lib/api';
 import { useAuth } from '../../../context/AuthContext';
 import AvatarCropModal from './components/AvatarCropModal';
+import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 import MfaSetup from '../../../components/MfaSetup';
 import {
     ensureDesktopPermission,
@@ -114,6 +115,12 @@ export default function ProfilePage() {
     const [notificationPreferences, setNotificationPreferences] = useState<Record<string, NotificationPreferenceState>>({});
     const [notificationsLoading, setNotificationsLoading] = useState(false);
     const [notificationSaveLoading, setNotificationSaveLoading] = useState(false);
+    const notificationSkeletonRows = useAdaptiveRows({
+        rowHeight: 72,
+        minRows: 4,
+        maxRows: 10,
+        viewportOffset: 340,
+    });
     const [pushFeatureEnabled, setPushFeatureEnabled] = useState(false);
     const [pushRegistrations, setPushRegistrations] = useState<PushRegistrationState[]>([]);
     const [currentPushEndpoint, setCurrentPushEndpoint] = useState<string | null>(null);
@@ -853,7 +860,7 @@ export default function ProfilePage() {
                     </p>
                     {notificationsLoading ? (
                         <div className="space-y-3">
-                            {Array.from({ length: 5 }).map((_, index) => (
+                            {Array.from({ length: notificationSkeletonRows }, (_, index) => (
                                 <div key={index} className="rounded-xl border border-[var(--color-card-border)] bg-white p-4">
                                     <div className="h-4 w-40 rounded bg-[var(--color-background)] animate-pulse" />
                                     <div className="mt-2 h-3 w-72 rounded bg-[var(--color-background)] animate-pulse" />

@@ -8,6 +8,7 @@ import { JwtStrategy } from './strategies/jwt.strategy';
 import { LocalStrategy } from './strategies/local.strategy';
 import { PrismaService } from '../../database/prisma.service';
 import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 @Module({
   imports: [
@@ -15,7 +16,13 @@ import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
     JwtModule.register({}), // secrets provided per-call in service
     BullModule.registerQueue({ name: EMAIL_SYNC_QUEUE }),
   ],
-  providers: [AuthService, JwtStrategy, LocalStrategy, PrismaService],
+  providers: [
+    AuthService,
+    JwtStrategy,
+    LocalStrategy,
+    PrismaService,
+    FeatureFlagsService,
+  ],
   controllers: [AuthController],
   exports: [AuthService],
 })

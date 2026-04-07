@@ -1,7 +1,15 @@
 import React from 'react';
 import { SkeletonBlock, SkeletonAvatar, SkeletonBadge } from '../ui/Skeleton';
+import { useAdaptiveRows } from '../../hooks/useAdaptiveCount';
 
 export function ContactsSkeleton() {
+  const rowCount = useAdaptiveRows({
+    rowHeight: 62,
+    minRows: 5,
+    maxRows: 12,
+    viewportOffset: 320,
+  });
+
   return (
     <div className="p-6 space-y-4">
       {/* Search + filter row */}
@@ -11,7 +19,7 @@ export function ContactsSkeleton() {
       </div>
       {/* Contact rows */}
       <div className="space-y-2">
-        {Array.from({ length: 8 }).map((_, i) => (
+        {Array.from({ length: rowCount }, (_, i) => (
           <div key={i} className="animate-pulse flex items-center gap-3 p-3 rounded-lg border border-gray-100 dark:border-gray-800">
             <SkeletonAvatar className="h-9 w-9" />
             <div className="flex-1 space-y-1">

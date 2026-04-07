@@ -1,10 +1,18 @@
 import React from 'react';
 import { SkeletonBlock, SkeletonAvatar, SkeletonBadge } from '../ui/Skeleton';
+import { useAdaptiveRows } from '../../hooks/useAdaptiveCount';
 
 export function NotificationsSkeleton() {
+  const rowCount = useAdaptiveRows({
+    rowHeight: 78,
+    minRows: 4,
+    maxRows: 10,
+    viewportOffset: 300,
+  });
+
   return (
     <div className="divide-y divide-gray-100 dark:divide-gray-800">
-      {Array.from({ length: 8 }).map((_, i) => (
+      {Array.from({ length: rowCount }, (_, i) => (
         <div key={i} className="animate-pulse flex items-start gap-3 px-4 py-3">
           <SkeletonAvatar className="h-8 w-8 mt-0.5" />
           <div className="flex-1 min-w-0 space-y-1.5">

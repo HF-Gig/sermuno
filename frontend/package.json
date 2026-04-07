@@ -12,6 +12,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "check:skeletons": "node scripts/check-skeleton-hardcoding.mjs",
     "preview": "vite preview",
     "setup": "npm install && cp -i .env.example .env"
   },

@@ -84,7 +84,7 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
                     </div>
                 </div>
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={6} cols={3} showHeader={false} />
+                    <TablePageSkeleton cols={3} showHeader={false} />
                 </div>
             </div>
         ) : (
@@ -92,7 +92,7 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
                 <PageHeader title="Tags" subtitle="Organize threads by creating and managing tags."
                     actions={canCreateTags ? <button onClick={() => { resetForm(); setShowForm(true); }} className="flex items-center gap-2 bg-[var(--color-cta-primary)] hover:bg-[var(--color-cta-secondary)] text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"><Plus className="w-4 h-4" /> New Tag</button> : null} />
                 <div className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-                    <TablePageSkeleton rows={6} cols={3} showHeader={false} />
+                    <TablePageSkeleton cols={3} showHeader={false} />
                 </div>
             </div>
         );
@@ -209,3 +209,4 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
 };
 
 export default TagsPage;
+

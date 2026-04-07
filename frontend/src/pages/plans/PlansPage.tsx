@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { ArrowLeft } from 'lucide-react';
 import api from '../../lib/api';
 import { clsx } from 'clsx';
+import { useAdaptiveGridCount, useAdaptiveRows } from '../../hooks/useAdaptiveCount';
 
 const PlansPage = () => {
     const { t } = useTranslation();
@@ -60,9 +61,23 @@ const PlansPage = () => {
     ];
 
     const normalizedCurrentPlan = useMemo(() => currentPlan, [currentPlan]);
+    const planSkeletonCards = useAdaptiveGridCount({
+        columns: 4,
+        rowHeight: 488,
+        minRows: 1,
+        maxRows: 2,
+        viewportOffset: 300,
+    });
+    const featureSkeletonRows = useAdaptiveRows({
+        rowHeight: 20,
+        minRows: 4,
+        maxRows: 7,
+        viewportOffset: 560,
+    });
+
     const plansSkeleton = (
         <div className="mx-auto grid w-full max-w-[90rem] grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4 animate-pulse">
-            {Array.from({ length: 4 }).map((_, index) => (
+            {Array.from({ length: planSkeletonCards }, (_, index) => (
                 <div key={index} className="flex min-h-[30.5rem] w-full flex-col rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)]">
                     <div className="mb-3 flex min-h-7 items-center justify-center">
                         <div className="h-6 w-24 rounded-full bg-[var(--color-background)]" />
@@ -77,7 +92,7 @@ const PlansPage = () => {
                         <div className="h-4 w-8/12 rounded-full bg-[var(--color-background)]" />
                     </div>
                     <div className="mb-6 grow space-y-2.5">
-                        {Array.from({ length: 5 }).map((__, featureIndex) => (
+                        {Array.from({ length: featureSkeletonRows }, (_, featureIndex) => (
                             <div key={featureIndex} className="flex items-start gap-2">
                                 <span className="mt-[0.35rem] h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--color-background)]" />
                                 <div className="h-4 w-full rounded-full bg-[var(--color-background)]" />

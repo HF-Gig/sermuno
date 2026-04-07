@@ -3,6 +3,7 @@ import { MulterModule } from '@nestjs/platform-express';
 import { PrismaService } from '../../database/prisma.service';
 import { ExportImportService } from './export-import.service';
 import { ExportImportController } from './export-import.controller';
+import { ExportImportPublicController } from './export-import-public.controller';
 
 @Module({
   imports: [
@@ -11,7 +12,7 @@ import { ExportImportController } from './export-import.controller';
       storage: undefined, // use memory storage (buffer)
     }),
   ],
-  controllers: [ExportImportController],
+  controllers: [ExportImportController, ExportImportPublicController],
   providers: [PrismaService, ExportImportService],
   exports: [ExportImportService],
 })

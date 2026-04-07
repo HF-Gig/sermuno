@@ -3,6 +3,7 @@ import { Prisma, type Message, type Thread } from '@prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { WebhooksService } from '../webhooks/webhooks.service';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 import type {
   RuleAction,
   RuleCondition,
@@ -44,6 +45,7 @@ export class RulesEngineService {
     private readonly prisma: PrismaService,
     private readonly notifications: NotificationsService,
     private readonly webhooks: WebhooksService,
+    private readonly featureFlags: FeatureFlagsService,
   ) {}
 
   async evaluate(
@@ -51,12 +53,26 @@ export class RulesEngineService {
     threadId: string,
     context: EvaluationContext,
   ): Promise<void> {
+    if (this.featureFlags.get('DISABLE_RULES_EVALUATION')) {
+      this.logger.warn(
+        `[rules-engine] DISABLE_RULES_EVALUATION active; skipped evaluation org=${organizationId} thread=${threadId}`,
+      );
+      return;
+    }
+
     const rules = await this.prisma.rule.findMany({
       where: { organizationId, isActive: true, deletedAt: null },
       orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
     });
 
     for (const rule of rules as LoadedRule[]) {
+      if (this.featureFlags.get('DISABLE_RULES_EVALUATION')) {
+        this.logger.warn(
+          `[rules-engine] DISABLE_RULES_EVALUATION active; halted actions org=${organizationId} thread=${threadId}`,
+        );
+        return;
+      }
+
       const conditions = this.normalizeConditions(
         rule.conditions,
         rule.conditionLogic ?? 'AND',

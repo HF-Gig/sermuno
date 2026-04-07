@@ -5,11 +5,12 @@ import { RulesEngineService } from './rules-engine.service';
 import { PrismaService } from '../../database/prisma.service';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { WebhooksModule } from '../webhooks/webhooks.module';
+import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 @Module({
   imports: [NotificationsModule, WebhooksModule],
   controllers: [RulesController],
-  providers: [RulesService, RulesEngineService, PrismaService],
+  providers: [RulesService, RulesEngineService, PrismaService, FeatureFlagsService],
   exports: [RulesService, RulesEngineService],
 })
 export class RulesModule {}

@@ -2,6 +2,10 @@ import React, { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { format } from 'date-fns';
 import api, { resolveAvatarUrl } from '../../../lib/api';
+import {
+    summarizeAttachmentUploadFailure,
+    uploadAttachmentsForMessage,
+} from '../../../lib/attachmentUploads';
 import { hasPermission } from '../../../hooks/usePermission';
 import { useWebSocket } from '../../../context/WebSocketContext';
 import { useAuth } from '../../../context/AuthContext';
@@ -12,9 +16,12 @@ import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
 import { InboxThreadListSkeleton } from '../../../components/skeletons/InboxThreadListSkeleton';
 import { ThreadDetailSkeleton } from '../../../components/skeletons/ThreadDetailSkeleton';
+import { PersonRowSkeleton, computeAdaptiveSkeletonRows } from '../../../components/ui/Skeleton';
+import { useAdaptiveLoading } from '../../../hooks/useAdaptiveLoading';
 import {
     Inbox as InboxIcon, SendHorizontal, User, ChevronDown,
     Clock, AlertCircle, Search, Tag, Hash,
+    AtSign,
     FileText, Paperclip, Type, Reply, FileSignature,
     CheckCircle2, Archive, Trash2,
     MoreHorizontal, Users, EyeOff, Star,
@@ -32,6 +39,12 @@ const statusMap: Record<string, { label: string; variant: 'success' | 'warning' 
     pending: { label: 'Waiting', variant: 'neutral' },
     closed: { label: 'Resolved', variant: 'success' },
 };
+
+const NOTE_MENTION_SUGGESTION_LIMIT = 50;
+const NOTE_MENTION_POPOVER_MAX_HEIGHT = 256;
+const NOTE_MENTION_ROW_HEIGHT = 48;
+const NOTE_MENTION_SKELETON_MIN_ROWS = 2;
+const NOTE_MENTION_SKELETON_MAX_ROWS = 8;
 
 const apiStatusToUiStatus = (status?: string | null, assignedUserId?: string | null) => {
     switch (String(status || '').toUpperCase()) {
@@ -165,6 +178,7 @@ type SidebarFilterItem = {
 const globalItems: SidebarFilterItem[] = [
     { id: 'all', label: 'All Inboxes', icon: InboxIcon },
     { id: 'my-threads', label: 'My Threads', icon: User },
+    { id: 'mentioned', label: 'Mentioned', icon: AtSign },
     { id: 'unassigned', label: 'Unassigned', icon: Users },
     { id: 'team-inbox', label: 'Team Inbox', icon: Users },
 ];
@@ -223,12 +237,46 @@ type MentionedUser = {
     avatarUrl?: string | null;
     mentionKey: string;
 };
+type PendingAttachment = {
+    id: string;
+    file: File;
+};
 type InternalNote = {
     id: string;
     body: string;
     createdAt: string;
     user?: { id?: string; fullName?: string; email?: string; avatarUrl?: string | null };
     mentionedUsers?: MentionedUser[];
+};
+type NoteMentionDraft = {
+    query: string;
+    startIndex: number;
+    length: number;
+};
+type MentionHighlightRange = {
+    index: number;
+    length: number;
+};
+type NoteEditorBounds = {
+    top: number;
+    left: number;
+    height: number;
+    width: number;
+};
+type NoteEditorReader = {
+    getSelection: () => { index: number; length: number } | null;
+    getText: (index?: number, length?: number) => string;
+    getLength: () => number;
+    getBounds?: (index: number, length?: number) => NoteEditorBounds;
+};
+
+type NoteEditorWriter = NoteEditorReader & {
+    formatText: (index: number, length: number, format: Record<string, unknown>, source?: string) => void;
+    deleteText: (index: number, length: number, source?: string) => void;
+    insertText: (index: number, text: string, source?: string) => void;
+    setSelection: (index: number, length: number, source?: string) => void;
+    focus: () => void;
+    root: HTMLElement;
 };
 
 type SidebarCounts = {
@@ -265,6 +313,288 @@ const normalizeThreadApiId = (threadId: string): string => {
 };
 
 const emptySidebarCounts: SidebarCounts = {};
+const noteMentionTriggerPattern = /(?:^|[^A-Za-z0-9._+@-])@([A-Za-z0-9._+-]{0,64})$/;
+const noteMentionTokenCharacterPattern = /^[A-Za-z0-9._+-]$/;
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const getMentionAliases = (mentionedUser: MentionedUser) => {
+    const aliases = new Set<string>();
+    const mentionKey = String(mentionedUser.mentionKey || '').trim();
+    const fullName = String(mentionedUser.fullName || '').trim();
+    const emailLocal = String(mentionedUser.email || '').trim().split('@')[0] || '';
+
+    if (mentionKey) aliases.add(mentionKey);
+    if (fullName) aliases.add(fullName);
+    if (emailLocal) aliases.add(emailLocal);
+
+    return [...aliases];
+};
+
+const resolveMentionedUserByToken = (
+    mentionToken: string,
+    directoryUsers: MentionedUser[],
+): MentionedUser | null => {
+    const normalizedToken = String(mentionToken || '').replace(/^@/, '').replace(/\u00A0/g, ' ').trim().toLowerCase();
+    if (!normalizedToken || !Array.isArray(directoryUsers) || directoryUsers.length === 0) {
+        return null;
+    }
+
+    for (const mentionedUser of directoryUsers) {
+        const aliases = getMentionAliases(mentionedUser).map((alias) => alias.toLowerCase());
+        if (aliases.includes(normalizedToken)) {
+            return mentionedUser;
+        }
+    }
+
+    return null;
+};
+
+const buildNoteTextForEditor = (text: string, mentionedUsers?: MentionedUser[]) => {
+    if (!text || !Array.isArray(mentionedUsers) || mentionedUsers.length === 0) {
+        return text;
+    }
+
+    let nextText = text;
+    const users = [...mentionedUsers]
+        .filter((mentionedUser) => mentionedUser?.mentionKey && mentionedUser?.fullName)
+        .sort((left, right) => right.mentionKey.length - left.mentionKey.length);
+
+    users.forEach((mentionedUser) => {
+        const mentionKey = String(mentionedUser.mentionKey || '').trim();
+        const fullName = String(mentionedUser.fullName || '').trim();
+        if (!mentionKey || !fullName) return;
+
+        const pattern = new RegExp(
+            `(^|[^A-Za-z0-9._+@-])@(${escapeRegExp(mentionKey)})(?=$|[^A-Za-z0-9._+-])`,
+            'gi',
+        );
+        nextText = nextText.replace(pattern, (_match, prefix: string) => `${prefix}@${fullName}`);
+    });
+
+    return nextText;
+};
+
+const serializeNoteTextForApi = (text: string, mentionedUsers: MentionedUser[]) => {
+    if (!text || !Array.isArray(mentionedUsers) || mentionedUsers.length === 0) {
+        return text;
+    }
+
+    let nextText = text;
+    const users = [...mentionedUsers]
+        .filter((mentionedUser) => mentionedUser?.mentionKey && mentionedUser?.fullName)
+        .sort((left, right) => right.fullName.length - left.fullName.length);
+
+    users.forEach((mentionedUser) => {
+        const mentionKey = String(mentionedUser.mentionKey || '').trim();
+        const fullName = String(mentionedUser.fullName || '').trim();
+        if (!mentionKey || !fullName) return;
+
+        const pattern = new RegExp(
+            `(^|[^A-Za-z0-9._+@-])@(${escapeRegExp(fullName)})(?=$|[^A-Za-z0-9._+-])`,
+            'gi',
+        );
+        nextText = nextText.replace(pattern, (_match, prefix: string) => `${prefix}@${mentionKey}`);
+    });
+
+    return nextText;
+};
+
+const extractNotePlainText = (html: string) => {
+    if (!html) return '';
+    return decodeHtmlEntities(String(html).replace(/<[^>]*>/g, ' '))
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+};
+
+const getNoteMentionDraft = (editor: NoteEditorReader): NoteMentionDraft | null => {
+    const selection = editor.getSelection();
+    if (!selection || selection.length > 0) return null;
+
+    const textBeforeCursor = editor.getText(0, selection.index);
+    const match = textBeforeCursor.match(noteMentionTriggerPattern);
+    if (!match) return null;
+
+    const query = String(match[1] || '').toLowerCase();
+    return {
+        query,
+        startIndex: selection.index - query.length - 1,
+        length: query.length + 1,
+    };
+};
+
+const getNoteMentionHighlightRanges = (
+    text: string,
+    directoryUsers: MentionedUser[],
+): MentionHighlightRange[] => {
+    if (!text || !Array.isArray(directoryUsers) || directoryUsers.length === 0) {
+        return [];
+    }
+
+    const aliasCandidates = Array.from(new Set(
+        directoryUsers
+            .flatMap((mentionedUser) => getMentionAliases(mentionedUser))
+            .map((alias) => String(alias || '').trim())
+            .filter(Boolean),
+    )).sort((left, right) => right.length - left.length);
+
+    if (aliasCandidates.length === 0) {
+        return [];
+    }
+
+    const ranges: MentionHighlightRange[] = [];
+    const hasOverlap = (index: number, length: number) => ranges.some((range) => {
+        const rangeEnd = range.index + range.length;
+        const nextEnd = index + length;
+        return index < rangeEnd && nextEnd > range.index;
+    });
+
+    aliasCandidates.forEach((alias) => {
+        const pattern = new RegExp(
+            `(^|[^A-Za-z0-9._+@-])@(${escapeRegExp(alias)})(?=$|[^A-Za-z0-9._+-])`,
+            'gi',
+        );
+        let match: RegExpExecArray | null = pattern.exec(text);
+        while (match) {
+            const prefixLength = String(match[1] || '').length;
+            const matchedAlias = String(match[2] || '');
+            const index = match.index + prefixLength;
+            const length = matchedAlias.length + 1;
+            if (length > 1 && !hasOverlap(index, length)) {
+                ranges.push({ index, length });
+            }
+            match = pattern.exec(text);
+        }
+    });
+
+    ranges.sort((left, right) => left.index - right.index);
+    return ranges;
+};
+
+const applyMentionDisplayNamesToHtml = (html: string, mentionedUsers?: MentionedUser[]) => {
+    if (!html || typeof window === 'undefined' || !Array.isArray(mentionedUsers) || mentionedUsers.length === 0) {
+        return html;
+    }
+
+    const mentionByKey = new Map<string, MentionedUser>();
+    mentionedUsers.forEach((mentionedUser) => {
+        const mentionKey = String(mentionedUser?.mentionKey || '').trim().toLowerCase();
+        if (!mentionKey || !mentionedUser?.fullName) return;
+        mentionByKey.set(mentionKey, mentionedUser);
+    });
+
+    if (mentionByKey.size === 0) {
+        return html;
+    }
+
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(`<div id="mention-render-root">${html}</div>`, 'text/html');
+    const root = doc.getElementById('mention-render-root');
+    if (!root) return html;
+
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const textNodes: Text[] = [];
+    let currentNode = walker.nextNode();
+
+    while (currentNode) {
+        textNodes.push(currentNode as Text);
+        currentNode = walker.nextNode();
+    }
+
+    textNodes.forEach((textNode) => {
+        const currentValue = textNode.nodeValue || '';
+        const matcher = /(^|[^A-Za-z0-9._+@-])@([A-Za-z0-9._+-]{1,64})\b/g;
+        const fragment = doc.createDocumentFragment();
+        let cursor = 0;
+        let hasReplacement = false;
+        let match: RegExpExecArray | null = matcher.exec(currentValue);
+
+        while (match) {
+            const prefixLength = String(match[1] || '').length;
+            const mentionStart = match.index + prefixLength;
+            const mentionToken = String(match[2] || '');
+            const mentionKey = mentionToken.toLowerCase();
+            const mentionedUser = mentionByKey.get(mentionKey);
+
+            if (mentionedUser) {
+                if (mentionStart > cursor) {
+                    fragment.appendChild(doc.createTextNode(currentValue.slice(cursor, mentionStart)));
+                }
+
+                const mentionWrapper = doc.createElement('span');
+                mentionWrapper.className = 'group relative inline-flex align-baseline';
+
+                const mentionLabel = doc.createElement('span');
+                mentionLabel.className = 'inline-flex cursor-pointer rounded-md bg-amber-100/80 px-1 py-0.5 font-medium text-amber-900';
+                mentionLabel.setAttribute('data-note-mention', 'label');
+                mentionLabel.setAttribute('data-mention-user-id', mentionedUser.id);
+                mentionLabel.textContent = `@${mentionedUser.fullName}`;
+                mentionWrapper.appendChild(mentionLabel);
+
+                const hoverCard = doc.createElement('span');
+                hoverCard.className = 'pointer-events-none absolute bottom-full left-1/2 z-[120] mb-1 hidden w-56 -translate-x-1/2 rounded-lg border border-[var(--color-card-border)] bg-white p-2 shadow-2xl group-hover:block';
+                hoverCard.setAttribute('data-note-mention', 'card');
+                hoverCard.setAttribute('data-mention-user-id', mentionedUser.id);
+
+                const hoverCardInner = doc.createElement('span');
+                hoverCardInner.className = 'flex items-center gap-2';
+
+                const resolvedAvatar = resolveAvatarUrl(mentionedUser.avatarUrl);
+                if (resolvedAvatar) {
+                    const avatarImage = doc.createElement('img');
+                    avatarImage.src = resolvedAvatar;
+                    avatarImage.alt = mentionedUser.fullName;
+                    avatarImage.className = 'h-8 w-8 shrink-0 rounded-full border border-[var(--color-card-border)] object-cover';
+                    hoverCardInner.appendChild(avatarImage);
+                } else {
+                    const initials = String(mentionedUser.fullName || '')
+                        .split(/\s+/)
+                        .map((part) => part[0] || '')
+                        .join('')
+                        .slice(0, 2)
+                        .toUpperCase() || 'U';
+                    const avatarFallback = doc.createElement('span');
+                    avatarFallback.className = 'flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)] text-[11px] font-semibold text-[var(--color-primary)]';
+                    avatarFallback.textContent = initials;
+                    hoverCardInner.appendChild(avatarFallback);
+                }
+
+                const infoWrap = doc.createElement('span');
+                infoWrap.className = 'min-w-0 flex-1';
+
+                const fullNameNode = doc.createElement('span');
+                fullNameNode.className = 'block truncate text-[12px] font-semibold text-[var(--color-text-primary)]';
+                fullNameNode.textContent = mentionedUser.fullName;
+                infoWrap.appendChild(fullNameNode);
+
+                const emailNode = doc.createElement('span');
+                emailNode.className = 'block truncate text-[11px] text-[var(--color-text-muted)]';
+                emailNode.textContent = mentionedUser.email;
+                infoWrap.appendChild(emailNode);
+
+                hoverCardInner.appendChild(infoWrap);
+                hoverCard.appendChild(hoverCardInner);
+                mentionWrapper.appendChild(hoverCard);
+                fragment.appendChild(mentionWrapper);
+
+                cursor = mentionStart + mentionToken.length + 1;
+                hasReplacement = true;
+            }
+
+            match = matcher.exec(currentValue);
+        }
+
+        if (hasReplacement) {
+            if (cursor < currentValue.length) {
+                fragment.appendChild(doc.createTextNode(currentValue.slice(cursor)));
+            }
+            textNode.replaceWith(fragment);
+        }
+    });
+
+    return root.innerHTML;
+};
 
 const buildRrule = (preset: RecurrencePreset, scheduledFor: Date | null) => {
     if (!scheduledFor || preset === 'none') return null;
@@ -391,7 +721,9 @@ const InboxPage: React.FC = () => {
     const [replyScheduledAt, setReplyScheduledAt] = useState<Date | null>(null);
     const [replyRecurrencePreset, setReplyRecurrencePreset] = useState<RecurrencePreset>('none');
     const [replyScheduledState, setReplyScheduledState] = useState<ScheduledStatePreset>('no_change');
+    const [replyPendingAttachments, setReplyPendingAttachments] = useState<PendingAttachment[]>([]);
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const replyAttachmentInputRef = useRef<HTMLInputElement | null>(null);
 
     const [isThreadLoading, setIsThreadLoading] = useState(false);
     const [isThreadListLoading, setIsThreadListLoading] = useState(false);
@@ -410,6 +742,22 @@ const InboxPage: React.FC = () => {
     const [replyEditorTab, setReplyEditorTab] = useState<'reply' | 'note'>('reply');
     const [replyHtml, setReplyHtml] = useState('');
     const [noteHtml, setNoteHtml] = useState('');
+    const noteQuillWrapperRef = useRef<HTMLDivElement | null>(null);
+    const noteEditorRef = useRef<ReactQuill | null>(null);
+    const noteMentionHighlightRangesRef = useRef<MentionHighlightRange[]>([]);
+    const isApplyingNoteMentionHighlightsRef = useRef(false);
+    const [noteMentionDraft, setNoteMentionDraft] = useState<NoteMentionDraft | null>(null);
+    const [noteMentionSuggestions, setNoteMentionSuggestions] = useState<MentionedUser[]>([]);
+    const [noteMentionDirectory, setNoteMentionDirectory] = useState<Record<string, MentionedUser>>({});
+    const [activeNoteMentionIndex, setActiveNoteMentionIndex] = useState(0);
+    const [isLoadingNoteMentions, setIsLoadingNoteMentions] = useState(false);
+    const [hasResolvedNoteMentionSuggestions, setHasResolvedNoteMentionSuggestions] = useState(false);
+    const [noteMentionPopoverTop, setNoteMentionPopoverTop] = useState<number | null>(null);
+    const [noteMentionHoverCard, setNoteMentionHoverCard] = useState<{
+        user: MentionedUser;
+        top: number;
+        left: number;
+    } | null>(null);
     const [showTemplateRow, setShowTemplateRow] = useState(false);
     const [isReplyExpanded, setIsReplyExpanded] = useState(false);
     const [replyTemplates, setReplyTemplates] = useState<{ id: string; name: string; bodyHtml: string }[]>([]);
@@ -435,11 +783,229 @@ const InboxPage: React.FC = () => {
     const [mailboxDataVersion, setMailboxDataVersion] = useState(0);
     const [realtimeListVersion, setRealtimeListVersion] = useState(0);
     const hasLoadedOnceRef = useRef(false);
+    const noteMentionRequestRef = useRef(0);
+    const shouldShowMentionLoading = useAdaptiveLoading(isLoadingNoteMentions, {
+        showDelayMs: 120,
+        minVisibleMs: 200,
+    });
+    const noteMentionDirectoryUsers = useMemo(
+        () => Object.values(noteMentionDirectory),
+        [noteMentionDirectory],
+    );
+    const mergeNoteMentionDirectory = useCallback((entries: MentionedUser[]) => {
+        if (!Array.isArray(entries) || entries.length === 0) return;
+        setNoteMentionDirectory((prev) => {
+            let changed = false;
+            const next = { ...prev };
+
+            entries.forEach((mentionedUser) => {
+                const id = String(mentionedUser?.id || '').trim();
+                const fullName = String(mentionedUser?.fullName || '').trim();
+                const email = String(mentionedUser?.email || '').trim();
+                const mentionKey = String(mentionedUser?.mentionKey || '').trim();
+                if (!id || !fullName || !email || !mentionKey) return;
+
+                const normalized: MentionedUser = {
+                    id,
+                    fullName,
+                    email,
+                    mentionKey,
+                    avatarUrl: mentionedUser?.avatarUrl || null,
+                };
+
+                const existing = next[id];
+                if (
+                    !existing
+                    || existing.fullName !== normalized.fullName
+                    || existing.email !== normalized.email
+                    || existing.mentionKey !== normalized.mentionKey
+                    || existing.avatarUrl !== normalized.avatarUrl
+                ) {
+                    next[id] = normalized;
+                    changed = true;
+                }
+            });
+
+            return changed ? next : prev;
+        });
+    }, []);
+    const mentionableUserCount = useMemo(
+        () => assigneeOptions.filter((entry) => entry.type === 'user').length,
+        [assigneeOptions],
+    );
+    const noteMentionSkeletonRows = useMemo(() => {
+        const expectedRows = Math.max(noteMentionSuggestions.length, mentionableUserCount);
+        return computeAdaptiveSkeletonRows({
+            rowHeight: NOTE_MENTION_ROW_HEIGHT,
+            containerMaxHeight: NOTE_MENTION_POPOVER_MAX_HEIGHT,
+            expectedCount: expectedRows,
+            minRows: NOTE_MENTION_SKELETON_MIN_ROWS,
+            maxRows: NOTE_MENTION_SKELETON_MAX_ROWS,
+            density: 'compact',
+        });
+    }, [mentionableUserCount, noteMentionSuggestions.length]);
+    const showNoteMentionSkeleton = shouldShowMentionLoading
+        && noteMentionSuggestions.length === 0
+        && !hasResolvedNoteMentionSuggestions;
+    const showNoteMentionRefreshIndicator = shouldShowMentionLoading && !showNoteMentionSkeleton;
 
     const toThreadPath = useCallback((id: string) => {
         const rawId = String(id || '').replace(/^t/, '');
         return `/inbox/thread/${toThreadRouteCode(rawId)}?tid=${encodeURIComponent(rawId)}`;
     }, []);
+
+    const clearNoteMentionState = useCallback(() => {
+        setNoteMentionDraft(null);
+        setNoteMentionSuggestions([]);
+        setActiveNoteMentionIndex(0);
+        setIsLoadingNoteMentions(false);
+        setHasResolvedNoteMentionSuggestions(false);
+        setNoteMentionPopoverTop(null);
+        setNoteMentionHoverCard(null);
+    }, []);
+
+    const updateNoteMentionPopoverTop = useCallback((
+        draftOverride?: NoteMentionDraft | null,
+        editorInstance?: NoteEditorReader,
+    ) => {
+        const activeDraft = draftOverride === undefined ? noteMentionDraft : draftOverride;
+        if (replyEditorTab !== 'note' || !activeDraft) {
+            setNoteMentionPopoverTop(null);
+            return;
+        }
+
+        const hintedEditor = editorInstance as NoteEditorWriter | undefined;
+        const editor = hintedEditor?.root && typeof hintedEditor.getBounds === 'function'
+            ? hintedEditor
+            : noteEditorRef.current?.getEditor() as NoteEditorWriter | undefined;
+        const wrapper = noteQuillWrapperRef.current;
+        if (!editor || !wrapper || typeof editor.getBounds !== 'function') {
+            setNoteMentionPopoverTop(null);
+            return;
+        }
+
+        const bounds = editor.getBounds(activeDraft.startIndex + activeDraft.length, 0);
+        if (!bounds) {
+            setNoteMentionPopoverTop(null);
+            return;
+        }
+        const editorRect = editor.root.getBoundingClientRect();
+        const wrapperRect = wrapper.getBoundingClientRect();
+        const topWithinWrapper = editorRect.top - wrapperRect.top + bounds.top;
+
+        setNoteMentionPopoverTop(Math.max(16, Math.round(topWithinWrapper)));
+    }, [noteMentionDraft, replyEditorTab]);
+
+    const applyNoteMentionHighlights = useCallback(() => {
+        const editor = noteEditorRef.current?.getEditor() as NoteEditorWriter | undefined;
+        if (!editor || isApplyingNoteMentionHighlightsRef.current) return;
+
+        isApplyingNoteMentionHighlightsRef.current = true;
+        try {
+            noteMentionHighlightRangesRef.current.forEach((range) => {
+                editor.formatText(range.index, range.length, { background: false, color: false }, 'silent');
+            });
+
+            const text = editor.getText(0, Math.max(0, editor.getLength() - 1));
+            const nextRanges = getNoteMentionHighlightRanges(text, noteMentionDirectoryUsers);
+            nextRanges.forEach((range) => {
+                editor.formatText(range.index, range.length, { background: '#FEF3C7', color: '#92400E' }, 'silent');
+            });
+
+            noteMentionHighlightRangesRef.current = nextRanges;
+        } finally {
+            isApplyingNoteMentionHighlightsRef.current = false;
+        }
+    }, [noteMentionDirectoryUsers]);
+
+    const syncNoteMentionDraft = useCallback((editorInstance?: NoteEditorReader) => {
+        if (replyEditorTab !== 'note') {
+            clearNoteMentionState();
+            return;
+        }
+
+        const editor = editorInstance || noteEditorRef.current?.getEditor();
+        if (!editor) return;
+
+        const selection = editor.getSelection();
+        if (!selection || selection.length > 0) {
+            clearNoteMentionState();
+            return;
+        }
+
+        const editorText = editor.getText(0, Math.max(0, editor.getLength() - 1));
+        const validMentionRanges = getNoteMentionHighlightRanges(editorText, noteMentionDirectoryUsers);
+        const isInsideExistingMention = validMentionRanges.some((range) => (
+            selection.index >= range.index && selection.index <= range.index + range.length
+        ));
+        if (isInsideExistingMention) {
+            clearNoteMentionState();
+            return;
+        }
+
+        const nextDraft = getNoteMentionDraft(editor);
+        if (!nextDraft) {
+            clearNoteMentionState();
+            return;
+        }
+
+        updateNoteMentionPopoverTop(nextDraft, editor);
+
+        setNoteMentionDraft((prev) => (
+            prev
+                && prev.query === nextDraft.query
+                && prev.startIndex === nextDraft.startIndex
+                && prev.length === nextDraft.length
+                ? prev
+                : nextDraft
+        ));
+    }, [clearNoteMentionState, noteMentionDirectoryUsers, replyEditorTab, updateNoteMentionPopoverTop]);
+
+    const handleNoteEditorChange = useCallback((
+        value: string,
+        _delta: unknown,
+        _source: string,
+        editor: NoteEditorReader,
+    ) => {
+        setNoteHtml(value);
+        if (replyEditorTab === 'note' && !isApplyingNoteMentionHighlightsRef.current) {
+            applyNoteMentionHighlights();
+        }
+        syncNoteMentionDraft(editor);
+    }, [applyNoteMentionHighlights, replyEditorTab, syncNoteMentionDraft]);
+
+    const applyNoteMentionSuggestion = useCallback((mentionedUser: MentionedUser) => {
+        const editor = noteEditorRef.current?.getEditor() as NoteEditorWriter | undefined;
+        if (!editor || !noteMentionDraft) return;
+
+        const mentionDisplayName = String(mentionedUser.fullName || '').replace(/\s+/g, ' ').trim();
+        const mentionText = `@${mentionDisplayName}\u00A0`;
+        const editorText = editor.getText(0, Math.max(0, editor.getLength() - 1));
+        const replacementStart = Math.max(0, noteMentionDraft.startIndex);
+        let replacementEnd = Math.min(editorText.length, replacementStart + noteMentionDraft.length);
+
+        while (
+            replacementEnd < editorText.length
+            && noteMentionTokenCharacterPattern.test(editorText.charAt(replacementEnd))
+        ) {
+            replacementEnd += 1;
+        }
+
+        editor.deleteText(replacementStart, Math.max(1, replacementEnd - replacementStart), 'user');
+        editor.insertText(replacementStart, mentionText, 'user');
+        editor.setSelection(replacementStart + mentionText.length, 0, 'user');
+        mergeNoteMentionDirectory([mentionedUser]);
+        applyNoteMentionHighlights();
+        clearNoteMentionState();
+        editor.focus();
+    }, [applyNoteMentionHighlights, clearNoteMentionState, mergeNoteMentionDirectory, noteMentionDraft]);
+
+    useEffect(() => {
+        if (!noteMentionDraft || replyEditorTab !== 'note') {
+            return;
+        }
+        updateNoteMentionPopoverTop();
+    }, [noteMentionDraft, noteMentionSuggestions.length, isLoadingNoteMentions, replyEditorTab, updateNoteMentionPopoverTop]);
 
     useEffect(() => {
         const mqLg = window.matchMedia('(min-width: 1024px)');
@@ -665,6 +1231,7 @@ const InboxPage: React.FC = () => {
             setSidebarCounts({
                 all: Number(sidebar.all || 0),
                 'my-threads': Number(sidebar['my-threads'] || 0),
+                mentioned: Number(sidebar.mentioned || 0),
                 unassigned: Number(sidebar.unassigned || 0),
                 'team-inbox': Number(sidebar['team-inbox'] || 0),
                 'priority-high': Number(sidebar['priority-high'] || 0),
@@ -748,6 +1315,9 @@ const InboxPage: React.FC = () => {
                 switch (activeSidebarItem.id) {
                     case 'my-threads':
                         params.append('assigned', 'me');
+                        break;
+                    case 'mentioned':
+                        params.append('mentioned', 'true');
                         break;
                     case 'unassigned':
                         params.append('assigned', 'unassigned');
@@ -1329,6 +1899,43 @@ const InboxPage: React.FC = () => {
         }
     };
 
+    const handleReplyAttachmentSelection = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const files = Array.from(event.target.files || []);
+        if (files.length === 0) {
+            event.target.value = '';
+            return;
+        }
+
+        setReplyPendingAttachments((prev) => {
+            const next = [...prev];
+            const existingKeys = new Set(
+                prev.map(({ file }) => `${file.name}:${file.size}:${file.lastModified}`),
+            );
+
+            files.forEach((file) => {
+                const fileKey = `${file.name}:${file.size}:${file.lastModified}`;
+                if (existingKeys.has(fileKey)) return;
+
+                next.push({
+                    id:
+                        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+                            ? crypto.randomUUID()
+                            : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+                    file,
+                });
+                existingKeys.add(fileKey);
+            });
+
+            return next;
+        });
+
+        event.target.value = '';
+    };
+
+    const removeReplyPendingAttachment = (attachmentId: string) => {
+        setReplyPendingAttachments((prev) => prev.filter((attachment) => attachment.id !== attachmentId));
+    };
+
     const handleReply = async (
         scheduledFor?: Date | null,
         recurrencePreset?: RecurrencePreset,
@@ -1375,6 +1982,7 @@ const InboxPage: React.FC = () => {
 
         try {
             const actualThreadId = String(openThread.id).replace('t', '');
+            const pendingReplyFiles = replyPendingAttachments.map((attachment) => attachment.file);
             const payload = {
                 mailboxId: mailboxIdForSend,
                 threadId: actualThreadId,
@@ -1387,16 +1995,45 @@ const InboxPage: React.FC = () => {
                 ...(resolvedScheduledAt ? { scheduledAt: resolvedScheduledAt.toISOString() } : {}),
                 ...(rrule ? { rrule, timezone: detectedTimezone } : {}),
             };
+            let attachmentFailureMessage = '';
 
             if (resolvedScheduledAt) {
-                await api.post('/scheduled-messages', payload);
+                const scheduledResponse = await api.post('/scheduled-messages', payload);
+                const scheduledMessageId = String(scheduledResponse.data?.messageId || '').trim();
+                if (!scheduledMessageId) {
+                    throw new Error('Scheduled reply API did not return a message id.');
+                }
+
+                if (pendingReplyFiles.length > 0) {
+                    const { failed } = await uploadAttachmentsForMessage(
+                        scheduledMessageId,
+                        pendingReplyFiles,
+                    );
+                    if (failed.length > 0) {
+                        attachmentFailureMessage = `Reply scheduled, but ${summarizeAttachmentUploadFailure(failed)}`;
+                    }
+                }
+
                 if (resolvedScheduledState !== 'no_change' && actualOpenThread) {
                     await handleStatusChange(openThread.id, resolvedScheduledState);
                 }
+                setReplyError(attachmentFailureMessage);
             } else {
                 const res = await api.post('/messages/send', payload);
                 if (!res?.data?.id) {
                     throw new Error('Message send API did not return message details.');
+                }
+
+                let uploadedAttachments: any[] = [];
+                if (pendingReplyFiles.length > 0) {
+                    const { uploaded, failed } = await uploadAttachmentsForMessage(
+                        String(res.data.id),
+                        pendingReplyFiles,
+                    );
+                    uploadedAttachments = uploaded;
+                    if (failed.length > 0) {
+                        attachmentFailureMessage = `Reply sent, but ${summarizeAttachmentUploadFailure(failed)}`;
+                    }
                 }
 
                 const newMsg = {
@@ -1412,13 +2049,14 @@ const InboxPage: React.FC = () => {
                     bodyHtml: res.data?.bodyHtml || finalBodyHtml,
                     createdAt: res.data?.createdAt || new Date().toISOString(),
                     direction: 'OUTBOUND' as const,
-                    attachments: res.data?.attachments || [],
+                    attachments: uploadedAttachments.length > 0 ? uploadedAttachments : (res.data?.attachments || []),
                 };
 
                 setLocalReplies(prev => ({
                     ...prev,
                     [openThread.id]: [...(prev[openThread.id] || []), newMsg]
                 }));
+                setReplyError(attachmentFailureMessage);
             }
         } catch (err) {
             console.error('Failed to send reply:', err);
@@ -1442,6 +2080,7 @@ const InboxPage: React.FC = () => {
         setReplyHtml('');
         setReplyScheduledAt(null);
         setReplyRecurrencePreset('none');
+        setReplyPendingAttachments([]);
         setIsReplyScheduleOpen(false);
         setIsReplying(false);
 
@@ -1460,9 +2099,13 @@ const InboxPage: React.FC = () => {
     };
 
     const handleEditNote = (noteId: string, noteText: string) => {
+        const noteToEdit = internalNotes.find((note) => String(note.id) === String(noteId));
+        const existingMentionUsers = Array.isArray(noteToEdit?.mentionedUsers) ? noteToEdit.mentionedUsers : [];
         setReplyEditorTab('note');
-        setNoteHtml(noteText);
+        mergeNoteMentionDirectory(existingMentionUsers);
+        setNoteHtml(buildNoteTextForEditor(noteText, existingMentionUsers));
         setEditingNoteId(noteId);
+        clearNoteMentionState();
         window.scrollTo(0, document.body.scrollHeight);
     };
 
@@ -1478,13 +2121,14 @@ const InboxPage: React.FC = () => {
 
     const handleUpdateNote = async () => {
         if (!editingNoteId || !actualOpenThread) return;
-        const plainText = noteHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        if (!plainText) return;
+        const plainText = extractNotePlainText(noteHtml);
+        const serializedBody = serializeNoteTextForApi(plainText, noteMentionDirectoryUsers).trim();
+        if (!serializedBody) return;
         setIsSavingNote(true);
         try {
             const response = await api.patch(
                 `/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/notes/${editingNoteId}`,
-                { body: plainText }
+                { body: serializedBody }
             );
             setInternalNotes(prev => prev.map(note =>
                 note.id === editingNoteId
@@ -1493,6 +2137,7 @@ const InboxPage: React.FC = () => {
             ));
             setNoteHtml('');
             setEditingNoteId(null);
+            clearNoteMentionState();
         } catch (err) {
             console.error('Failed to update note:', err);
         } finally {
@@ -1501,11 +2146,12 @@ const InboxPage: React.FC = () => {
     };
 
     const handleSaveNote = async () => {
-        const plainText = noteHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        if (!plainText || !actualOpenThread) return;
+        const plainText = extractNotePlainText(noteHtml);
+        const serializedBody = serializeNoteTextForApi(plainText, noteMentionDirectoryUsers).trim();
+        if (!serializedBody || !actualOpenThread) return;
         setIsSavingNote(true);
         try {
-            const response = await api.post(`/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/notes`, { body: plainText });
+            const response = await api.post(`/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/notes`, { body: serializedBody });
             setInternalNotes(prev => {
                 const existingIndex = prev.findIndex(note => note.id === response.data.id);
                 if (existingIndex === -1) {
@@ -1517,6 +2163,7 @@ const InboxPage: React.FC = () => {
                 return next;
             });
             setNoteHtml('');
+            clearNoteMentionState();
         } catch (err) {
             console.error('Failed to save note:', err);
         } finally {
@@ -1637,6 +2284,9 @@ const InboxPage: React.FC = () => {
 
         const handleThreadNoteAdded = (payload: any) => {
             if (!payload?.threadId || !payload?.note) return;
+            mergeNoteMentionDirectory(
+                Array.isArray(payload.note.mentionedUsers) ? payload.note.mentionedUsers : [],
+            );
             setApiThreads((prev) => prev.map((thread) => (
                 String(thread.id) === String(payload.threadId)
                     ? { ...thread, noteCount: Number(thread.noteCount || 0) + 1 }
@@ -1672,7 +2322,7 @@ const InboxPage: React.FC = () => {
             socket.off('mailbox:synced', handleMailboxSynced);
             socket.off('thread:note_added', handleThreadNoteAdded);
         };
-    }, [activeFolderId, socket, isConnected, resolvedRouteThreadId, scheduleThreadListRefresh, currentPage, shouldProcessMailboxEvent, refreshSidebarDataForEvent]);
+    }, [activeFolderId, socket, isConnected, resolvedRouteThreadId, scheduleThreadListRefresh, currentPage, shouldProcessMailboxEvent, refreshSidebarDataForEvent, mergeNoteMentionDirectory]);
 
     // Derived open thread with overrides
     const actualOpenThread = useMemo(() => {
@@ -1687,6 +2337,197 @@ const InboxPage: React.FC = () => {
             snoozeUntil: override.snoozeUntil
         };
     }, [openThread, threadOverrides]);
+
+    useEffect(() => {
+        setNoteMentionDirectory({});
+        setHasResolvedNoteMentionSuggestions(false);
+    }, [actualOpenThread?.id]);
+
+    useEffect(() => {
+        const usersFromNotes = internalNotes.flatMap((note) =>
+            Array.isArray(note.mentionedUsers) ? note.mentionedUsers : [],
+        );
+        mergeNoteMentionDirectory(usersFromNotes);
+    }, [internalNotes, mergeNoteMentionDirectory]);
+
+    useEffect(() => {
+        if (replyEditorTab !== 'note' || !actualOpenThread?.id || !noteMentionDraft) {
+            setNoteMentionSuggestions([]);
+            setActiveNoteMentionIndex(0);
+            setIsLoadingNoteMentions(false);
+            setHasResolvedNoteMentionSuggestions(false);
+            return;
+        }
+
+        const requestId = noteMentionRequestRef.current + 1;
+        noteMentionRequestRef.current = requestId;
+        let isCancelled = false;
+        setIsLoadingNoteMentions(true);
+
+        const run = async () => {
+            try {
+                const response = await api.get(
+                    `/threads/${normalizeThreadApiId(String(actualOpenThread.id))}/mention-suggestions`,
+                    {
+                        params: {
+                            query: noteMentionDraft.query,
+                            limit: NOTE_MENTION_SUGGESTION_LIMIT,
+                        },
+                    },
+                );
+                if (isCancelled || noteMentionRequestRef.current !== requestId) return;
+
+                const suggestions = Array.isArray(response.data) ? response.data : [];
+                setNoteMentionSuggestions(suggestions);
+                setHasResolvedNoteMentionSuggestions(true);
+                mergeNoteMentionDirectory(suggestions);
+                setActiveNoteMentionIndex((prev) => Math.min(prev, Math.max(suggestions.length - 1, 0)));
+            } catch {
+                if (isCancelled || noteMentionRequestRef.current !== requestId) return;
+                setHasResolvedNoteMentionSuggestions(true);
+            } finally {
+                if (!isCancelled && noteMentionRequestRef.current === requestId) {
+                    setIsLoadingNoteMentions(false);
+                }
+            }
+        };
+
+        void run();
+
+        return () => {
+            isCancelled = true;
+        };
+    }, [actualOpenThread?.id, mergeNoteMentionDirectory, noteMentionDraft, replyEditorTab]);
+
+    useEffect(() => {
+        const editor = noteEditorRef.current?.getEditor();
+        const root = editor?.root as HTMLElement | undefined;
+        if (!root) return;
+
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (!noteMentionDraft) return;
+
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                clearNoteMentionState();
+                return;
+            }
+
+            if (noteMentionSuggestions.length === 0) return;
+
+            if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                setActiveNoteMentionIndex((prev) => (prev + 1) % noteMentionSuggestions.length);
+            } else if (event.key === 'ArrowUp') {
+                event.preventDefault();
+                setActiveNoteMentionIndex((prev) => (prev - 1 + noteMentionSuggestions.length) % noteMentionSuggestions.length);
+            } else if (event.key === 'Enter') {
+                event.preventDefault();
+                applyNoteMentionSuggestion(noteMentionSuggestions[activeNoteMentionIndex] || noteMentionSuggestions[0]);
+            }
+        };
+
+        root.addEventListener('keydown', handleKeyDown);
+        return () => {
+            root.removeEventListener('keydown', handleKeyDown);
+        };
+    }, [activeNoteMentionIndex, applyNoteMentionSuggestion, clearNoteMentionState, noteMentionDraft, noteMentionSuggestions]);
+
+    useEffect(() => {
+        if (replyEditorTab !== 'note') {
+            clearNoteMentionState();
+        }
+    }, [clearNoteMentionState, replyEditorTab]);
+
+    useEffect(() => {
+        if (replyEditorTab !== 'note') {
+            setNoteMentionHoverCard(null);
+            return;
+        }
+
+        const editor = noteEditorRef.current?.getEditor() as NoteEditorWriter | undefined;
+        const editorRoot = editor?.root;
+        if (!editorRoot) {
+            setNoteMentionHoverCard(null);
+            return;
+        }
+
+        const hideHoverCard = () => {
+            setNoteMentionHoverCard(null);
+        };
+
+        const handleMouseMove = (event: MouseEvent) => {
+            const target = event.target as HTMLElement | null;
+            if (!target) {
+                hideHoverCard();
+                return;
+            }
+
+            const mentionElement = target.closest('span');
+            if (!mentionElement) {
+                hideHoverCard();
+                return;
+            }
+
+            const mentionText = String(mentionElement.textContent || '')
+                .replace(/\u00A0/g, ' ')
+                .trim();
+            if (!mentionText.startsWith('@')) {
+                hideHoverCard();
+                return;
+            }
+
+            const mentionedUser = resolveMentionedUserByToken(
+                mentionText.slice(1),
+                noteMentionDirectoryUsers,
+            );
+            if (!mentionedUser) {
+                hideHoverCard();
+                return;
+            }
+
+            const bounds = mentionElement.getBoundingClientRect();
+            const nextTop = Math.round(bounds.top - 10);
+            const nextLeft = Math.round(bounds.left + bounds.width / 2);
+
+            setNoteMentionHoverCard((prev) => {
+                if (
+                    prev
+                    && prev.user.id === mentionedUser.id
+                    && prev.top === nextTop
+                    && prev.left === nextLeft
+                ) {
+                    return prev;
+                }
+
+                return {
+                    user: mentionedUser,
+                    top: nextTop,
+                    left: nextLeft,
+                };
+            });
+        };
+
+        editorRoot.addEventListener('mousemove', handleMouseMove);
+        editorRoot.addEventListener('mouseleave', hideHoverCard);
+
+        return () => {
+            editorRoot.removeEventListener('mousemove', handleMouseMove);
+            editorRoot.removeEventListener('mouseleave', hideHoverCard);
+            setNoteMentionHoverCard(null);
+        };
+    }, [noteMentionDirectoryUsers, replyEditorTab]);
+
+    useEffect(() => {
+        clearNoteMentionState();
+    }, [actualOpenThread?.id, clearNoteMentionState]);
+
+    useEffect(() => {
+        if (replyEditorTab !== 'note') return;
+        const editor = noteEditorRef.current?.getEditor() as NoteEditorWriter | undefined;
+        if (!editor) return;
+        applyNoteMentionHighlights();
+    }, [applyNoteMentionHighlights, noteHtml, replyEditorTab]);
 
     const threadParticipants = useMemo(() => {
         const participants = new Set<string>();
@@ -2771,20 +3612,17 @@ const InboxPage: React.FC = () => {
                                                         )}
                                                     </div>
                                                 )}
-                                                <div className="prose prose-sm max-w-none break-words" dangerouslySetInnerHTML={{ __html: normalizeMessageBody(msg.bodyHtml, msg.bodyText) }} />
-                                                {isInternalNote && Array.isArray(msg.mentionedUsers) && msg.mentionedUsers.length > 0 && (
-                                                    <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-[#fae8b7] pt-2 text-[11px] text-[var(--color-text-muted)]">
-                                                        <span className="font-semibold text-[var(--color-text-primary)]">Mentions:</span>
-                                                        {msg.mentionedUsers.map((mentionedUser: MentionedUser) => (
-                                                            <span
-                                                                key={mentionedUser.id}
-                                                                className="inline-flex items-center rounded-full border border-[#fae8b7] bg-white/80 px-2 py-0.5"
-                                                            >
-                                                                @{mentionedUser.mentionKey} {mentionedUser.fullName}
-                                                            </span>
-                                                        ))}
-                                                    </div>
-                                                )}
+                                                <div
+                                                    className="prose prose-sm max-w-none break-words"
+                                                    dangerouslySetInnerHTML={{
+                                                        __html: isInternalNote
+                                                            ? applyMentionDisplayNamesToHtml(
+                                                                normalizeMessageBody(msg.bodyHtml, msg.bodyText),
+                                                                Array.isArray(msg.mentionedUsers) ? msg.mentionedUsers : [],
+                                                            )
+                                                            : normalizeMessageBody(msg.bodyHtml, msg.bodyText),
+                                                    }}
+                                                />
                                                 {messageAttachments.length > 0 && (
                                                     <div className="mt-3 flex flex-wrap gap-1.5">
                                                         {messageAttachments.map((attachment: any, index: number) => (
@@ -2832,7 +3670,7 @@ const InboxPage: React.FC = () => {
                                 <span className="text-[13px] text-[var(--color-text-muted)]">Reply...</span>
                             </div>
                         ) : (
-                        <div className="rounded-xl border border-[var(--color-card-border)] bg-white shadow-sm overflow-hidden">
+                        <div className="rounded-xl border border-[var(--color-card-border)] bg-white shadow-sm overflow-visible">
                             {/* Tab bar + icons */}
                             <div className="flex items-center justify-between border-b border-[var(--color-card-border)] px-4 pt-1">
                                 <div className="flex items-center">
@@ -2885,10 +3723,20 @@ const InboxPage: React.FC = () => {
                                     )}
                                     <button
                                         title="Attachment"
+                                        type="button"
+                                        onClick={() => replyAttachmentInputRef.current?.click()}
                                         className="no-global-hover p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)] transition-colors"
                                     >
                                         <Paperclip className="w-4 h-4" />
                                     </button>
+                                    <input
+                                        ref={replyAttachmentInputRef}
+                                        data-testid="reply-attachment-input"
+                                        type="file"
+                                        multiple
+                                        className="hidden"
+                                        onChange={handleReplyAttachmentSelection}
+                                    />
                                 </div>
                             </div>
 
@@ -2937,6 +3785,32 @@ const InboxPage: React.FC = () => {
                             {replyEditorTab === 'reply' ? (
                                 <div className="reply-quill-wrapper">
                                     {replyError && <div className="text-red-500 text-[11px] px-4 pt-2 font-medium">{replyError}</div>}
+                                    {replyPendingAttachments.length > 0 && (
+                                        <div className="flex flex-wrap gap-2 border-b border-[var(--color-card-border)] px-4 py-3">
+                                            {replyPendingAttachments.map((attachment) => (
+                                                <div
+                                                    key={attachment.id}
+                                                    className="inline-flex max-w-full items-center gap-2 rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)]/40 px-3 py-1.5 text-xs text-[var(--color-text-primary)]"
+                                                >
+                                                    <Paperclip className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                                                    <span className="max-w-[220px] truncate">{attachment.file.name}</span>
+                                                    {formatSize(attachment.file.size) && (
+                                                        <span className="shrink-0 text-[var(--color-text-muted)]">
+                                                            ({formatSize(attachment.file.size)})
+                                                        </span>
+                                                    )}
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => removeReplyPendingAttachment(attachment.id)}
+                                                        className="rounded-full p-0.5 text-[var(--color-text-muted)] transition-colors hover:bg-white hover:text-[var(--color-text-primary)]"
+                                                        aria-label={`Remove ${attachment.file.name}`}
+                                                    >
+                                                        <X className="h-3 w-3" />
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                     <ReactQuill
                                         value={replyHtml}
                                         onChange={v => { setReplyHtml(v); if (v !== '<p><br></p>') setReplyError(''); }}
@@ -3069,10 +3943,12 @@ const InboxPage: React.FC = () => {
                                     </div>
                                 </div>
                             ) : (
-                                <div className="note-quill-wrapper">
+                                <div ref={noteQuillWrapperRef} className="note-quill-wrapper relative">
                                     <ReactQuill
+                                        ref={noteEditorRef}
                                         value={noteHtml}
-                                        onChange={setNoteHtml}
+                                        onChange={handleNoteEditorChange}
+                                        onChangeSelection={() => syncNoteMentionDraft()}
                                         placeholder="Write an internal note..."
                                         modules={{
                                             toolbar: [
@@ -3084,6 +3960,110 @@ const InboxPage: React.FC = () => {
                                         formats={['bold', 'italic', 'align', 'color', 'background']}
                                         className="note-editor"
                                     />
+                                    {noteMentionDraft && (
+                                        <div
+                                            data-note-mentions-popover="true"
+                                            className="absolute inset-x-4 z-50 overflow-hidden rounded-xl border border-[var(--color-card-border)] bg-white shadow-xl"
+                                            style={{
+                                                top: `${noteMentionPopoverTop ?? 64}px`,
+                                                transform: 'translateY(calc(-100% - 8px))',
+                                            }}
+                                        >
+                                            <div className="max-h-64 overflow-y-auto py-1">
+                                                {showNoteMentionRefreshIndicator && (
+                                                    <div className="flex items-center gap-2 border-b border-[var(--color-card-border)] px-3 py-1.5 text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">
+                                                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                                        Updating suggestions...
+                                                    </div>
+                                                )}
+                                                {showNoteMentionSkeleton ? (
+                                                    <div className="space-y-1 px-3 py-2">
+                                                        {Array.from({ length: noteMentionSkeletonRows }, (_, skeletonRow) => (
+                                                            <PersonRowSkeleton
+                                                                key={skeletonRow}
+                                                                index={skeletonRow}
+                                                                density="compact"
+                                                            />
+                                                        ))}
+                                                    </div>
+                                                ) : noteMentionSuggestions.length > 0 ? (
+                                                    noteMentionSuggestions.map((mentionedUser, index) => (
+                                                        <button
+                                                            key={mentionedUser.id}
+                                                            type="button"
+                                                            onMouseDown={(event) => {
+                                                                event.preventDefault();
+                                                                applyNoteMentionSuggestion(mentionedUser);
+                                                            }}
+                                                            className={clsx(
+                                                                'flex w-full items-center gap-3 px-3 py-2 text-left transition-colors',
+                                                                index === activeNoteMentionIndex
+                                                                    ? 'bg-[var(--color-background)]'
+                                                                    : 'hover:bg-[var(--color-background)]/70',
+                                                            )}
+                                                        >
+                                                            <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)] text-[11px] font-semibold text-[var(--color-primary)]">
+                                                                {mentionedUser.avatarUrl ? (
+                                                                    <img
+                                                                        src={resolveAvatarUrl(mentionedUser.avatarUrl)}
+                                                                        alt={mentionedUser.fullName}
+                                                                        className="h-full w-full object-cover"
+                                                                    />
+                                                                ) : (
+                                                                    mentionedUser.fullName.charAt(0).toUpperCase()
+                                                                )}
+                                                            </div>
+                                                            <div className="min-w-0 flex-1">
+                                                                <div className="truncate text-[13px] font-semibold text-[var(--color-text-primary)]">
+                                                                    {mentionedUser.fullName}
+                                                                </div>
+                                                                <div className="truncate text-[12px] text-[var(--color-text-muted)]">
+                                                                    {mentionedUser.email}
+                                                                </div>
+                                                            </div>
+                                                        </button>
+                                                    ))
+                                                ) : (
+                                                    <div className="px-3 py-2 text-[13px] text-[var(--color-text-muted)]">
+                                                        No matching teammates found.
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+                                    {noteMentionHoverCard && (
+                                        <div
+                                            data-note-mention-hover-card="true"
+                                            className="pointer-events-none fixed z-[60] min-w-[220px] rounded-xl border border-[var(--color-card-border)] bg-white px-3 py-2 shadow-2xl"
+                                            style={{
+                                                top: `${noteMentionHoverCard.top}px`,
+                                                left: `${noteMentionHoverCard.left}px`,
+                                                transform: 'translate(-50%, -100%)',
+                                            }}
+                                        >
+                                            <div className="flex items-center gap-2.5">
+                                                <div className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)] text-[12px] font-semibold text-[var(--color-primary)]">
+                                                    {noteMentionHoverCard.user.avatarUrl ? (
+                                                        <img
+                                                            src={resolveAvatarUrl(noteMentionHoverCard.user.avatarUrl)}
+                                                            alt={noteMentionHoverCard.user.fullName}
+                                                            className="h-full w-full object-cover"
+                                                        />
+                                                    ) : (
+                                                        noteMentionHoverCard.user.fullName.charAt(0).toUpperCase()
+                                                    )}
+                                                </div>
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="truncate text-[13px] font-semibold text-[var(--color-text-primary)]">
+                                                        {noteMentionHoverCard.user.fullName}
+                                                    </div>
+                                                    <div className="truncate text-[12px] text-[var(--color-text-muted)]">
+                                                        {noteMentionHoverCard.user.email}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
                                     {/* Save note footer */}
                                     <div className="flex items-center justify-between px-4 py-2 border-t border-[var(--color-card-border)]">
                                         <div className="flex items-center gap-2 flex-1">
@@ -3092,6 +4072,7 @@ const InboxPage: React.FC = () => {
                                                     onClick={() => {
                                                         setEditingNoteId(null);
                                                         setNoteHtml('');
+                                                        clearNoteMentionState();
                                                     }}
                                                     className="no-global-hover px-3 py-1 text-[12px] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] transition-colors underline"
                                                 >

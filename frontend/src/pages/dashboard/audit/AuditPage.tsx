@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ScrollText } from 'lucide-react';
 import PageHeader from '../../../components/ui/PageHeader';
 import EmptyState from '../../../components/ui/EmptyState';
-import { InlineSkeleton } from '../../../components/ui/Skeleton';
+import { AdaptiveTableRowsSkeleton } from '../../../components/ui/Skeleton';
 import api from '../../../lib/api';
 
 type AuditItem = {
@@ -84,12 +84,20 @@ const AuditPage: React.FC = () => {
                             </tr>
                         </thead>
                         <tbody>
-                            {(loading ? Array.from({ length: 10 }, (_, index) => ({ id: `loading-${index}`, action: '', entityType: '', createdAt: '' })) : items).map((item) => (
+                            {loading ? (
+                                <AdaptiveTableRowsSkeleton
+                                    cols={4}
+                                    rowHeight={42}
+                                    containerMaxHeight={420}
+                                    minRows={6}
+                                    maxRows={12}
+                                />
+                            ) : items.map((item) => (
                                 <tr key={item.id} className="border-t border-[var(--color-card-border)]">
-                                    <td className="px-3 py-2">{loading ? <InlineSkeleton className="h-4 w-28" /> : new Date(item.createdAt).toLocaleString()}</td>
-                                    <td className="px-3 py-2">{loading ? <InlineSkeleton className="h-4 w-24" /> : item.action}</td>
-                                    <td className="px-3 py-2">{loading ? <InlineSkeleton className="h-4 w-36" /> : `${item.entityType}${item.entityId ? ` (${item.entityId})` : ''}`}</td>
-                                    <td className="px-3 py-2">{loading ? <InlineSkeleton className="h-4 w-20" /> : (item.userId || 'system')}</td>
+                                    <td className="px-3 py-2">{new Date(item.createdAt).toLocaleString()}</td>
+                                    <td className="px-3 py-2">{item.action}</td>
+                                    <td className="px-3 py-2">{`${item.entityType}${item.entityId ? ` (${item.entityId})` : ''}`}</td>
+                                    <td className="px-3 py-2">{item.userId || 'system'}</td>
                                 </tr>
                             ))}
                         </tbody>

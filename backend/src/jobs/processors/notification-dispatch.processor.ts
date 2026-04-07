@@ -77,6 +77,12 @@ export class NotificationDispatchProcessor extends WorkerHost {
 
       switch (channel) {
         case 'email':
+          if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
+            this.logger.warn(
+              '[notification-dispatch] DISABLE_SMTP_SEND active; skipping email dispatch',
+            );
+            return;
+          }
           if (notification) {
             await this.sendEmail({
               userId,
@@ -170,6 +176,13 @@ export class NotificationDispatchProcessor extends WorkerHost {
       contentType?: string;
     }>;
   }): Promise<void> {
+    if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
+      this.logger.warn(
+        '[notification-dispatch] DISABLE_SMTP_SEND active; sendEmail skipped',
+      );
+      return;
+    }
+
     let recipient = params.to ?? null;
     if (!recipient && params.userId) {
       const user = await this.prisma.user.findUnique({

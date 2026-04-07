@@ -9,6 +9,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  Req,
 } from '@nestjs/common';
 import { MailboxesService } from './mailboxes.service';
 import {
@@ -21,6 +22,8 @@ import {
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import type { Request } from 'express';
+import { extractRequestMeta } from '../../common/http/request-meta';
 
 @UseGuards(JwtAuthGuard)
 @Controller('mailboxes')
@@ -53,8 +56,12 @@ export class MailboxesController {
 
   // POST /mailboxes
   @Post()
-  create(@Body() dto: CreateMailboxDto, @CurrentUser() user: JwtUser) {
-    return this.mailboxesService.create(dto, user);
+  create(
+    @Body() dto: CreateMailboxDto,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.mailboxesService.create(dto, user, extractRequestMeta(req));
   }
 
   // POST /mailboxes/test-connection
@@ -77,8 +84,12 @@ export class MailboxesController {
   // DELETE /mailboxes/:id
   @Delete(':id')
   @HttpCode(HttpStatus.OK)
-  remove(@Param('id') id: string, @CurrentUser() user: JwtUser) {
-    return this.mailboxesService.remove(id, user);
+  remove(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.mailboxesService.remove(id, user, extractRequestMeta(req));
   }
 
   // DELETE /mailboxes/:id/oauth

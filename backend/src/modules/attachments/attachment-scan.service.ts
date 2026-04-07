@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -7,8 +8,10 @@ import {
   ServiceUnavailableException,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Express } from 'express';
 import { AttachmentScanStatus, type Attachment } from '@prisma/client';
+import * as crypto from 'crypto';
 import { PrismaService } from '../../database/prisma.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
 import { AuditService } from '../audit/audit.service';
@@ -18,16 +21,93 @@ import {
 } from './attachment-virus-scanner.service';
 import { AttachmentStorageService } from './attachment-storage.service';
 
+type AttachmentUploadTokenPayload = {
+  actorUserId: string;
+  contentType: string;
+  expiresAt: number;
+  filename: string;
+  finalStorageKey: string;
+  messageId: string;
+  organizationId: string;
+  sizeBytes: number;
+  stagingStorageKey: string;
+  version: 1;
+};
+
 @Injectable()
 export class AttachmentScanService {
   private readonly logger = new Logger(AttachmentScanService.name);
+  private readonly presignedUploadTtlSeconds = 3600;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: AttachmentStorageService,
     private readonly scanner: AttachmentVirusScannerService,
     private readonly audit: AuditService,
+    private readonly config: ConfigService,
   ) {}
+
+  async createPresignedUpload(
+    user: JwtUser,
+    params: {
+      contentType: string;
+      filename: string;
+      messageId: string;
+      sizeBytes: number;
+    },
+  ): Promise<{
+    expiresIn: number;
+    finalStorageKey: string;
+    requiresConfirm: true;
+    storageKey: string;
+    uploadToken: string;
+    url: string;
+  }> {
+    await this.assertMessageAccess(params.messageId, user.organizationId);
+
+    if (!this.storage.isS3Storage()) {
+      throw new BadRequestException(
+        'Presigned attachment uploads require S3-compatible storage',
+      );
+    }
+
+    const contentType = params.contentType || 'application/octet-stream';
+    const stagingStorageKey = this.storage.generateStagingKey(
+      user.organizationId,
+      params.filename,
+    );
+    const finalStorageKey = this.storage.generateStorageKey(
+      user.organizationId,
+      params.filename,
+    );
+    const uploadToken = this.signUploadToken({
+      actorUserId: user.sub,
+      contentType,
+      expiresAt:
+        Date.now() + this.presignedUploadTtlSeconds * 1000,
+      filename: params.filename,
+      finalStorageKey,
+      messageId: params.messageId,
+      organizationId: user.organizationId,
+      sizeBytes: Math.max(Number(params.sizeBytes || 0), 0),
+      stagingStorageKey,
+      version: 1,
+    });
+    const url = await this.storage.presignedPutUrl(
+      stagingStorageKey,
+      contentType,
+      this.presignedUploadTtlSeconds,
+    );
+
+    return {
+      expiresIn: this.presignedUploadTtlSeconds,
+      finalStorageKey,
+      requiresConfirm: true,
+      storageKey: stagingStorageKey,
+      uploadToken,
+      url,
+    };
+  }
 
   async createDirectUploadAttachment(
     user: JwtUser,
@@ -69,7 +149,18 @@ export class AttachmentScanService {
       },
     });
 
-    const result = await this.scanner.scanBuffer(params.file.buffer);
+    let result: AttachmentVirusScanResult;
+    try {
+      result = await this.scanner.scanBuffer(params.file.buffer);
+    } catch (error) {
+      result = {
+        failureReason: this.stringifyError(error),
+        scannedAt: new Date(),
+        scannerName: this.scanner.getScannerName(),
+        scannerVersion: null,
+        status: 'failed',
+      };
+    }
 
     return this.finalizeUploadScan({
       attachment,
@@ -84,25 +175,80 @@ export class AttachmentScanService {
   async confirmUploadedAttachment(
     user: JwtUser,
     params: {
-      messageId: string;
-      storageKey: string;
-      filename: string;
       contentType: string | null;
+      filename: string;
+      messageId: string;
       sizeBytes: number;
+      storageKey: string;
+      uploadToken: string;
     },
   ): Promise<Attachment> {
     await this.assertMessageAccess(params.messageId, user.organizationId);
 
+    const uploadToken = String(params.uploadToken || '').trim();
+    if (!uploadToken) {
+      throw new BadRequestException('uploadToken is required');
+    }
+
+    const payload = this.verifyUploadToken(uploadToken);
     const contentType = params.contentType ?? 'application/octet-stream';
+    const requestedStorageKey = String(params.storageKey || '').trim();
+
+    if (payload.organizationId !== user.organizationId) {
+      throw new ForbiddenException('Upload token does not belong to this organization');
+    }
+
+    if (payload.actorUserId !== user.sub) {
+      throw new ForbiddenException('Upload token does not belong to this user');
+    }
+
+    if (payload.messageId !== params.messageId) {
+      throw new BadRequestException('Upload token message mismatch');
+    }
+
+    if (payload.stagingStorageKey !== requestedStorageKey) {
+      throw new BadRequestException('Upload token storage key mismatch');
+    }
+
+    if (payload.filename !== params.filename) {
+      throw new BadRequestException('Upload token filename mismatch');
+    }
+
+    if (payload.contentType !== contentType) {
+      throw new BadRequestException('Upload token content type mismatch');
+    }
+
+    if (payload.sizeBytes !== Math.max(Number(params.sizeBytes || 0), 0)) {
+      throw new BadRequestException('Upload token size mismatch');
+    }
+
+    const metadata = await this.storage.getMetadata(payload.stagingStorageKey);
+
+    if (metadata.sizeBytes !== payload.sizeBytes) {
+      throw new BadRequestException('Uploaded file size does not match the requested upload');
+    }
+
+    if (
+      metadata.contentType &&
+      payload.contentType &&
+      metadata.contentType !== payload.contentType
+    ) {
+      throw new BadRequestException('Uploaded file content type does not match the requested upload');
+    }
 
     if (!this.scanner.isEnabled()) {
+      await this.storage.move(
+        payload.stagingStorageKey,
+        payload.finalStorageKey,
+      );
+
       return this.prisma.attachment.create({
         data: {
           messageId: params.messageId,
           filename: params.filename,
           contentType: params.contentType,
           sizeBytes: params.sizeBytes,
-          storageKey: params.storageKey,
+          storageKey: payload.finalStorageKey,
           scanStatus: AttachmentScanStatus.UNSCANNED,
         },
       });
@@ -114,21 +260,34 @@ export class AttachmentScanService {
         filename: params.filename,
         contentType: params.contentType,
         sizeBytes: params.sizeBytes,
-        storageKey: params.storageKey,
+        storageKey: payload.stagingStorageKey,
         scanStatus: AttachmentScanStatus.PENDING,
       },
     });
 
-    const result = await this.scanner.scanStream(
-      await this.storage.getReadStream(params.storageKey),
-    );
+    let result: AttachmentVirusScanResult;
+    try {
+      result = await this.scanner.scanStream(
+        await this.storage.getReadStream(payload.stagingStorageKey),
+      );
+    } catch (error) {
+      result = {
+        failureReason: this.stringifyError(error),
+        scannedAt: new Date(),
+        scannerName: this.scanner.getScannerName(),
+        scannerVersion: null,
+        status: 'failed',
+      };
+    }
 
     return this.finalizeUploadScan({
       attachment,
       organizationId: user.organizationId,
       actorUserId: user.sub,
       contentType,
+      finalStorageKey: payload.finalStorageKey,
       result,
+      sourceStorageKey: payload.stagingStorageKey,
     });
   }
 
@@ -187,19 +346,35 @@ export class AttachmentScanService {
     organizationId: string;
     actorUserId: string;
     contentType: string;
+    finalStorageKey?: string;
     result: AttachmentVirusScanResult;
+    sourceStorageKey?: string;
     uploadBuffer?: Buffer;
   }): Promise<Attachment> {
-    const { attachment, organizationId, actorUserId, contentType, result } =
+    const {
+      attachment,
+      organizationId,
+      actorUserId,
+      contentType,
+      finalStorageKey,
+      result,
+      sourceStorageKey,
+    } =
       params;
 
     if (result.status === 'clean') {
+      let storageKey = attachment.storageKey;
       try {
         if (params.uploadBuffer) {
           await this.storage.upload(
             attachment.storageKey,
             params.uploadBuffer,
             contentType,
+          );
+        } else if (sourceStorageKey && finalStorageKey) {
+          storageKey = await this.storage.move(
+            sourceStorageKey,
+            finalStorageKey,
           );
         }
       } catch (error) {
@@ -223,6 +398,9 @@ export class AttachmentScanService {
       const updated = await this.prisma.attachment.update({
         where: { id: attachment.id },
         data: {
+          ...(storageKey !== attachment.storageKey
+            ? { storageKey }
+            : {}),
           scanStatus: AttachmentScanStatus.CLEAN,
           scannerName: result.scannerName,
           scannerVersion: result.scannerVersion,
@@ -245,6 +423,7 @@ export class AttachmentScanService {
         organizationId,
         attachment.filename,
       );
+      const sourceKey = sourceStorageKey ?? attachment.storageKey;
 
       try {
         if (params.uploadBuffer) {
@@ -254,7 +433,7 @@ export class AttachmentScanService {
             contentType,
           );
         } else {
-          await this.storage.move(attachment.storageKey, quarantineKey);
+          await this.storage.move(sourceKey, quarantineKey);
         }
       } catch (error) {
         await this.prisma.attachment.update({
@@ -310,9 +489,33 @@ export class AttachmentScanService {
       );
     }
 
+    const quarantineKey = sourceStorageKey
+      ? this.storage.generateQuarantineKey(
+          organizationId,
+          attachment.filename,
+        )
+      : null;
+    let failedStorageKey = attachment.storageKey;
+
+    if (quarantineKey && sourceStorageKey) {
+      try {
+        failedStorageKey = await this.storage.move(
+          sourceStorageKey,
+          quarantineKey,
+        );
+      } catch (error) {
+        this.logger.error(
+          `[attachment-scan] attachment=${attachment.id} quarantine move failed after scan failure: ${this.stringifyError(error)}`,
+        );
+      }
+    }
+
     await this.prisma.attachment.update({
       where: { id: attachment.id },
       data: {
+        ...(failedStorageKey !== attachment.storageKey
+          ? { storageKey: failedStorageKey }
+          : {}),
         scanStatus: AttachmentScanStatus.FAILED,
         scannerName: result.scannerName,
         scannerVersion: result.scannerVersion,
@@ -330,7 +533,7 @@ export class AttachmentScanService {
       entityId: attachment.id,
       newValue: {
         filename: attachment.filename,
-        storageKey: attachment.storageKey,
+        storageKey: failedStorageKey,
         failureReason: result.failureReason,
         scanner: result.scannerName,
       },
@@ -467,5 +670,73 @@ export class AttachmentScanService {
 
   private stringifyError(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  private signUploadToken(payload: AttachmentUploadTokenPayload): string {
+    const serializedPayload = Buffer.from(
+      JSON.stringify(payload),
+      'utf8',
+    ).toString('base64url');
+    const signature = crypto
+      .createHmac('sha256', this.getUploadTokenSecret())
+      .update(serializedPayload)
+      .digest('base64url');
+
+    return `${serializedPayload}.${signature}`;
+  }
+
+  private verifyUploadToken(token: string): AttachmentUploadTokenPayload {
+    const [serializedPayload, signature] = String(token || '').split('.');
+    if (!serializedPayload || !signature) {
+      throw new BadRequestException('Invalid upload token');
+    }
+
+    const expectedSignature = crypto
+      .createHmac('sha256', this.getUploadTokenSecret())
+      .update(serializedPayload)
+      .digest('base64url');
+    const providedSignature = Buffer.from(signature, 'utf8');
+    const expectedSignatureBuffer = Buffer.from(expectedSignature, 'utf8');
+
+    if (
+      providedSignature.length !== expectedSignatureBuffer.length ||
+      !crypto.timingSafeEqual(providedSignature, expectedSignatureBuffer)
+    ) {
+      throw new ForbiddenException('Upload token signature is invalid');
+    }
+
+    let payload: AttachmentUploadTokenPayload;
+    try {
+      payload = JSON.parse(
+        Buffer.from(serializedPayload, 'base64url').toString('utf8'),
+      ) as AttachmentUploadTokenPayload;
+    } catch {
+      throw new BadRequestException('Upload token payload is invalid');
+    }
+
+    if (payload.version !== 1) {
+      throw new BadRequestException('Upload token version is not supported');
+    }
+
+    if (!payload.expiresAt || payload.expiresAt <= Date.now()) {
+      throw new ForbiddenException('Upload token has expired');
+    }
+
+    return payload;
+  }
+
+  private getUploadTokenSecret(): string {
+    const configuredSecret =
+      this.config.get<string>('encryption.key') ??
+      this.config.get<string>('jwt.secret') ??
+      '';
+
+    if (configuredSecret.trim()) {
+      return configuredSecret;
+    }
+
+    throw new ServiceUnavailableException(
+      'Attachment upload token signing is not configured',
+    );
   }
 }
