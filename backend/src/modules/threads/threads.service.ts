@@ -39,6 +39,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { AuditService } from '../audit/audit.service';
 import type { RequestMeta } from '../../common/http/request-meta';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { CrmService } from '../crm/crm.service';
 
 const ALGORITHM = 'aes-256-gcm';
 
@@ -129,6 +130,7 @@ export class ThreadsService {
     private readonly slaService: SlaService,
     private readonly notificationsService: NotificationsService,
     private readonly auditService: AuditService,
+    private readonly crmService: CrmService,
   ) {}
 
   private async getUserTeamIds(userId: string): Promise<string[]> {
@@ -966,6 +968,33 @@ export class ThreadsService {
       );
     }
 
+    if (
+      dto.status !== undefined ||
+      dto.assignedUserId !== undefined ||
+      dto.assignedToTeamId !== undefined
+    ) {
+      const updatedThreads = await this.prisma.thread.findMany({
+        where: {
+          id: { in: accessibleThreadIds },
+          organizationId: user.organizationId,
+          contactId: { not: null },
+        },
+        select: { id: true, mailboxId: true, contactId: true },
+      });
+      await Promise.all(
+        updatedThreads.map((thread) =>
+          this.crmService.emitContactActivity({
+            organizationId: user.organizationId,
+            contactId: thread.contactId as string,
+            activity: 'thread_updated',
+            actorUserId: user.sub,
+            threadId: thread.id,
+            mailboxId: thread.mailboxId,
+          }),
+        ),
+      );
+    }
+
     return { updated: dto.ids.length };
   }
 
@@ -1040,11 +1069,22 @@ export class ThreadsService {
       type: 'status_changed',
     });
 
+    if (thread.contact?.id) {
+      await this.crmService.emitContactActivity({
+        organizationId: user.organizationId,
+        contactId: thread.contact.id,
+        activity: 'thread_updated',
+        actorUserId: user.sub,
+        threadId: updated.id,
+        mailboxId: updated.mailboxId,
+      });
+    }
+
     return updated;
   }
 
   async star(threadId: string, starred: boolean, user: JwtUser) {
-    await this.findOne(threadId, user);
+    const thread = await this.findOne(threadId, user);
     const updated = await this.prisma.thread.update({
       where: { id: threadId },
       data: { starred },
@@ -1055,6 +1095,17 @@ export class ThreadsService {
       mailboxId: updated.mailboxId,
       type: 'status_changed',
     });
+
+    if (thread.contact?.id) {
+      await this.crmService.emitContactActivity({
+        organizationId: user.organizationId,
+        contactId: thread.contact.id,
+        activity: 'thread_updated',
+        actorUserId: user.sub,
+        threadId: updated.id,
+        mailboxId: updated.mailboxId,
+      });
+    }
 
     return updated;
   }
@@ -1091,6 +1142,17 @@ export class ThreadsService {
       mailboxId: updated.mailboxId,
       type: 'status_changed',
     });
+
+    if (thread.contact?.id) {
+      await this.crmService.emitContactActivity({
+        organizationId: user.organizationId,
+        contactId: thread.contact.id,
+        activity: 'thread_updated',
+        actorUserId: user.sub,
+        threadId: updated.id,
+        mailboxId: updated.mailboxId,
+      });
+    }
 
     return updated;
   }
@@ -1133,6 +1195,41 @@ export class ThreadsService {
   }
 
   async compose(dto: ComposeThreadDto, user: JwtUser) {
+    const to = this.sanitizeEmails(dto.to);
+    const cc = this.sanitizeEmails(dto.cc);
+    const bcc = this.sanitizeEmails(dto.bcc);
+
+    let contactId: string | null = null;
+    let companyId: string | null = null;
+    const recipientEmail = this.extractFirstEmail(to);
+    if (recipientEmail) {
+      const linkedContact = await this.prisma.contact.findFirst({
+        where: {
+          organizationId: user.organizationId,
+          deletedAt: null,
+          OR: [
+            { email: recipientEmail },
+            { additionalEmails: { array_contains: [recipientEmail] } },
+          ],
+        },
+        select: {
+          id: true,
+          companyId: true,
+        },
+      });
+
+      if (linkedContact) {
+        contactId = linkedContact.id;
+        companyId = linkedContact.companyId ?? null;
+      } else {
+        const autoLinked = await this.crmService
+          .autoCreateContactIfEnabled(recipientEmail, undefined, user.organizationId)
+          .catch(() => ({ contactId: null, companyId: null }));
+        contactId = autoLinked.contactId;
+        companyId = autoLinked.companyId;
+      }
+    }
+
     // Create a new thread + first outbound message
     const thread = await this.prisma.thread.create({
       data: {
@@ -1140,6 +1237,8 @@ export class ThreadsService {
         organizationId: user.organizationId,
         subject: dto.subject,
         status: ThreadStatus.OPEN,
+        ...(contactId ? { contactId } : {}),
+        ...(companyId ? { companyId } : {}),
       },
     });
 
@@ -1149,11 +1248,9 @@ export class ThreadsService {
         mailboxId: dto.mailboxId,
         direction: MessageDirection.OUTBOUND,
         fromEmail: user.email,
-        to: dto.to as unknown as import('@prisma/client').Prisma.InputJsonValue,
-        cc: (dto.cc ??
-          []) as unknown as import('@prisma/client').Prisma.InputJsonValue,
-        bcc: (dto.bcc ??
-          []) as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        to: to as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        cc: cc as unknown as import('@prisma/client').Prisma.InputJsonValue,
+        bcc: bcc as unknown as import('@prisma/client').Prisma.InputJsonValue,
         subject: dto.subject,
         bodyHtml: dto.bodyHtml,
         bodyText: dto.bodyText,
@@ -1161,6 +1258,18 @@ export class ThreadsService {
         isDraft: false,
       },
     });
+
+    if (contactId) {
+      await this.crmService.emitContactActivity({
+        organizationId: user.organizationId,
+        contactId,
+        activity: 'email_sent',
+        actorUserId: user.sub,
+        threadId: thread.id,
+        mailboxId: dto.mailboxId,
+        messageId: message.id,
+      });
+    }
 
     return { thread, message };
   }
@@ -1183,7 +1292,7 @@ export class ThreadsService {
         priority: true,
         slaPolicyId: true,
         firstResponseAt: true,
-        contact: { select: { email: true } },
+        contact: { select: { id: true, email: true } },
         mailbox: {
           select: {
             id: true,
@@ -1364,6 +1473,18 @@ export class ThreadsService {
       ipAddress: meta.ipAddress,
       userAgent: meta.userAgent,
     });
+
+    if (thread.contact?.id) {
+      await this.crmService.emitContactActivity({
+        organizationId: user.organizationId,
+        contactId: thread.contact.id,
+        activity: 'email_sent',
+        actorUserId: user.sub,
+        threadId: thread.id,
+        mailboxId: thread.mailboxId,
+        messageId: message.id,
+      });
+    }
 
     return message;
   }

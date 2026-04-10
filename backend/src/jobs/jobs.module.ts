@@ -12,6 +12,7 @@ import { NotificationsModule } from '../modules/notifications/notifications.modu
 import { WebhooksModule } from '../modules/webhooks/webhooks.module';
 import { RulesModule } from '../modules/rules/rules.module';
 import { FeatureFlagsService } from '../config/feature-flags.service';
+import { AiCategorizationService } from '../modules/ai-categorization/ai-categorization.service';
 
 import { EMAIL_SYNC_QUEUE } from './queues/email-sync.queue';
 import { EMAIL_SEND_QUEUE } from './queues/email-send.queue';
@@ -81,6 +82,7 @@ const QUEUE_NAMES = [
     NotificationDigestProcessor,
     NotificationDigestScheduler,
     FeatureFlagsService,
+    AiCategorizationService,
   ],
   exports: [BullModule, BullConfigService],
 })

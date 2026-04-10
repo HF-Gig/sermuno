@@ -8,6 +8,7 @@ import { SlaModule } from '../sla/sla.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { AuditModule } from '../audit/audit.module';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { CrmModule } from '../crm/crm.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { FeatureFlagsService } from '../../config/feature-flags.service';
     SlaModule,
     NotificationsModule,
     AuditModule,
+    CrmModule,
   ],
   controllers: [ThreadsController],
   providers: [ThreadsService, PrismaService, FeatureFlagsService],

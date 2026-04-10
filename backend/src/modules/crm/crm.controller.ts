@@ -21,6 +21,7 @@ import {
   UpdateContactDto,
   CreateCompanyDto,
   UpdateCompanyDto,
+  UpdateContactNotificationPreferenceDto,
 } from './dto/crm.dto';
 
 @UseGuards(JwtAuthGuard, PermissionsGuard)
@@ -63,6 +64,25 @@ export class CrmController {
   @HttpCode(HttpStatus.NO_CONTENT)
   async deleteContact(@Param('id') id: string, @CurrentUser() user: JwtUser) {
     await this.crm.deleteContact(id, user);
+  }
+
+  @Get('contacts/:id/notification-preferences')
+  @RequirePermission('contacts:view')
+  getContactNotificationPreference(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.crm.getContactNotificationPreference(id, user);
+  }
+
+  @Patch('contacts/:id/notification-preferences')
+  @RequirePermission('contacts:manage')
+  updateContactNotificationPreference(
+    @Param('id') id: string,
+    @Body() dto: UpdateContactNotificationPreferenceDto,
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.crm.updateContactNotificationPreference(id, dto, user);
   }
 
   // ── Companies ─────────────────────────────────────────────────────────────

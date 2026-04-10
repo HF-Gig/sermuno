@@ -1,5 +1,5 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Logger, Optional } from '@nestjs/common';
+import { Inject, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Job } from 'bullmq';
 import { ImapFlow } from 'imapflow';
@@ -12,6 +12,7 @@ import type { Prisma } from '@prisma/client';
 import { EventsGateway } from '../../modules/websockets/events.gateway';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
 import { RulesEngineService } from '../../modules/rules/rules-engine.service';
+import { AiCategorizationService } from '../../modules/ai-categorization/ai-categorization.service';
 import {
   resolveEmailSyncProviderPolicy,
   sharedEmailSyncRateLimiter,
@@ -84,9 +85,18 @@ export class EmailSyncProcessor extends WorkerHost {
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
     private readonly featureFlags: FeatureFlagsService,
-    @Optional() private readonly crmService: CrmService | null,
-    @Optional() private readonly eventsGateway: EventsGateway | null,
-    @Optional() private readonly rulesEngine: RulesEngineService | null,
+    @Optional()
+    @Inject(CrmService)
+    private readonly crmService: CrmService | null,
+    @Optional()
+    @Inject(EventsGateway)
+    private readonly eventsGateway: EventsGateway | null,
+    @Optional()
+    @Inject(RulesEngineService)
+    private readonly rulesEngine: RulesEngineService | null,
+    @Optional()
+    @Inject(AiCategorizationService)
+    private readonly aiCategorizationService: AiCategorizationService | null,
   ) {
     super();
   }
@@ -1204,7 +1214,7 @@ export class EmailSyncProcessor extends WorkerHost {
       ? `${snippetSource.replace(/\s+/g, ' ').slice(0, 200)}${fromName ? ` — ${fromName}` : ''}`
       : null;
 
-    await this.prisma.message.create({
+    const createdMessage = await this.prisma.message.create({
       data: {
         thread: { connect: { id: thread.id } },
         mailbox: { connect: { id: mailboxId } },
@@ -1232,12 +1242,28 @@ export class EmailSyncProcessor extends WorkerHost {
         snippet,
         createdAt: Number.isNaN(receivedAt.getTime()) ? new Date() : receivedAt,
       },
+      select: { id: true },
     });
 
     if (direction === 'INBOUND') {
       await this.evaluateRulesForInboundMessage({
         organizationId,
         threadId: thread.id,
+        fromEmail,
+        toAddresses,
+        ccAddresses,
+        subject,
+        bodyText,
+        bodyHtml,
+        hasAttachments: Boolean(
+          message.hasAttachments ?? message.HasAttachments,
+        ),
+      });
+      await this.categorizeInboundMessage({
+        organizationId,
+        mailboxId,
+        threadId: thread.id,
+        messageId: createdMessage.id,
         fromEmail,
         toAddresses,
         ccAddresses,
@@ -1256,14 +1282,15 @@ export class EmailSyncProcessor extends WorkerHost {
       type: 'new_message',
     });
 
-    if (this.crmService && fromEmail !== 'unknown@example.com') {
-      await this.crmService
-        .autoCreateContactIfEnabled(fromEmail, fromName, organizationId)
-        .catch((err) =>
-          this.logger.warn(
-            `[email-sync] CRM auto-create failed: ${String(err)}`,
-          ),
-        );
+    if (this.crmService && thread.contactId) {
+      await this.crmService.emitContactActivity({
+        organizationId,
+        contactId: thread.contactId,
+        activity: direction === 'INBOUND' ? 'email_received' : 'email_sent',
+        threadId: thread.id,
+        mailboxId,
+        messageId: createdMessage.id,
+      });
     }
 
     return true;
@@ -1625,7 +1652,7 @@ export class EmailSyncProcessor extends WorkerHost {
     const snippet =
       snippetText.slice(0, 200) + (fromName ? ` — ${fromName}` : '') || null;
 
-    await this.prisma.message.create({
+    const createdMessage = await this.prisma.message.create({
       data: {
         thread: { connect: { id: thread.id } },
         mailbox: { connect: { id: mailboxId } },
@@ -1643,6 +1670,7 @@ export class EmailSyncProcessor extends WorkerHost {
         snippet,
         createdAt: receivedAt,
       },
+      select: { id: true },
     });
 
     if (direction === 'INBOUND') {
@@ -1658,6 +1686,19 @@ export class EmailSyncProcessor extends WorkerHost {
         hasAttachments: false,
         inReplyTo,
       });
+      await this.categorizeInboundMessage({
+        organizationId,
+        mailboxId,
+        threadId: thread.id,
+        messageId: createdMessage.id,
+        fromEmail,
+        toAddresses,
+        ccAddresses: [],
+        subject,
+        bodyText,
+        bodyHtml,
+        hasAttachments: false,
+      });
     }
 
     this.eventsGateway?.emitToOrganization(organizationId, 'thread:updated', {
@@ -1666,17 +1707,43 @@ export class EmailSyncProcessor extends WorkerHost {
       type: 'new_message',
     });
 
-    if (this.crmService && fromEmail !== 'unknown@example.com') {
-      await this.crmService
-        .autoCreateContactIfEnabled(fromEmail, fromName, organizationId)
-        .catch((err) =>
-          this.logger.warn(
-            `[email-sync] CRM auto-create failed: ${String(err)}`,
-          ),
-        );
+    if (this.crmService && thread.contactId) {
+      await this.crmService.emitContactActivity({
+        organizationId,
+        contactId: thread.contactId,
+        activity: direction === 'INBOUND' ? 'email_received' : 'email_sent',
+        threadId: thread.id,
+        mailboxId,
+        messageId: createdMessage.id,
+      });
     }
 
     return true;
+  }
+
+  private async categorizeInboundMessage(input: {
+    organizationId: string;
+    mailboxId: string;
+    threadId: string;
+    messageId: string;
+    fromEmail: string;
+    toAddresses: string[];
+    ccAddresses: string[];
+    subject: string;
+    bodyText: string;
+    bodyHtml: string | null;
+    hasAttachments: boolean;
+  }): Promise<void> {
+    if (!this.aiCategorizationService) {
+      return;
+    }
+    try {
+      await this.aiCategorizationService.categorizeInboundThread(input);
+    } catch (err) {
+      this.logger.warn(
+        `[email-sync] AI categorization failed thread=${input.threadId}: ${String(err)}`,
+      );
+    }
   }
 
   private async evaluateRulesForInboundMessage(input: {
@@ -1726,13 +1793,51 @@ export class EmailSyncProcessor extends WorkerHost {
     inReplyTo: string | undefined,
     fromEmail: string,
     fromName?: string,
-  ): Promise<{ id: string }> {
+  ): Promise<{ id: string; contactId: string | null; companyId: string | null }> {
     if (inReplyTo) {
       const existing = await this.prisma.thread.findFirst({
         where: { organizationId, subject },
-        select: { id: true },
+        select: { id: true, contactId: true, companyId: true },
       });
-      if (existing) return existing;
+      if (existing) {
+        if (existing.contactId || !this.crmService) {
+          return {
+            id: existing.id,
+            contactId: existing.contactId ?? null,
+            companyId: existing.companyId ?? null,
+          };
+        }
+
+        const contactLink =
+          fromEmail && fromEmail !== 'unknown@example.com'
+            ? await this.crmService
+                .autoCreateContactIfEnabled(fromEmail, fromName, organizationId)
+                .catch(() => ({ contactId: null, companyId: null }))
+            : { contactId: null, companyId: null };
+        if (!contactLink.contactId) {
+          return {
+            id: existing.id,
+            contactId: null,
+            companyId: existing.companyId ?? null,
+          };
+        }
+
+        const updated = await this.prisma.thread.update({
+          where: { id: existing.id },
+          data: {
+            ...(existing.contactId ? {} : { contactId: contactLink.contactId }),
+            ...(existing.companyId
+              ? {}
+              : { companyId: contactLink.companyId ?? null }),
+          },
+          select: { id: true, contactId: true, companyId: true },
+        });
+        return {
+          id: updated.id,
+          contactId: updated.contactId ?? null,
+          companyId: updated.companyId ?? null,
+        };
+      }
     }
 
     let contactLink: { contactId: string | null; companyId: string | null } = {
@@ -1745,7 +1850,7 @@ export class EmailSyncProcessor extends WorkerHost {
         .catch(() => ({ contactId: null, companyId: null }));
     }
 
-    return this.prisma.thread.create({
+    const created = await this.prisma.thread.create({
       data: {
         organization: { connect: { id: organizationId } },
         mailbox: { connect: { id: mailboxId } },
@@ -1758,8 +1863,13 @@ export class EmailSyncProcessor extends WorkerHost {
           ? { company: { connect: { id: contactLink.companyId } } }
           : {}),
       },
-      select: { id: true },
+      select: { id: true, contactId: true, companyId: true },
     });
+    return {
+      id: created.id,
+      contactId: created.contactId ?? null,
+      companyId: created.companyId ?? null,
+    };
   }
 
   // ─── Encryption ───────────────────────────────────────────────────────────

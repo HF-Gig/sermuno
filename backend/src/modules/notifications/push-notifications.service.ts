@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   ServiceUnavailableException,
@@ -94,14 +95,16 @@ export class PushNotificationsService {
     const endpoint = this.readEndpoint(dto);
     const token = dto.token?.trim() || null;
 
+    if (provider === 'fcm') {
+      throw new BadRequestException(
+        'FCM registration is not supported yet. Use web_push registration.',
+      );
+    }
+
     if (provider === 'web_push' && (!dto.subscription || !endpoint)) {
       throw new BadRequestException(
         'Web push subscription payload with a valid endpoint is required',
       );
-    }
-
-    if (provider === 'fcm' && !token) {
-      throw new BadRequestException('Push token is required');
     }
 
     if (!registrationKey) {
@@ -110,8 +113,28 @@ export class PushNotificationsService {
       );
     }
 
+    const providerEnum = provider as PushProvider;
+    const activeClaim = await this.prisma.pushRegistration.findFirst({
+      where: {
+        provider: providerEnum,
+        registrationKey,
+        active: true,
+        revokedAt: null,
+        NOT: {
+          organizationId: user.organizationId,
+          userId: user.sub,
+        },
+      },
+      select: { id: true, userId: true, organizationId: true },
+    });
+    if (activeClaim) {
+      throw new ConflictException(
+        'Push registration key is already active for another account',
+      );
+    }
+
     const payload = {
-      provider: provider as PushProvider,
+      provider: providerEnum,
       registrationKey,
       endpoint,
       token,
@@ -132,29 +155,48 @@ export class PushNotificationsService {
       lastFailureReason: null,
     };
 
-    const registration = await this.prisma.pushRegistration.upsert({
-      where: { registrationKey },
-      create: {
-        userId: user.sub,
+    const existing = await this.prisma.pushRegistration.findFirst({
+      where: {
         organizationId: user.organizationId,
-        ...payload,
-      },
-      update: {
         userId: user.sub,
-        organizationId: user.organizationId,
-        ...payload,
+        provider: providerEnum,
+        registrationKey,
       },
-      select: {
-        id: true,
-        provider: true,
-        registrationKey: true,
-        endpoint: true,
-        soundEnabled: true,
-        active: true,
-        revokedAt: true,
-        updatedAt: true,
-      },
+      select: { id: true },
     });
+
+    const registration = existing
+      ? await this.prisma.pushRegistration.update({
+          where: { id: existing.id },
+          data: payload,
+          select: {
+            id: true,
+            provider: true,
+            registrationKey: true,
+            endpoint: true,
+            soundEnabled: true,
+            active: true,
+            revokedAt: true,
+            updatedAt: true,
+          },
+        })
+      : await this.prisma.pushRegistration.create({
+          data: {
+            userId: user.sub,
+            organizationId: user.organizationId,
+            ...payload,
+          },
+          select: {
+            id: true,
+            provider: true,
+            registrationKey: true,
+            endpoint: true,
+            soundEnabled: true,
+            active: true,
+            revokedAt: true,
+            updatedAt: true,
+          },
+        });
 
     this.logger.log(
       `[push] Registered provider=${registration.provider} key=${registration.registrationKey} user=${user.sub} org=${user.organizationId} sound=${registration.soundEnabled}`,

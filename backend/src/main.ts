@@ -1,14 +1,24 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import * as express from 'express';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { resolveLoggingConfig } from './logging/logging-config';
+import { JsonLoggerService } from './logging/json-logger.service';
 
 async function bootstrap() {
+  const loggingConfig = resolveLoggingConfig();
+  const jsonLogger =
+    loggingConfig.format === 'json' ? new JsonLoggerService() : null;
+  if (jsonLogger) {
+    jsonLogger.setLogLevels(loggingConfig.nestLogLevels);
+  }
+
   const app = await NestFactory.create(AppModule, {
     rawBody: true, // needed for Stripe webhook signature verification
+    logger: jsonLogger ?? loggingConfig.nestLogLevels,
   });
 
   // Global CORS
@@ -59,7 +69,11 @@ async function bootstrap() {
 
   const port = parseInt(process.env.PORT ?? '3000', 10);
   await app.listen(port);
-  console.log(`Sermuno backend running on port ${port}`);
+  if (jsonLogger) {
+    jsonLogger.log(`Sermuno backend running on port ${port}`, 'Bootstrap');
+  } else {
+    new Logger('Bootstrap').log(`Sermuno backend running on port ${port}`);
+  }
 }
 
 bootstrap();

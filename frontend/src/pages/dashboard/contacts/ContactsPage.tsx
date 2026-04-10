@@ -41,6 +41,19 @@ type CompanyRecord = {
     threadCount?: number;
 };
 
+type ContactNotificationPreference = {
+    contactId: string;
+    notificationType: 'contact_activity';
+    hasOverride: boolean;
+    enabled: boolean;
+    channels: {
+        in_app: boolean;
+        email: boolean;
+        push: boolean;
+        desktop: boolean;
+    };
+};
+
 type TabKey = 'contacts' | 'companies';
 
 const blankContact = {
@@ -87,6 +100,10 @@ const ContactsPage: React.FC = () => {
     const [contactForm, setContactForm] = useState(blankContact);
     const [companyForm, setCompanyForm] = useState(blankCompany);
     const [formError, setFormError] = useState('');
+    const [contactNotificationPreference, setContactNotificationPreference] = useState<ContactNotificationPreference | null>(null);
+    const [contactNotificationLoading, setContactNotificationLoading] = useState(false);
+    const [contactNotificationSaving, setContactNotificationSaving] = useState(false);
+    const [contactNotificationError, setContactNotificationError] = useState('');
 
     const load = async () => {
         setLoading(true);
@@ -118,9 +135,31 @@ const ContactsPage: React.FC = () => {
     useEffect(() => {
         if (!selectedContactId) {
             setContactDetail(null);
+            setContactNotificationPreference(null);
+            setContactNotificationError('');
             return;
         }
-        void api.get(`/contacts/${selectedContactId}`).then((res) => setContactDetail(res.data)).catch(() => setContactDetail(null));
+        setContactNotificationLoading(true);
+        setContactNotificationError('');
+        void Promise.allSettled([
+            api.get(`/contacts/${selectedContactId}`),
+            api.get(`/contacts/${selectedContactId}/notification-preferences`),
+        ])
+            .then(([contactResult, preferenceResult]) => {
+                if (contactResult.status === 'fulfilled') {
+                    setContactDetail(contactResult.value.data);
+                } else {
+                    setContactDetail(null);
+                }
+
+                if (preferenceResult.status === 'fulfilled') {
+                    setContactNotificationPreference(preferenceResult.value.data);
+                } else {
+                    setContactNotificationPreference(null);
+                    setContactNotificationError('Failed to load contact notification preference.');
+                }
+            })
+            .finally(() => setContactNotificationLoading(false));
     }, [selectedContactId]);
 
     useEffect(() => {
@@ -260,6 +299,45 @@ const ContactsPage: React.FC = () => {
         await load();
     };
 
+    const updateContactNotificationPreference = (patch: Partial<ContactNotificationPreference>) => {
+        setContactNotificationPreference((prev) => {
+            if (!prev) return prev;
+            return {
+                ...prev,
+                ...patch,
+                channels: {
+                    ...prev.channels,
+                    ...(patch.channels || {}),
+                },
+            };
+        });
+    };
+
+    const saveContactNotificationPreference = async () => {
+        if (!selectedContactId || !contactNotificationPreference) return;
+        setContactNotificationSaving(true);
+        setContactNotificationError('');
+        try {
+            const response = await api.patch(
+                `/contacts/${selectedContactId}/notification-preferences`,
+                {
+                    enabled: contactNotificationPreference.enabled,
+                    in_app: contactNotificationPreference.channels.in_app,
+                    email: contactNotificationPreference.channels.email,
+                    push: contactNotificationPreference.channels.push,
+                    desktop: contactNotificationPreference.channels.desktop,
+                },
+            );
+            setContactNotificationPreference(response.data);
+        } catch (err: any) {
+            setContactNotificationError(
+                err?.response?.data?.message || 'Failed to save contact notification preference.',
+            );
+        } finally {
+            setContactNotificationSaving(false);
+        }
+    };
+
     const displayContacts = loading
         ? Array.from({ length: contactsLoadingRows }, (_, index) => ({ id: `loading-contact-${index}`, email: '', fullName: '', lifecycleStage: '', source: '', assignedToUserId: '', emailCount: 0, threadCount: 0, lastContactedAt: '' } as ContactRecord))
         : contacts;
@@ -353,6 +431,85 @@ const ContactsPage: React.FC = () => {
                                     ['Assigned To', userMap[contactDetail.assignedToUserId || ''] || '--'],
                                     ['Company', companyMap[contactDetail.companyId || ''] || '--'],
                                 ]} />
+                                <div className="rounded-xl border border-[var(--color-card-border)] p-4">
+                                    <div className="flex items-start justify-between gap-3">
+                                        <div>
+                                            <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">Contact activity notifications</h3>
+                                            <p className="mt-1 text-xs text-[var(--color-text-muted)]">
+                                                Override channel and enable settings for this contact only.
+                                            </p>
+                                        </div>
+                                        {contactNotificationPreference?.hasOverride && (
+                                            <span className="rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)] px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                                                Override
+                                            </span>
+                                        )}
+                                    </div>
+                                    {contactNotificationLoading ? (
+                                        <div className="mt-3 space-y-2">
+                                            <InlineSkeleton className="h-4 w-40" />
+                                            <InlineSkeleton className="h-8 w-full" />
+                                            <InlineSkeleton className="h-8 w-full" />
+                                        </div>
+                                    ) : contactNotificationPreference ? (
+                                        <div className="mt-4 space-y-3">
+                                            <label className="flex items-center justify-between rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm text-[var(--color-text-primary)]">
+                                                Enabled
+                                                <input
+                                                    type="checkbox"
+                                                    checked={contactNotificationPreference.enabled}
+                                                    onChange={(event) =>
+                                                        updateContactNotificationPreference({ enabled: event.target.checked })
+                                                    }
+                                                    className="h-4 w-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]"
+                                                />
+                                            </label>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                {[
+                                                    ['in_app', 'In-app'],
+                                                    ['email', 'Email'],
+                                                    ['push', 'Push'],
+                                                    ['desktop', 'Desktop'],
+                                                ].map(([channelKey, label]) => (
+                                                    <label key={channelKey} className="flex items-center justify-between rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm text-[var(--color-text-primary)]">
+                                                        {label}
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={Boolean(contactNotificationPreference.channels[channelKey as keyof ContactNotificationPreference['channels']])}
+                                                            onChange={(event) =>
+                                                                updateContactNotificationPreference({
+                                                                    channels: {
+                                                                        [channelKey]: event.target.checked,
+                                                                    } as ContactNotificationPreference['channels'],
+                                                                })
+                                                            }
+                                                            className="h-4 w-4 rounded border-[var(--color-card-border)] text-[var(--color-primary)]"
+                                                        />
+                                                    </label>
+                                                ))}
+                                            </div>
+                                            {contactNotificationError && (
+                                                <p className="text-xs text-red-600">{contactNotificationError}</p>
+                                            )}
+                                            {canManage && (
+                                                <div className="flex justify-end">
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => void saveContactNotificationPreference()}
+                                                        disabled={contactNotificationSaving}
+                                                        className="rounded-lg bg-[var(--color-cta-primary)] px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+                                                    >
+                                                        {contactNotificationSaving ? 'Saving...' : 'Save contact preference'}
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    ) : (
+                                        <p className="mt-3 text-xs text-[var(--color-text-muted)]">
+                                            Contact notification preference could not be loaded.
+                                        </p>
+                                    )}
+                                </div>
                                 <DetailBlock title="Additional Emails" rows={(contactDetail.additionalEmails || []).map((email) => [email, ''])} emptyLabel="No additional emails" />
                                 <JsonBlock title="Phone Numbers" value={contactDetail.phoneNumbers || []} />
                                 <JsonBlock title="Addresses" value={contactDetail.addresses || []} />

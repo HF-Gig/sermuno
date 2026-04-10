@@ -353,3 +353,98 @@
 - frontend/src/hooks/useAdaptiveCount.ts
 - frontend/scripts/check-skeleton-hardcoding.mjs
 - frontend/src/components/skeletons/
+
+## 11. AI Categorization (Section 3.4)
+
+### Requirements
+- Implement feature flag `FEATURE_AI_CATEGORIZATION`
+- Automatically categorize incoming emails during sync
+- Integrate AI model for categorization
+- Persist categorization results to thread/tag system
+- Ensure safe fallback when feature is disabled or fails
+
+### What Was Implemented
+- Implemented runtime feature flag `FEATURE_AI_CATEGORIZATION` via feature-flags service/API
+- Built AI categorization service using Anthropic Claude with configurable model, timeout, and input limits
+- Integrated categorization into inbound email sync processor (IMAP + Outlook flows)
+- Persisted categorization output using existing tagging system (`tags` + `thread_tags`) with `AI:*` labels
+- Added per-organization credit system (`aiCategorizationCredits`) with configurable deduction per request
+- Implemented safe fallback behavior: skips categorization when disabled, no API key, insufficient credits, or provider failure without breaking sync
+
+### Key References
+- backend/src/config/feature-flags.service.ts
+- backend/src/config/configuration.ts
+- backend/src/modules/ai-categorization/ai-categorization.service.ts
+- backend/src/jobs/processors/email-sync.processor.ts
+- backend/src/jobs/jobs.module.ts
+- backend/prisma/schema.prisma
+- backend/prisma/migrations/20260410_add_ai_categorization_credits/migration.sql
+- backend/.env
+- backend/.env.example
+
+## 12. Notification: contact_activity Type (Section 2.12)
+
+### Requirements
+- Support `contact_activity` notification type
+- Trigger notifications on contact-related activity (email, thread updates, contact changes)
+- Allow per-contact enable/disable configuration
+- Allow per-contact channel selection (in-app, email, push, desktop)
+- Ensure preferences are respected during notification dispatch
+
+### What Was Implemented
+- Implemented `contact_activity` as an active notification type in the notifications pipeline
+- Added runtime triggers for:
+  - contact create/update activity
+  - outbound email activity linked to a resolved contact (`email_sent`)
+  - thread updates linked to a resolved contact (`thread_updated`)
+- Implemented per-contact notification preference storage
+- Enforced per-contact enable/disable logic during dispatch resolution
+- Enforced per-contact channel selection (in-app, email, push, desktop overrides)
+- Added contact-scoped API endpoints for managing notification preferences
+- Removed dependency on profile-level `contactIds` filtering in favor of dedicated contact-level controls
+
+### Key References
+- backend/prisma/schema.prisma
+- backend/prisma/migrations/20260409_add_contact_notification_preferences/migration.sql
+- backend/src/modules/notifications/notifications.service.ts
+- backend/src/modules/crm/crm.controller.ts
+- backend/src/modules/crm/crm.service.ts
+- backend/src/modules/crm/dto/crm.dto.ts
+- backend/src/modules/threads/threads.service.ts
+- backend/src/jobs/processors/email-sync.processor.ts
+- frontend/src/pages/dashboard/contacts/ContactsPage.tsx
+- frontend/src/pages/dashboard/profile/ProfilePage.tsx
+
+## 13. Logging Configuration (Section 4.2)
+
+### Requirements
+- Support `LOG_LEVEL` (debug/info/warn/error) to control logger levels
+- Support `LOG_FORMAT` (pretty/json) to switch output format
+- Validate environment values and fail on invalid configuration
+- Provide sensible defaults aligned with spec
+- Ensure configuration is applied at runtime
+
+### What Was Implemented
+- Implemented `LOG_LEVEL` mapping to effective NestJS log levels:
+  - `debug` → `error,warn,log,debug`
+  - `info` → `error,warn,log`
+  - `warn` → `error,warn`
+  - `error` → `error`
+- Implemented `LOG_FORMAT` handling:
+  - `pretty` → human-readable Nest logs
+  - `json` → structured JSON logging
+- Added strict validation: invalid `LOG_LEVEL` or `LOG_FORMAT` values fail application startup with clear errors
+- Set explicit defaults:
+  - `LOG_LEVEL=info`
+  - `LOG_FORMAT=pretty`
+- Ensured environment variables are defined and available in both runtime and example env files
+
+### Key References
+- backend/src/main.ts
+- backend/src/logging/logging-config.ts
+- backend/src/logging/json-logger.service.ts
+- backend/src/config/configuration.ts
+- backend/.env
+- backend/.env.example
+- test/backend/src/logging/logging-config.spec.ts
+- test/backend/src/logging/json-logger.service.spec.ts

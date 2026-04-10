@@ -60,3 +60,12 @@ export class UpdateCompanyDto {
   customFields?: Record<string, unknown>;
   logoUrl?: string | null;
 }
+
+export class UpdateContactNotificationPreferenceDto {
+  enabled?: boolean;
+  inApp?: boolean;
+  in_app?: boolean;
+  email?: boolean;
+  push?: boolean;
+  desktop?: boolean;
+}

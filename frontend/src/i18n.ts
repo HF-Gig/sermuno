@@ -1,4 +1,4 @@
-import i18n from 'i18next';
+﻿import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 
 const DEFAULT_LANGUAGE = 'en';
@@ -25,7 +25,7 @@ const resources = {
             "mfa_title": "Two-Factor Authentication",
             "mfa_desc": "Please enter the code from your authenticator app.",
             "mfa_code_label": "Authentication Code",
-            "submit_mfa": "Verify",
+            "submit_mfa": "Verifieren",
             "error_rate_limit": "Too many attempts. Please try again later.",
             "login_success": "Login successful.",
             "back_to_login": "Back to Login",
@@ -66,7 +66,7 @@ const resources = {
             "mfa_gen_failed": "Failed to generate MFA secret",
             "invalid_code": "Invalid code",
             "loading": "Loading...",
-            "verifying": "Verifying...",
+            "verifying": "Verifieren...",
             "cancel": "Cancel",
             "done": "Resolved",
             "dashboard": "Dashboard",
@@ -124,7 +124,7 @@ const resources = {
             "storage": "Storage",
             "billing_note": "Note",
             "billing_fields_read_only_notice": "Billing and limit settings are managed by the system and are read-only here.",
-            "verifying_your_email": "Verifying your email...",
+            "verifying_your_email": "E-mail Verifieren...",
             "please_wait_while_we_verify": "Please wait a moment while we confirm your email address.",
             "email_verified_success": "Email Verified!",
             "redirecting_to_dashboard": "You have successfully verified your email. Redirecting to dashboard...",
@@ -168,7 +168,7 @@ const resources = {
             "plan_trial": "Trial",
             "trial_plan_description": "Experience all Pro features for 14 days, no credit card required.",
             "plan_free": "Free",
-            "free_plan_description": "Essential features for individuals or very small teams.",
+            "free_plan_description": "Essentiele functies voor individuen of zeer kleine teams.",
             "current_plan_btn": "Current Plan",
             "max_1_user": "1 user",
             "max_1_mailbox": "1 mailbox",
@@ -297,7 +297,7 @@ const resources = {
             "auth_sign_up_with_microsoft": "Sign up with Microsoft",
             "auth_inter_medium": "Inter Medium",
             "auth_code_title_login": "Enter security code",
-            "auth_code_title_signup": "Verify your account",
+            "auth_code_title_signup": "Uw account Verifieren",
             "auth_code_sub_login": "Enter the 6-digit code to continue to your workspace.",
             "auth_code_sub_signup": "Enter the 6-digit code to finish creating your account.",
             "auth_code_session_missing": "No pending verification was found. Please sign in or sign up again.",
@@ -465,7 +465,7 @@ const resources = {
             "mfa_title": "Twee-factor-authenticatie",
             "mfa_desc": "Voer de code van uw authenticator-app in.",
             "mfa_code_label": "Authenticatiecode",
-            "submit_mfa": "VerifiÃƒÆ’Ã‚Â«ren",
+            "submit_mfa": "Verifieren",
             "error_rate_limit": "Te veel inlogpogingen. Wacht 60 seconden.",
             "login_success": "Mislukt inloggen.",
             "back_to_login": "Terug naar inloggen",
@@ -506,7 +506,7 @@ const resources = {
             "mfa_gen_failed": "Kan MFA-geheim niet genereren",
             "invalid_code": "Ongeldige code",
             "loading": "Laden...",
-            "verifying": "VerifiÃƒÆ’Ã‚Â«ren...",
+            "verifying": "Verifieren...",
             "cancel": "Annuleren",
             "done": "Opgelost",
             "dashboard": "Dashboard",
@@ -564,7 +564,7 @@ const resources = {
             "storage": "Opslag",
             "billing_note": "Let op",
             "billing_fields_read_only_notice": "Facturerings- en limietinstellingen worden door het systeem beheerd en zijn hier alleen-lezen.",
-            "verifying_your_email": "E-mail verifiÃƒÆ’Ã‚Â«ren...",
+            "verifying_your_email": "E-mail Verifieren...",
             "please_wait_while_we_verify": "Een moment geduld alstublieft terwijl we uw e-mailadres bevestigen.",
             "email_verified_success": "E-mail geverifieerd!",
             "redirecting_to_dashboard": "U heeft uw e-mail succesvol geverifieerd. U wordt doorgestuurd naar het dashboard...",
@@ -608,7 +608,7 @@ const resources = {
             "plan_trial": "Proefperiode",
             "trial_plan_description": "Ervaar alle Pro-functies gedurende 14 dagen, geen creditcard vereist.",
             "plan_free": "Gratis",
-            "free_plan_description": "EssentiÃƒÆ’Ã‚Â«le functies voor individuen of zeer kleine teams.",
+            "free_plan_description": "Essentiele functies voor individuen of zeer kleine teams.",
             "current_plan_btn": "Huidig Abonnement",
             "max_1_user": "1 Gebruiker",
             "max_1_mailbox": "1 Mailbox",
@@ -736,7 +736,7 @@ const resources = {
             "auth_sign_up_with_microsoft": "Aanmelden met Microsoft",
             "auth_inter_medium": "Inter Medium",
             "auth_code_title_login": "Beveiligingscode invoeren",
-            "auth_code_title_signup": "Uw account verifiÃƒÆ’Ã‚Â«ren",
+            "auth_code_title_signup": "Uw account Verifieren",
             "auth_code_sub_login": "Voer de 6-cijferige code in om door te gaan naar uw werkruimte.",
             "auth_code_sub_signup": "Voer de 6-cijferige code in om uw account aan te maken.",
             "auth_code_session_missing": "Geen wachtende verificatie gevonden. Log opnieuw in of meld u opnieuw aan.",
@@ -907,3 +907,4 @@ if (typeof document !== 'undefined') {
 }
 
 export default i18n;
+

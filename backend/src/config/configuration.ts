@@ -132,11 +132,14 @@ export default () => ({
     privateKey: process.env.WEB_PUSH_PRIVATE_KEY ?? '',
     subject: process.env.WEB_PUSH_SUBJECT ?? '',
   },
+  calendar: {
+    rsvpIngestSecret: process.env.CALENDAR_RSVP_INGEST_SECRET ?? '',
+  },
   cors: {
     origins: process.env.CORS_ORIGINS ?? 'http://localhost:5173',
   },
   logging: {
-    level: process.env.LOG_LEVEL ?? 'log',
+    level: process.env.LOG_LEVEL ?? 'info',
     format: process.env.LOG_FORMAT ?? 'pretty',
   },
   stripe: {
@@ -199,6 +202,23 @@ export default () => ({
     enablePushNotifications: process.env.ENABLE_PUSH_NOTIFICATIONS === 'true',
     enableSlackNotifications: process.env.ENABLE_SLACK_NOTIFICATIONS === 'true',
     enableCrmAutoCreate: process.env.ENABLE_CRM_AUTO_CREATE !== 'false',
+    featureAiCategorization:
+      process.env.FEATURE_AI_CATEGORIZATION === 'true',
+  },
+  aiCategorization: {
+    model:
+      process.env.AI_CATEGORIZATION_MODEL ?? 'claude-haiku-4-5-20251001',
+    timeoutMs: parseInt(process.env.AI_CATEGORIZATION_TIMEOUT_MS ?? '4000', 10),
+    maxBodyChars: parseInt(
+      process.env.AI_CATEGORIZATION_MAX_BODY_CHARS ?? '2500',
+      10,
+    ),
+    creditDeduction: parseFloat(
+      process.env.AI_CATEGORIZATION_CREDIT_DEDUCTION ?? '0.8',
+    ),
+    defaultCredits: parseFloat(
+      process.env.AI_CATEGORIZATION_DEFAULT_CREDITS ?? '50',
+    ),
   },
   backpressure: {
     heapHighWatermark: parseFloat(

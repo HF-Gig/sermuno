@@ -12,12 +12,18 @@ import {
   HttpStatus,
   Res,
   Req,
+  BadRequestException,
+  UnauthorizedException,
+  Headers,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as crypto from 'crypto';
 import { CalendarService } from './calendar.service';
 import { CalendarTemplatesService } from './calendar-templates.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import { RequirePermission } from '../../common/decorators/permissions.decorator';
+import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
 import type { Request, Response } from 'express';
@@ -38,6 +44,7 @@ export class CalendarController {
   constructor(
     private readonly calendarService: CalendarService,
     private readonly templatesService: CalendarTemplatesService,
+    private readonly config: ConfigService,
   ) {}
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -134,8 +141,35 @@ export class CalendarController {
   // RSVP ingest (incoming iCal reply)
   // ──────────────────────────────────────────────────────────────────────────
 
+  @Public()
   @Post('rsvp/ingest')
-  ingestRsvp(@Body() dto: IngestRsvpDto) {
+  ingestRsvp(
+    @Body() dto: IngestRsvpDto,
+    @Headers('x-rsvp-ingest-secret') providedSecret?: string,
+  ) {
+    const expectedSecret =
+      this.config.get<string>('calendar.rsvpIngestSecret')?.trim() ?? '';
+
+    if (!expectedSecret) {
+      throw new BadRequestException(
+        'RSVP ingest secret is not configured on the server',
+      );
+    }
+
+    const provided = (providedSecret ?? '').trim();
+    if (!provided) {
+      throw new UnauthorizedException('Missing RSVP ingest secret');
+    }
+
+    const expectedBuffer = Buffer.from(expectedSecret, 'utf8');
+    const providedBuffer = Buffer.from(provided, 'utf8');
+    const isValid =
+      expectedBuffer.length === providedBuffer.length &&
+      crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+    if (!isValid) {
+      throw new UnauthorizedException('Invalid RSVP ingest secret');
+    }
+
     return this.calendarService.ingestRsvp(dto);
   }
 

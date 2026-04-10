@@ -531,9 +531,8 @@ export default function ProfilePage() {
                     </div>
                 )}
                 {type === 'contact_activity' && (
-                    <div>
-                        <label className="block text-xs font-medium text-[var(--color-text-muted)] mb-1">Contact IDs (comma separated)</label>
-                        <input value={Array.isArray(pref.config?.contactIds) ? pref.config.contactIds.join(', ') : ''} onChange={(event) => updateNotificationConfig(type, { contactIds: event.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} className="w-full rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm" />
+                    <div className="rounded-lg border border-[var(--color-card-border)] bg-[var(--color-background)]/50 px-3 py-2 text-xs text-[var(--color-text-muted)] md:col-span-2">
+                        Contact-level enable/disable and channel overrides are configured from each contact in the CRM page.
                     </div>
                 )}
                 {type === 'daily_digest' && (

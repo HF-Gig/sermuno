@@ -77,7 +77,7 @@ const NOTIFICATION_TYPE_DEFS: Record<
   },
   contact_activity: {
     channels: { in_app: true, email: true, push: false, desktop: false },
-    config: { contactIds: [] },
+    config: {},
   },
   daily_digest: {
     channels: { in_app: false, email: true, push: false, desktop: false },
@@ -413,21 +413,36 @@ export class NotificationsService {
       }
     }
 
-    const [userPref, globalPref, orgSettings, recipientUser] = await Promise.all(
-      [
-      this.prisma.notificationPreference.findFirst({
-        where: { userId, notificationType: type },
-      }),
-      this.prisma.notificationPreference.findFirst({
-        where: { userId, notificationType: 'global' },
-      }),
-      this.getOrganizationSettingsInternal(params.organizationId),
-      this.prisma.user.findUnique({
-        where: { id: userId },
-        select: { timezone: true },
-      }),
-    ],
-    );
+    const contactId =
+      type === 'contact_activity' && typeof params.data?.contactId === 'string'
+        ? params.data.contactId
+        : null;
+
+    const [userPref, globalPref, orgSettings, recipientUser, contactPref] =
+      await Promise.all([
+        this.prisma.notificationPreference.findFirst({
+          where: { userId, notificationType: type },
+        }),
+        this.prisma.notificationPreference.findFirst({
+          where: { userId, notificationType: 'global' },
+        }),
+        this.getOrganizationSettingsInternal(params.organizationId),
+        this.prisma.user.findUnique({
+          where: { id: userId },
+          select: { timezone: true },
+        }),
+        contactId
+          ? this.prisma.contactNotificationPreference.findUnique({
+              where: {
+                userId_contactId_notificationType: {
+                  userId,
+                  contactId,
+                  notificationType: type,
+                },
+              },
+            })
+          : Promise.resolve(null),
+      ]);
 
     const orgTypeSetting = orgSettings.types[type];
     if (!orgTypeSetting.enabled) {
@@ -437,19 +452,25 @@ export class NotificationsService {
     const effectiveChannels: ChannelMap = {
       in_app:
         orgTypeSetting.channels.in_app &&
-        (userPref?.inApp ?? orgTypeSetting.channels.in_app),
+        (contactPref?.inApp ??
+          userPref?.inApp ??
+          orgTypeSetting.channels.in_app),
       email:
         (params.channels?.email ?? false) ||
         (orgTypeSetting.channels.email &&
-          (userPref?.email ?? orgTypeSetting.channels.email)),
+          (contactPref?.email ??
+            userPref?.email ??
+            orgTypeSetting.channels.email)),
       push:
         (params.channels?.push ?? false) ||
         (orgTypeSetting.channels.push &&
-          (userPref?.push ?? orgTypeSetting.channels.push)),
+          (contactPref?.push ?? userPref?.push ?? orgTypeSetting.channels.push)),
       desktop:
         (params.channels?.desktop ?? false) ||
         (orgTypeSetting.channels.desktop &&
-          (userPref?.desktop ?? orgTypeSetting.channels.desktop)),
+          (contactPref?.desktop ??
+            userPref?.desktop ??
+            orgTypeSetting.channels.desktop)),
     };
     const effectiveConfig = {
       ...orgTypeSetting.config,
@@ -458,6 +479,9 @@ export class NotificationsService {
     const emailDeliveryMode = this.getEmailDeliveryMode(effectiveConfig);
 
     if (userPref?.enabled === false) {
+      return;
+    }
+    if (contactPref?.enabled === false) {
       return;
     }
     if (!this.matchesTypeConfig(type, effectiveConfig, params, userId)) {
@@ -671,19 +695,6 @@ export class NotificationsService {
         const ruleId =
           typeof params.data?.ruleId === 'string' ? params.data.ruleId : '';
         return ruleIds.includes(ruleId);
-      }
-    }
-
-    if (type === 'contact_activity') {
-      const contactIds = Array.isArray(config.contactIds)
-        ? config.contactIds.map(String)
-        : [];
-      if (contactIds.length > 0) {
-        const contactId =
-          typeof params.data?.contactId === 'string'
-            ? params.data.contactId
-            : '';
-        return contactIds.includes(contactId);
       }
     }
 

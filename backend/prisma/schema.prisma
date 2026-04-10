@@ -23,6 +23,7 @@ model Organization {
   enforceMfa              Boolean                  @default(false)
   logoUrl                 String?
   notificationSettings    Json?                    @default("{}")
+  aiCategorizationCredits Decimal                  @default(50) @db.Decimal(10, 2)
   plan                    PlanTier                 @default(trial)
   subscriptionStatus      SubscriptionStatus       @default(active)
   companies               Company[]
@@ -45,6 +46,7 @@ model Organization {
   exportJobs              ExportJob[]
   importJobs              ImportJob[]
   notificationPreferences NotificationPreference[]
+  contactNotificationPreferences ContactNotificationPreference[]
   pushRegistrations       PushRegistration[]
   notificationDigestItems NotificationDigestItem[]
 
@@ -92,6 +94,7 @@ model User {
   exportJobs               ExportJob[]
   importJobs               ImportJob[]
   notificationPreferences  NotificationPreference[]
+  contactNotificationPreferences ContactNotificationPreference[]
   pushRegistrations        PushRegistration[]
   notificationDigestItems  NotificationDigestItem[]
   organization             Organization             @relation(fields: [organizationId], references: [id])
@@ -392,6 +395,7 @@ model Contact {
   organization     Organization    @relation(fields: [organizationId], references: [id])
   eventAttendees   EventAttendee[]
   threads          Thread[]
+  notificationPreferences ContactNotificationPreference[]
 
   @@unique([organizationId, email])
   @@map("contacts")
@@ -599,12 +603,34 @@ model NotificationPreference {
   @@map("notification_preferences")
 }
 
+model ContactNotificationPreference {
+  id               String       @id @default(uuid())
+  userId           String
+  organizationId   String
+  contactId        String
+  notificationType String
+  enabled          Boolean      @default(true)
+  inApp            Boolean      @default(true)
+  email            Boolean      @default(true)
+  push             Boolean      @default(false)
+  desktop          Boolean      @default(false)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  contact          Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, contactId, notificationType])
+  @@index([organizationId, notificationType])
+  @@map("contact_notification_preferences")
+}
+
 model PushRegistration {
   id                String       @id @default(uuid())
   userId            String
   organizationId    String
   provider          PushProvider
-  registrationKey   String       @unique
+  registrationKey   String
   endpoint          String?
   token             String?
   subscription      Json?
@@ -626,6 +652,8 @@ model PushRegistration {
 
   @@index([userId, active, revokedAt])
   @@index([organizationId, provider, active])
+  @@index([provider, registrationKey])
+  @@unique([organizationId, userId, provider, registrationKey], map: "push_registrations_org_user_provider_key_unique")
   @@map("push_registrations")
 }
 

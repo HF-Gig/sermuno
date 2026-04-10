@@ -3,6 +3,7 @@ import {
   NotFoundException,
   ConflictException,
   ForbiddenException,
+  Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service';
 import { ConfigService } from '@nestjs/config';
@@ -12,12 +13,15 @@ import type {
   UpdateContactDto,
   CreateCompanyDto,
   UpdateCompanyDto,
+  UpdateContactNotificationPreferenceDto,
 } from './dto/crm.dto';
 import { Prisma } from '@prisma/client';
 import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class CrmService {
+  private readonly logger = new Logger(CrmService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
@@ -91,14 +95,21 @@ export class CrmService {
       },
     });
 
-    await this.dispatchContactActivity({
+    await this.emitContactActivity({
       organizationId: user.organizationId,
-      actor: user,
       contactId: created.id,
-      contactEmail: created.email,
-      contactName: created.fullName || created.name || created.email,
       activity: 'created',
+      actorUserId: user.sub,
       preferredUserId: created.assignedToUserId ?? undefined,
+      recipientUserIds: [user.sub, created.assignedToUserId ?? undefined].filter(
+        (recipientId): recipientId is string => Boolean(recipientId),
+      ),
+      contact: {
+        id: created.id,
+        email: created.email,
+        name: created.name,
+        fullName: created.fullName,
+      },
     });
 
     return created;
@@ -239,14 +250,21 @@ export class CrmService {
       },
     });
 
-    await this.dispatchContactActivity({
+    await this.emitContactActivity({
       organizationId: user.organizationId,
-      actor: user,
       contactId: updated.id,
-      contactEmail: updated.email,
-      contactName: updated.fullName || updated.name || updated.email,
       activity: 'updated',
+      actorUserId: user.sub,
       preferredUserId: updated.assignedToUserId ?? undefined,
+      recipientUserIds: [user.sub, updated.assignedToUserId ?? undefined].filter(
+        (recipientId): recipientId is string => Boolean(recipientId),
+      ),
+      contact: {
+        id: updated.id,
+        email: updated.email,
+        name: updated.name,
+        fullName: updated.fullName,
+      },
     });
 
     return updated;
@@ -261,6 +279,155 @@ export class CrmService {
       where: { id },
       data: { deletedAt: new Date() },
     });
+  }
+
+  async getContactNotificationPreference(contactId: string, user: JwtUser) {
+    const contact = await this.prisma.contact.findFirst({
+      where: {
+        id: contactId,
+        organizationId: user.organizationId,
+        deletedAt: null,
+      },
+      select: { id: true },
+    });
+    if (!contact) {
+      throw new NotFoundException('Contact not found');
+    }
+
+    const [contactPref, typePref] = await Promise.all([
+      this.prisma.contactNotificationPreference.findUnique({
+        where: {
+          userId_contactId_notificationType: {
+            userId: user.sub,
+            contactId,
+            notificationType: 'contact_activity',
+          },
+        },
+      }),
+      this.prisma.notificationPreference.findUnique({
+        where: {
+          userId_notificationType: {
+            userId: user.sub,
+            notificationType: 'contact_activity',
+          },
+        },
+        select: {
+          enabled: true,
+          inApp: true,
+          email: true,
+          push: true,
+          desktop: true,
+        },
+      }),
+    ]);
+
+    return {
+      contactId,
+      notificationType: 'contact_activity',
+      hasOverride: Boolean(contactPref),
+      enabled: contactPref?.enabled ?? typePref?.enabled ?? true,
+      channels: {
+        in_app: contactPref?.inApp ?? typePref?.inApp ?? true,
+        email: contactPref?.email ?? typePref?.email ?? true,
+        push: contactPref?.push ?? typePref?.push ?? false,
+        desktop: contactPref?.desktop ?? typePref?.desktop ?? false,
+      },
+    };
+  }
+
+  async updateContactNotificationPreference(
+    contactId: string,
+    dto: UpdateContactNotificationPreferenceDto,
+    user: JwtUser,
+  ) {
+    const contact = await this.prisma.contact.findFirst({
+      where: {
+        id: contactId,
+        organizationId: user.organizationId,
+        deletedAt: null,
+      },
+      select: { id: true },
+    });
+    if (!contact) {
+      throw new NotFoundException('Contact not found');
+    }
+
+    const [existing, fallback] = await Promise.all([
+      this.prisma.contactNotificationPreference.findUnique({
+        where: {
+          userId_contactId_notificationType: {
+            userId: user.sub,
+            contactId,
+            notificationType: 'contact_activity',
+          },
+        },
+      }),
+      this.prisma.notificationPreference.findUnique({
+        where: {
+          userId_notificationType: {
+            userId: user.sub,
+            notificationType: 'contact_activity',
+          },
+        },
+        select: {
+          enabled: true,
+          inApp: true,
+          email: true,
+          push: true,
+          desktop: true,
+        },
+      }),
+    ]);
+
+    const nextEnabled =
+      dto.enabled ?? existing?.enabled ?? fallback?.enabled ?? true;
+    const nextInApp =
+      dto.inApp ?? dto.in_app ?? existing?.inApp ?? fallback?.inApp ?? true;
+    const nextEmail = dto.email ?? existing?.email ?? fallback?.email ?? true;
+    const nextPush = dto.push ?? existing?.push ?? fallback?.push ?? false;
+    const nextDesktop =
+      dto.desktop ?? existing?.desktop ?? fallback?.desktop ?? false;
+
+    const saved = await this.prisma.contactNotificationPreference.upsert({
+      where: {
+        userId_contactId_notificationType: {
+          userId: user.sub,
+          contactId,
+          notificationType: 'contact_activity',
+        },
+      },
+      create: {
+        userId: user.sub,
+        organizationId: user.organizationId,
+        contactId,
+        notificationType: 'contact_activity',
+        enabled: nextEnabled,
+        inApp: nextInApp,
+        email: nextEmail,
+        push: nextPush,
+        desktop: nextDesktop,
+      },
+      update: {
+        enabled: nextEnabled,
+        inApp: nextInApp,
+        email: nextEmail,
+        push: nextPush,
+        desktop: nextDesktop,
+      },
+    });
+
+    return {
+      contactId,
+      notificationType: 'contact_activity',
+      hasOverride: true,
+      enabled: saved.enabled,
+      channels: {
+        in_app: saved.inApp,
+        email: saved.email,
+        push: saved.push,
+        desktop: saved.desktop,
+      },
+    };
   }
 
   async listCompanies(user: JwtUser) {
@@ -580,20 +747,68 @@ export class CrmService {
     return Array.from(new Set(accesses.map((entry) => entry.mailboxId)));
   }
 
-  private async dispatchContactActivity(params: {
+  async emitContactActivity(params: {
     organizationId: string;
-    actor: JwtUser;
     contactId: string;
-    contactEmail: string;
-    contactName: string;
-    activity: 'created' | 'updated';
+    activity:
+      | 'created'
+      | 'updated'
+      | 'email_received'
+      | 'email_sent'
+      | 'thread_updated';
+    actorUserId?: string;
+    threadId?: string;
+    mailboxId?: string;
+    messageId?: string;
     preferredUserId?: string;
+    recipientUserIds?: string[];
+    contact?: {
+      id: string;
+      email: string;
+      name: string | null;
+      fullName: string | null;
+    };
   }) {
-    const recipients = new Set<string>();
-    recipients.add(params.actor.sub);
+    const contact =
+      params.contact ??
+      (await this.prisma.contact.findFirst({
+        where: {
+          id: params.contactId,
+          organizationId: params.organizationId,
+          deletedAt: null,
+        },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          fullName: true,
+        },
+      }));
+    if (!contact) {
+      return;
+    }
+
+    const recipients = new Set<string>(params.recipientUserIds ?? []);
+    if (recipients.size === 0) {
+      const users = await this.prisma.user.findMany({
+        where: {
+          organizationId: params.organizationId,
+          deletedAt: null,
+          isActive: true,
+        },
+        select: { id: true },
+      });
+      users.forEach((entry) => recipients.add(entry.id));
+    }
+    if (params.actorUserId) {
+      recipients.add(params.actorUserId);
+    }
     if (params.preferredUserId) {
       recipients.add(params.preferredUserId);
     }
+
+    const label = this.contactActivityLabel(params.activity);
+    const contactName = contact.fullName || contact.name || contact.email;
 
     await Promise.all(
       [...recipients].map((recipientId) =>
@@ -602,17 +817,52 @@ export class CrmService {
             userId: recipientId,
             organizationId: params.organizationId,
             type: 'contact_activity',
-            title: `Contact ${params.activity}`,
-            message: `${params.contactName} (${params.contactEmail}) was ${params.activity}`,
-            resourceId: params.contactId,
+            title: `Contact ${label.title}`,
+            message: `${contactName} (${contact.email}) ${label.messageSuffix}`,
+            resourceId: contact.id,
             data: {
-              contactId: params.contactId,
+              contactId: contact.id,
               activity: params.activity,
-              actorUserId: params.actor.sub,
+              actorUserId: params.actorUserId ?? null,
+              threadId: params.threadId ?? null,
+              mailboxId: params.mailboxId ?? null,
+              messageId: params.messageId ?? null,
             },
           })
-          .catch(() => undefined),
+          .catch((error) => {
+            this.logger.warn(
+              `[crm] Failed to dispatch contact_activity contact=${contact.id} recipient=${recipientId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }),
       ),
     );
+  }
+
+  private contactActivityLabel(activity: string): {
+    title: string;
+    messageSuffix: string;
+  } {
+    switch (activity) {
+      case 'created':
+        return { title: 'created', messageSuffix: 'was created' };
+      case 'updated':
+        return { title: 'updated', messageSuffix: 'was updated' };
+      case 'email_received':
+        return { title: 'email received', messageSuffix: 'sent a new email' };
+      case 'email_sent':
+        return { title: 'email sent', messageSuffix: 'received an email reply' };
+      case 'thread_updated':
+        return {
+          title: 'thread updated',
+          messageSuffix: 'has an updated thread activity',
+        };
+      default:
+        return {
+          title: 'activity updated',
+          messageSuffix: 'has new activity',
+        };
+    }
   }
 }
