@@ -15,7 +15,7 @@ type Plan = {
 const plans: Plan[] = [
     {
         name: 'Starter',
-        price: '$19',
+        price: '€24.99',
         cadence: '/month',
         description: 'Core inbox workflows for growing support teams.',
         features: [
@@ -29,7 +29,7 @@ const plans: Plan[] = [
     },
     {
         name: 'Professional',
-        price: '$39',
+        price: '€29.99',
         cadence: '/month',
         description: 'Advanced operations for high-volume customer support.',
         features: [

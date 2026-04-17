@@ -11,7 +11,7 @@ export function NotificationsSkeleton() {
   });
 
   return (
-    <div className="divide-y divide-gray-100 dark:divide-gray-800">
+    <div className="divide-y divide-slate-100">
       {Array.from({ length: rowCount }, (_, i) => (
         <div key={i} className="animate-pulse flex items-start gap-3 px-4 py-3">
           <SkeletonAvatar className="h-8 w-8 mt-0.5" />

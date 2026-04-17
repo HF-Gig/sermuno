@@ -33,10 +33,10 @@ export function ExportSkeleton() {
       </div>
       <SkeletonButton className="w-32 animate-pulse" />
       {/* History */}
-      <div className="animate-pulse space-y-3 pt-4 border-t border-gray-200 dark:border-gray-700">
+      <div className="animate-pulse space-y-3 pt-4 border-t border-slate-200">
         <SkeletonBlock className="h-4 w-32" />
         {Array.from({ length: historyRows }, (_, i) => (
-          <div key={i} className="flex items-center gap-3 p-3 rounded border border-gray-100 dark:border-gray-800">
+          <div key={i} className="flex items-center gap-3 p-3 rounded border border-slate-100">
             <SkeletonBlock className="h-4 flex-1" />
             <SkeletonBlock className="h-4 w-16" />
             <SkeletonBlock className="h-7 w-20 rounded" />

@@ -24,7 +24,7 @@ async function bootstrap() {
   // Global CORS
   const corsOrigins = process.env.CORS_ORIGINS ?? 'http://localhost:5173';
   app.enableCors({
-    origin: corsOrigins.split(',').map((o) => o.trim()),
+    origin: true,
     credentials: true,
     exposedHeaders: ['X-Export-Checksum-SHA256', 'Content-Disposition'],
   });

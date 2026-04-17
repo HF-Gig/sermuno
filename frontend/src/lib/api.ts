@@ -33,7 +33,8 @@ const emitApiError = (status: number | undefined, message: string) => {
 };
 
 const api = axios.create({
-    baseURL: import.meta.env.VITE_API_URL || 'http://localhost:3000',
+    //@ts-ignore
+    baseURL: import.meta.env.VITE_API_URL || (import.meta.env.DEV ? '/api' : ''),
     headers: {
         'Content-Type': 'application/json',
     },
@@ -128,6 +129,7 @@ api.interceptors.response.use(
 
 export default api;
 
+//@ts-ignore
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 /**

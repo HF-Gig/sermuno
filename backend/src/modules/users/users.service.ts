@@ -17,9 +17,9 @@ import * as crypto from 'crypto';
 import { UserRole } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { ConfigService } from '@nestjs/config';
-import * as nodemailer from 'nodemailer';
 import { AuditService } from '../audit/audit.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
+import { MailService } from '../mail/mail.service';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
 
 type UserStatus = 'active' | 'inactive' | 'invited' | 'deleted';
@@ -38,6 +38,7 @@ export class UsersService {
     private readonly config: ConfigService,
     private readonly auditService: AuditService,
     private readonly featureFlags: FeatureFlagsService,
+    private readonly mailService: MailService,
   ) {}
 
   // ─── List users ────────────────────────────────────────────────────────────
@@ -478,63 +479,7 @@ export class UsersService {
     fullName?: string;
     role: string;
   }): Promise<boolean> {
-    if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
-      this.logger.warn(
-        `[users] DISABLE_SMTP_SEND active; skipped invite email recipient=${input.email}`,
-      );
-      return false;
-    }
-
-    const host = this.config.get<string>('smtp.host') ?? '';
-    const from = this.config.get<string>('smtp.from') ?? '';
-    const port = this.config.get<number>('smtp.port') ?? 587;
-    const user = this.config.get<string>('smtp.user') ?? '';
-    const pass = this.config.get<string>('smtp.pass') ?? '';
-
-    if (!host || !from) {
-      this.logger.warn(
-        `SMTP is not configured (SMTP_HOST/SMTP_FROM). Invite email skipped for ${input.email}.`,
-      );
-      return false;
-    }
-
-    const frontendUrl =
-      this.config.get<string>('frontend.url') ?? 'http://localhost:5173';
-    const inviteUrl = `${frontendUrl}/invite/${encodeURIComponent(input.token)}`;
-
-    const transporter = nodemailer.createTransport({
-      host,
-      port,
-      secure: port === 465,
-      ...(user && pass ? { auth: { user, pass } } : {}),
-    });
-
-    const safeName =
-      input.fullName && input.fullName.trim().length > 0
-        ? input.fullName
-        : input.email;
-
-    try {
-      await transporter.sendMail({
-        from,
-        to: input.email,
-        subject: `Invitation to join ${input.organizationName} on Sermuno`,
-        html: `
-          <p>Hello ${safeName},</p>
-          <p>${input.inviterName} invited you to join <strong>${input.organizationName}</strong> as <strong>${input.role}</strong>.</p>
-          <p><a href="${inviteUrl}">Accept your invitation</a></p>
-          <p>This invite expires in 7 days.</p>
-        `,
-        text: `Hello ${safeName},\n\n${input.inviterName} invited you to join ${input.organizationName} as ${input.role}.\n\nAccept your invitation: ${inviteUrl}\n\nThis invite expires in 7 days.`,
-      });
-      return true;
-    } catch (error) {
-      this.logger.error(
-        `Failed to send invite email to ${input.email}`,
-        error as Error,
-      );
-      return false;
-    }
+    return this.mailService.sendInviteEmail(input);
   }
 
   // ─── Update own profile ───────────────────────────────────────────────────

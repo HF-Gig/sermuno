@@ -1,6 +1,6 @@
 import React from 'react';
 
-interface SkeletonProps {
+interface SkeletonProps extends React.HTMLAttributes<HTMLDivElement> {
   className?: string;
 }
 
@@ -61,15 +61,16 @@ export const computeAdaptiveSkeletonGridItems = (options: AdaptiveSkeletonGridOp
   return rows * columns;
 };
 
-export function InlineSkeleton({ className = '' }: SkeletonProps) {
-  return <span className={`inline-block animate-pulse rounded bg-[var(--color-background)] ${className}`} />;
+export function InlineSkeleton({ className = '', ...props }: SkeletonProps) {
+  return <span className={`inline-block animate-pulse rounded bg-slate-50 ${className}`} {...props} />;
 }
 
 // Base shimmer block
-export function SkeletonBlock({ className = '' }: SkeletonProps) {
+export function SkeletonBlock({ className = '', ...props }: SkeletonProps) {
   return (
     <div
-      className={`animate-pulse bg-gray-200 dark:bg-gray-700 rounded ${className}`}
+      className={`animate-pulse bg-slate-100 rounded ${className}`}
+      {...props}
     />
   );
 }
@@ -110,7 +111,7 @@ export function SkeletonRow({ cols }: { cols: number }) {
 // Card
 export function SkeletonCard({ className = '' }: SkeletonProps) {
   return (
-    <div className={`animate-pulse rounded-lg border border-gray-200 dark:border-gray-700 p-4 space-y-3 ${className}`}>
+    <div className={`animate-pulse rounded-lg border border-slate-100 p-4 space-y-3 ${className}`}>
       <SkeletonBlock className="h-4 w-1/2" />
       <SkeletonBlock className="h-8 w-3/4" />
       <SkeletonBlock className="h-3 w-full" />
@@ -232,13 +233,13 @@ export function PersonRowSkeleton({
 
   return (
     <div className={`flex items-center gap-3 ${rowPadding} ${className}`.trim()}>
-      <SkeletonBlock className={`${avatarSize} shrink-0 rounded-full bg-slate-200`} />
+      <SkeletonBlock className={`${avatarSize} shrink-0 rounded-full bg-slate-100/80`} />
       <div className="min-w-0 flex-1 space-y-1.5">
         <SkeletonBlock
-          className={`${titleHeight} rounded bg-slate-200 ${skeletonWidthFromPattern(index, ['w-3/5', 'w-2/3', 'w-1/2'])}`}
+          className={`${titleHeight} rounded bg-slate-100/80 ${skeletonWidthFromPattern(index, ['w-3/5', 'w-2/3', 'w-1/2'])}`}
         />
         <SkeletonBlock
-          className={`${subtitleHeight} rounded bg-slate-200 ${skeletonWidthFromPattern(index, ['w-4/5', 'w-2/3', 'w-3/4'])}`}
+          className={`${subtitleHeight} rounded bg-slate-100/80 ${skeletonWidthFromPattern(index, ['w-4/5', 'w-2/3', 'w-3/4'])}`}
         />
       </div>
     </div>

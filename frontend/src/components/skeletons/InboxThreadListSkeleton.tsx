@@ -43,7 +43,7 @@ export function InboxThreadListSkeleton({
     });
 
   return (
-    <div className="divide-y divide-gray-100 dark:divide-gray-800">
+    <div className="divide-y divide-slate-100">
       {Array.from({ length: resolvedRows }).map((_, i) => (
         <div key={i} className="animate-pulse flex items-start gap-3 px-4 py-3">
           <SkeletonBlock className="h-8 w-8 rounded-full shrink-0 mt-1" />

@@ -1,0 +1,6 @@
+{
+  "nixpacks": {
+    "node": "20"
+  },
+  "start": "npm run start"
+}

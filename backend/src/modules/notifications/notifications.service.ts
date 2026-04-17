@@ -76,7 +76,7 @@ const NOTIFICATION_TYPE_DEFS: Record<
     config: { ruleIds: [] },
   },
   contact_activity: {
-    channels: { in_app: true, email: true, push: false, desktop: false },
+    channels: { in_app: true, email: false, push: false, desktop: false },
     config: {},
   },
   daily_digest: {

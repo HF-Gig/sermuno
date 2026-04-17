@@ -5,9 +5,10 @@ import { InvitesController } from './invites.controller';
 import { PrismaService } from '../../database/prisma.service';
 import { AuditModule } from '../audit/audit.module';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { MailModule } from '../mail/mail.module';
 
 @Module({
-  imports: [AuditModule],
+  imports: [AuditModule, MailModule],
   providers: [UsersService, PrismaService, FeatureFlagsService],
   controllers: [UsersController, InvitesController],
   exports: [UsersService],

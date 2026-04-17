@@ -13,11 +13,7 @@ import { PrismaService } from '../../database/prisma.service';
 import * as bcrypt from 'bcryptjs';
 import * as crypto from 'crypto';
 import { Queue } from 'bullmq';
-import {
-  generateSecret as otpGenerateSecret,
-  generateURI as otpGenerateURI,
-  verifySync as otpVerifySync,
-} from 'otplib';
+import * as speakeasy from 'speakeasy';
 import {
   RegisterDto,
   LoginDto,
@@ -35,6 +31,7 @@ import { UserRole } from '@prisma/client';
 import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
 import type { EmailSyncJobData } from '../../jobs/processors/email-sync.processor';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { MailService } from '../mail/mail.service';
 
 // Permissions per role
 const ROLE_PERMISSIONS: Record<string, string[]> = {
@@ -173,6 +170,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
     private readonly featureFlags: FeatureFlagsService,
+    private readonly mailService: MailService,
     @InjectQueue(EMAIL_SYNC_QUEUE)
     private readonly emailSyncQueue: Queue<EmailSyncJobData>,
   ) {}
@@ -404,10 +402,25 @@ export class AuthService {
       userAgent,
     );
 
+    // Generate verification token
+    const verificationToken = crypto.randomBytes(32).toString('hex');
+    const verificationExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+
     await this.prisma.user.update({
       where: { id: user.id },
-      data: { lastLogin: new Date() },
+      data: {
+        lastLogin: new Date(),
+        inviteToken: verificationToken,
+        inviteExpiresAt: verificationExpiresAt,
+      },
     });
+
+    // Send verification email
+    await this.mailService.sendVerificationEmail(
+      dto.email,
+      verificationToken,
+      dto.fullName,
+    );
 
     return {
       accessToken,
@@ -763,7 +776,12 @@ export class AuthService {
       data: { inviteToken: token, inviteExpiresAt: expiresAt },
     });
 
-    // TODO: enqueue password reset email via BullMQ (Phase 2)
+    // Send password reset email
+    await this.mailService.sendPasswordResetEmail(
+      user.email,
+      token,
+      user.fullName,
+    );
   }
 
   async resetPassword(dto: ResetPasswordDto): Promise<void> {
@@ -888,11 +906,13 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException('User not found');
 
-    const secret = otpGenerateSecret();
-    const otpauthUrl = otpGenerateURI({
-      issuer: 'Sermuno',
-      label: user.email,
+    const secretObj = speakeasy.generateSecret({ length: 20 });
+    const secret = secretObj.base32;
+    const otpauthUrl = speakeasy.otpauthURL({
       secret,
+      label: user.email,
+      issuer: 'Sermuno',
+      encoding: 'base32',
     });
 
     // Store encrypted secret temporarily (not yet enabled)
@@ -916,7 +936,11 @@ export class AuthService {
       );
 
     const secret = this.decrypt(user.mfaSecret);
-    const valid = otpVerifySync({ token: dto.totp, secret });
+    const valid = speakeasy.totp.verify({
+      secret,
+      encoding: 'base32',
+      token: dto.totp,
+    });
     if (!valid) throw new BadRequestException('Invalid TOTP code');
 
     await this.prisma.user.update({
@@ -931,7 +955,11 @@ export class AuthService {
       throw new BadRequestException('MFA is not enabled');
 
     const secret = this.decrypt(user.mfaSecret!);
-    const valid = otpVerifySync({ token: dto.totp, secret });
+    const valid = speakeasy.totp.verify({
+      secret,
+      encoding: 'base32',
+      token: dto.totp,
+    });
     if (!valid) throw new BadRequestException('Invalid TOTP code');
 
     await this.prisma.user.update({
@@ -966,7 +994,11 @@ export class AuthService {
       throw new UnauthorizedException('MFA not configured');
 
     const secret = this.decrypt(user.mfaSecret);
-    const valid = otpVerifySync({ token: dto.totp, secret });
+    const valid = speakeasy.totp.verify({
+      secret,
+      encoding: 'base32',
+      token: dto.totp,
+    });
     if (!valid) throw new BadRequestException('Invalid TOTP code');
 
     const updated = await this.prisma.user.update({

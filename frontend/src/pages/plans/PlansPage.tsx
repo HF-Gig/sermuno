@@ -9,6 +9,7 @@ import { useAdaptiveGridCount, useAdaptiveRows } from '../../hooks/useAdaptiveCo
 const PlansPage = () => {
     const { t } = useTranslation();
     const navigate = useNavigate();
+    // @ts-ignore
     const contactEmail = import.meta.env.VITE_CONTACT_EMAIL;
     const [currentPlan, setCurrentPlan] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
@@ -55,9 +56,9 @@ const PlansPage = () => {
 
     const plans = [
         { id: 'trial', name: t('plan_trial'), price: '$0', description: t('trial_plan_description'), features: [t('max_1_user'), t('max_1_mailbox'), t('1gb_storage'), t('standard_support')], cta: t('get_started'), popular: false },
-        { id: 'starter', name: t('plan_starter'), price: '$10', description: t('starter_plan_description'), features: [t('max_5_users'), t('max_3_mailboxes'), t('10gb_storage'), t('standard_support')], cta: t('get_started'), popular: false },
-        { id: 'professional', name: 'Professional', price: '$20', description: t('pro_plan_description'), features: [t('unlimited_users'), t('unlimited_mailboxes'), t('100gb_storage'), t('priority_24_7_support'), t('advanced_analytics'), t('custom_branding')], cta: t('get_started'), popular: true },
-        { id: 'enterprise', name: t('plan_enterprise'), price: t('custom'), description: t('enterprise_plan_description'), features: [t('custom_user_mailbox_limit'), t('unlimited_storage'), t('priority_24_7_support'), t('dedicated_account_manager'), t('sso_saml'), t('custom_branding')], cta: t('contact_sales'), popular: false },
+        { id: 'starter', name: t('plan_starter'), price: '€24.99', description: t('starter_plan_description'), features: [t('max_5_users'), t('max_3_mailboxes'), t('10gb_storage'), t('standard_support')], cta: t('get_started'), popular: false },
+        { id: 'professional', name: 'Professional', price: '€29.99', description: t('pro_plan_description'), features: [t('unlimited_users'), t('unlimited_mailboxes'), t('100gb_storage'), t('priority_24_7_support'), t('advanced_analytics'), t('custom_branding')], cta: t('get_started'), popular: true },
+        // { id: 'enterprise', name: t('plan_enterprise'), price: t('custom'), description: t('enterprise_plan_description'), features: [t('custom_user_mailbox_limit'), t('unlimited_storage'), t('priority_24_7_support'), t('dedicated_account_manager'), t('sso_saml'), t('custom_branding')], cta: t('contact_sales'), popular: false },
     ];
 
     const normalizedCurrentPlan = useMemo(() => currentPlan, [currentPlan]);

@@ -20,7 +20,7 @@ export function ContactsSkeleton() {
       {/* Contact rows */}
       <div className="space-y-2">
         {Array.from({ length: rowCount }, (_, i) => (
-          <div key={i} className="animate-pulse flex items-center gap-3 p-3 rounded-lg border border-gray-100 dark:border-gray-800">
+          <div key={i} className="animate-pulse flex items-center gap-3 p-3 rounded-lg border border-slate-100">
             <SkeletonAvatar className="h-9 w-9" />
             <div className="flex-1 space-y-1">
               <SkeletonBlock className={`h-3.5 ${i % 2 === 0 ? 'w-36' : 'w-28'}`} />

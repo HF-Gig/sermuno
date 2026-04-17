@@ -1,5 +1,6 @@
 import React from 'react';
 import { useAdaptiveRows } from '../../hooks/useAdaptiveCount';
+import { SkeletonBlock } from '../ui/Skeleton';
 
 export function DashboardSkeleton() {
   const statsCards = useAdaptiveRows({
@@ -33,55 +34,55 @@ export function DashboardSkeleton() {
       {/* Row 1: four stat cards */}
       <div className="grid grid-cols-1 min-[426px]:grid-cols-2 min-[787px]:grid-cols-4 gap-4">
         {Array.from({ length: statsCards }, (_, card) => (
-          <div key={card} className="rounded-xl border border-[var(--color-card-border)] bg-white px-5 py-4 shadow-[var(--shadow-sm)]">
+          <div key={card} className="rounded-xl border border-(--color-card-border) bg-white px-5 py-4 shadow-(--shadow-sm)">
             <div className="flex items-center gap-2 mb-2">
-              <div className="w-5 h-5 rounded-md bg-gray-200 dark:bg-gray-700 animate-pulse" />
-              <div className="h-3 w-28 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+              <SkeletonBlock className="w-5 h-5 rounded-md" />
+              <SkeletonBlock className="h-3 w-28 rounded" />
             </div>
-            <div className="h-8 w-14 rounded bg-gray-200 dark:bg-gray-700 animate-pulse mb-2" />
-            <div className="h-3 w-24 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+            <SkeletonBlock className="h-8 w-14 rounded mb-2" />
+            <SkeletonBlock className="h-3 w-24 rounded" />
           </div>
         ))}
       </div>
 
       {/* Row 2: threads + activity */}
       <div className="grid grid-cols-1 gap-4 min-[787px]:grid-cols-[minmax(0,1fr)_360px] min-[1440px]:grid-cols-[minmax(0,1fr)_390px]">
-        <div className="rounded-xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-          <div className="px-5 py-3 border-b border-[var(--color-card-border)] flex items-center justify-between">
-            <div className="h-4 w-36 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-            <div className="h-3 w-12 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+        <div className="rounded-xl border border-(--color-card-border) bg-white shadow-(--shadow-sm) overflow-hidden">
+          <div className="px-5 py-3 border-b border-(--color-card-border) flex items-center justify-between">
+            <SkeletonBlock className="h-4 w-36 rounded" />
+            <SkeletonBlock className="h-3 w-12 rounded" />
           </div>
 
-          <div className="h-[308px] px-5 py-3">
+          <div className="h-77 px-5 py-3">
             <div className="grid grid-cols-5 gap-3 mb-3">
               {[1, 2, 3, 4, 5].map((h) => (
-                <div key={h} className="h-3 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+                <SkeletonBlock key={h} className="h-3 rounded" />
               ))}
             </div>
 
             <div className="space-y-4">
               {Array.from({ length: tableRows }, (_, r) => (
                 <div key={r} className="grid grid-cols-5 gap-3 items-center">
-                  <div className="h-3 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-                  <div className="h-3 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-                  <div className="h-3 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-                  <div className="h-3 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-                  <div className="h-3 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+                  <SkeletonBlock className="h-3 rounded" />
+                  <SkeletonBlock className="h-3 rounded" />
+                  <SkeletonBlock className="h-3 rounded" />
+                  <SkeletonBlock className="h-3 rounded" />
+                  <SkeletonBlock className="h-3 rounded" />
                 </div>
               ))}
             </div>
           </div>
         </div>
 
-        <div className="rounded-xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] px-4 py-3">
-          <div className="h-4 w-28 rounded bg-gray-200 dark:bg-gray-700 animate-pulse mb-4" />
+        <div className="rounded-xl border border-(--color-card-border) bg-white shadow-(--shadow-sm) px-4 py-3">
+          <SkeletonBlock className="h-4 w-28 rounded mb-4" />
           <div className="space-y-4">
             {Array.from({ length: activityRows }, (_, row) => (
               <div key={row} className="flex items-start gap-2.5">
-                <div className="w-4 h-4 rounded-full bg-gray-200 dark:bg-gray-700 animate-pulse mt-0.5" />
+                <SkeletonBlock className="w-4 h-4 rounded-full mt-0.5" />
                 <div className="flex-1">
-                  <div className="h-3 w-[85%] rounded bg-gray-200 dark:bg-gray-700 animate-pulse mb-1.5" />
-                  <div className="h-3 w-[45%] rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+                  <SkeletonBlock className="h-3 w-[85%] rounded mb-1.5" />
+                  <SkeletonBlock className="h-3 w-[45%] rounded" />
                 </div>
               </div>
             ))}
@@ -90,12 +91,12 @@ export function DashboardSkeleton() {
       </div>
 
       {/* Row 3: SLA & Performance */}
-      <div className="rounded-xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
-        <div className="px-4 py-3 border-b border-[var(--color-card-border)] flex items-center justify-between">
-          <div className="h-4 w-36 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
+      <div className="rounded-xl border border-(--color-card-border) bg-white shadow-(--shadow-sm) overflow-hidden">
+        <div className="px-4 py-3 border-b border-(--color-card-border) flex items-center justify-between">
+          <SkeletonBlock className="h-4 w-36 rounded" />
           <div className="flex gap-1">
             {Array.from({ length: 3 }, (_, pill) => (
-              <div key={pill} className="h-5 w-10 rounded-md bg-gray-200 dark:bg-gray-700 animate-pulse" />
+              <SkeletonBlock key={pill} className="h-5 w-10 rounded-md" />
             ))}
           </div>
         </div>
@@ -104,19 +105,19 @@ export function DashboardSkeleton() {
           <div className="flex items-center gap-6 mb-4">
             {Array.from({ length: 3 }, (_, group) => (
               <div key={group} className="flex items-end gap-2">
-                <div className="h-6 w-10 rounded bg-gray-200 dark:bg-gray-700 animate-pulse" />
-                <div className="h-3 w-16 rounded bg-gray-200 dark:bg-gray-700 animate-pulse mb-0.5" />
+                <SkeletonBlock className="h-6 w-10 rounded" />
+                <SkeletonBlock className="h-3 w-16 rounded mb-0.5" />
               </div>
             ))}
           </div>
 
-          <div className="h-[220px] flex items-end gap-2 px-1">
+          <div className="h-55 flex items-end gap-2 px-1">
             {Array.from({ length: chartBars }, (_, idx) => {
               const height = 22 + ((idx * 11) % 56);
               return (
-              <div
+              <SkeletonBlock
                 key={idx}
-                className="flex-1 rounded-t bg-gray-200 dark:bg-gray-700 animate-pulse"
+                className="flex-1 rounded-t"
                 style={{ height: `${height}%` }}
               />
               );

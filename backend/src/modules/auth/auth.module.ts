@@ -9,12 +9,14 @@ import { LocalStrategy } from './strategies/local.strategy';
 import { PrismaService } from '../../database/prisma.service';
 import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { MailModule } from '../mail/mail.module';
 
 @Module({
   imports: [
     PassportModule,
     JwtModule.register({}), // secrets provided per-call in service
     BullModule.registerQueue({ name: EMAIL_SYNC_QUEUE }),
+    MailModule,
   ],
   providers: [
     AuthService,

@@ -788,8 +788,9 @@ export class CrmService {
       return;
     }
 
+    const noisyActivities = ['email_received', 'email_sent', 'thread_updated'];
     const recipients = new Set<string>(params.recipientUserIds ?? []);
-    if (recipients.size === 0) {
+    if (recipients.size === 0 && !noisyActivities.includes(params.activity)) {
       const users = await this.prisma.user.findMany({
         where: {
           organizationId: params.organizationId,

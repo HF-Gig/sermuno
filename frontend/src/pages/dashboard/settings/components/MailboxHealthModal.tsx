@@ -26,11 +26,11 @@ interface MailboxHealthModalProps {
     } | null;
 }
 
-const healthMeta: Record<HealthStatus, { icon: React.ReactNode; label: string; color: string; bg: string; border: string }> = {
-    healthy:  { icon: <CheckCircle2  className="w-5 h-5" />, label: 'Healthy',  color: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200' },
-    degraded: { icon: <AlertTriangle className="w-5 h-5" />, label: 'Degraded', color: 'text-amber-600',   bg: 'bg-amber-50',   border: 'border-amber-200'   },
-    failed:   { icon: <XCircle       className="w-5 h-5" />, label: 'Failed',   color: 'text-red-600',     bg: 'bg-red-50',     border: 'border-red-200'     },
-    unknown:  { icon: <HelpCircle    className="w-5 h-5" />, label: 'Unknown',  color: 'text-gray-500',    bg: 'bg-gray-50',    border: 'border-gray-200'    },
+const healthMeta: Record<HealthStatus, { Icon: React.FC<any>; label: string; color: string; bg: string; border: string }> = {
+    healthy:  { Icon: CheckCircle2,  label: 'Healthy',  color: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200' },
+    degraded: { Icon: AlertTriangle, label: 'Degraded', color: 'text-amber-600',   bg: 'bg-amber-50',   border: 'border-amber-200'   },
+    failed:   { Icon: XCircle,       label: 'Failed',   color: 'text-red-600',     bg: 'bg-red-50',     border: 'border-red-200'     },
+    unknown:  { Icon: HelpCircle,    label: 'Unknown',  color: 'text-gray-500',    bg: 'bg-gray-50',    border: 'border-gray-200'    },
 };
 
 const syncMeta: Record<SyncStatus, { label: string; color: string; dotColor: string }> = {
@@ -73,7 +73,7 @@ const MailboxHealthModal: React.FC<MailboxHealthModalProps> = ({ isOpen, onClose
         <Modal isOpen={isOpen} onClose={onClose} title="Mailbox Health Details" size="md">
             {/* Connection badge row */}
             <div className={`flex items-center gap-3 rounded-lg border p-3 mb-5 ${health.border} ${health.bg}`}>
-                <span className={health.color}>{health.icon}</span>
+                <span className={health.color}><health.Icon className="w-5 h-5" /></span>
                 <div>
                     <p className={`text-sm font-semibold ${health.color}`}>{health.label}</p>
                     <p className="text-xs text-[var(--color-text-muted)]">{mailbox.name} · {mailbox.email || mailbox.imapHost}</p>

@@ -32,6 +32,7 @@ import { ExportImportModule } from './modules/export-import/export-import.module
 import { AttachmentsModule } from './modules/attachments/attachments.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
 import { ScheduledMessagesModule } from './modules/scheduled-messages/scheduled-messages.module';
+import { MailModule } from './modules/mail/mail.module';
 
 @Module({
   imports: [
@@ -73,6 +74,7 @@ import { ScheduledMessagesModule } from './modules/scheduled-messages/scheduled-
     AttachmentsModule,
     FeatureFlagsModule,
     ScheduledMessagesModule,
+    MailModule,
   ],
   controllers: [AppController],
   providers: [

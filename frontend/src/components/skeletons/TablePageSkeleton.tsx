@@ -61,9 +61,9 @@ export function TablePageSkeleton({
         <SkeletonBadge className="h-9 w-20" />
       </div>
       {/* Table */}
-      <div className="rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+      <div className="rounded-lg border border-slate-200 overflow-hidden">
         {/* Table header */}
-        <div className="animate-pulse flex gap-4 px-4 py-3 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+        <div className="animate-pulse flex gap-4 px-4 py-3 bg-slate-50 border-b border-slate-200">
           {Array.from({ length: cols }).map((_, i) => (
             <SkeletonBlock
               key={i}
@@ -73,7 +73,7 @@ export function TablePageSkeleton({
         </div>
         {/* Rows */}
         {Array.from({ length: resolvedRows }).map((_, i) => (
-          <div key={i} className="animate-pulse flex gap-4 px-4 py-3.5 border-b border-gray-100 dark:border-gray-800 last:border-0">
+          <div key={i} className="animate-pulse flex gap-4 px-4 py-3.5 border-b border-slate-100 last:border-0">
             {Array.from({ length: cols }).map((_, j) => (
               <SkeletonBlock
                 key={j}

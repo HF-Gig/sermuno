@@ -13,7 +13,7 @@ export function SettingsSkeleton() {
   return (
     <div className="p-6 space-y-6">
       {/* Tab bar */}
-      <div className="animate-pulse flex gap-1 border-b border-gray-200 dark:border-gray-700 pb-0">
+      <div className="animate-pulse flex gap-1 border-b border-slate-200 pb-0">
         {Array.from({ length: 6 }, (_, i) => (
           <SkeletonBlock key={i} className={`h-9 rounded-t ${skeletonWidthFromPattern(i, ['w-20', 'w-24', 'w-28', 'w-16'])}`} />
         ))}

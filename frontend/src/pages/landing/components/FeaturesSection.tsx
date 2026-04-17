@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState, type MouseEvent } from 'react';
 
 type Feature = {
     key: string;
@@ -52,7 +52,7 @@ const FeaturesSection = () => {
         return () => media.removeEventListener('change', listener);
     }, []);
 
-    const onCardMove = (event: React.MouseEvent<HTMLElement>) => {
+    const onCardMove = (event: MouseEvent<HTMLElement>) => {
         if (isMobile) return;
         const rect = event.currentTarget.getBoundingClientRect();
         const x = event.clientX - rect.left;

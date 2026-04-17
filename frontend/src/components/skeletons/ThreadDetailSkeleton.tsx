@@ -13,7 +13,7 @@ export function ThreadDetailSkeleton() {
   return (
     <div className="flex flex-col h-full">
       {/* Thread header */}
-      <div className="animate-pulse px-5 py-4 border-b border-gray-100 dark:border-gray-800 space-y-2">
+      <div className="animate-pulse px-5 py-4 border-b border-slate-100 space-y-2">
         <SkeletonBlock className="h-5 w-3/4" />
         <div className="flex gap-2">
           <SkeletonBadge />
@@ -38,7 +38,7 @@ export function ThreadDetailSkeleton() {
         ))}
       </div>
       {/* Reply bar placeholder */}
-      <div className="animate-pulse px-4 py-3 border-t border-gray-100 dark:border-gray-800">
+      <div className="animate-pulse px-4 py-3 border-t border-slate-100">
         <SkeletonBlock className="h-9 w-full rounded-lg" />
       </div>
     </div>
