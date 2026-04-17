@@ -1,4 +1,4 @@
-﻿import React from 'react';
+import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { ReactLenis } from 'lenis/react';
 import '../landing/styles.css';
@@ -260,7 +260,7 @@ const TermsContent = () => (
 
 export default function LegalPage() {
     const { pathname } = useLocation();
-    const isPrivacy = pathname === '/privacy';
+    const isPrivacy = pathname === '/privacy-policy' || pathname === '/privacy';
     const title = isPrivacy ? 'Privacy Policy' : 'Terms of Service';
 
     return (

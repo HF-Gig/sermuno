@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import {
     Bar,
     BarChart,
@@ -114,6 +115,7 @@ const badgeStyles: Record<'success' | 'danger' | 'neutral', string> = {
 
 const periodTabs = ['Day', 'Week', 'Month'] as const;
 type Period = (typeof periodTabs)[number];
+type DashboardTranslate = TFunction<'translation', undefined>;
 
 const dayKey = (date: Date): string => {
     return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
@@ -170,7 +172,7 @@ const humanizeAuditAction = (action: string) => {
     return titleCase(tokenized.join(' '));
 };
 
-const slaLabel = (thread: ThreadSummary, t: (key: string, fallback?: string) => string): { text: string; warning: boolean } => {
+const slaLabel = (thread: ThreadSummary, t: DashboardTranslate): { text: string; warning: boolean } => {
     if (thread.slaBreached) return { text: t('dashboard_sla_breached', 'Breached'), warning: true };
     const due = thread.firstResponseDueAt ?? thread.resolutionDueAt;
     if (!due) return { text: t('dashboard_sla_none', 'No SLA'), warning: false };
@@ -417,6 +419,18 @@ const UserDashboard: React.FC = () => {
         return Math.max(top + 1, 8);
     }, [periodData]);
 
+    const dynamicBarSize = useMemo(() => {
+        const points = Math.max(periodData.length, 1);
+        const availableWidth = Math.max(chartSize.width - 32, 0);
+        const rawSize = availableWidth > 0 ? Math.floor(availableWidth / (points * 1.7)) : 0;
+
+        if (period === 'Day') {
+            return Math.max(4, Math.min(8, rawSize || 8));
+        }
+
+        return Math.max(10, Math.min(28, rawSize || 24));
+    }, [chartSize.width, periodData.length, period]);
+
     return (
         <div className="flex w-full flex-col gap-3 min-[787px]:h-full">
             {error && (
@@ -462,11 +476,11 @@ const UserDashboard: React.FC = () => {
                         })}
                     </div>
 
-                    <div className={`grid grid-cols-1 gap-4 min-[787px]:flex-1 min-[787px]:min-h-0 ${showRecentActivity
+                    <div className={`grid grid-cols-1 gap-4 min-[1536px]:gap-3 min-[787px]:flex-1 min-[787px]:min-h-0 max-[1279px]:hidden ${showRecentActivity
                         ? 'min-[787px]:grid-cols-[minmax(0,1fr)_360px] min-[1440px]:grid-cols-[minmax(0,1fr)_390px]'
                         : 'min-[787px]:grid-cols-1'
                         }`}>
-                        <div className="order-1">
+                        <div className="order-1 max-[1535px]:hidden">
                             <div className="bg-white rounded-xl border border-[var(--color-card-border)] shadow-[var(--shadow-sm)] overflow-hidden">
                                 <div className="px-5 py-3 border-b border-[var(--color-card-border)] flex items-center justify-between">
                                     <h3 className="text-sm font-semibold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>
@@ -475,7 +489,7 @@ const UserDashboard: React.FC = () => {
                                     <Link to="/inbox" className="text-[11px] font-medium text-[var(--color-primary)] hover:underline">{t('dashboard_view_all', 'View All')}</Link>
                                 </div>
 
-                                <div className="hidden min-[787px]:block h-[308px]">
+                                <div className="hidden min-[787px]:block h-[210px] min-[1920px]:h-[308px]">
                                     <table className="w-full text-sm table-fixed min-w-[560px]">
                                         <thead>
                                             <tr className="border-b border-[var(--color-card-border)] text-[10px] font-semibold text-[var(--color-text-muted)] uppercase tracking-wider">
@@ -489,7 +503,7 @@ const UserDashboard: React.FC = () => {
                                         <tbody>
                                             {attentionThreads.length === 0 ? (
                                                 <tr>
-                                                    <td colSpan={5} className="text-center align-middle h-[260px] text-xs text-[var(--color-text-muted)]">{t('dashboard_no_opened_threads', 'No opened threads')}</td>
+                                                    <td colSpan={5} className="text-center align-middle h-[162px] min-[1920px]:h-[260px] text-xs text-[var(--color-text-muted)]">{t('dashboard_no_opened_threads', 'No opened threads')}</td>
                                                 </tr>
                                             ) : (
                                                 attentionThreads.map((thread) => {
@@ -564,7 +578,7 @@ const UserDashboard: React.FC = () => {
                         </div>
 
                         {showRecentActivity && (
-                            <div className="order-2 min-[787px]:col-start-2 min-[787px]:row-span-2 min-[787px]:flex min-[787px]:min-h-0 min-[787px]:flex-col">
+                            <div className="order-2 min-[787px]:col-start-2 min-[1536px]:row-span-2 min-[787px]:flex min-[787px]:min-h-0 min-[787px]:flex-col">
                                 <div className="bg-white rounded-xl border border-[var(--color-card-border)] shadow-[var(--shadow-sm)] px-4 py-3 h-full flex flex-col">
                                     <div className="flex items-center justify-between mb-3 shrink-0">
                                         <h3 className="text-sm font-semibold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>
@@ -600,10 +614,10 @@ const UserDashboard: React.FC = () => {
                         )}
 
                         <div className={`min-h-[220px] max-[425px]:min-h-[190px] min-[787px]:flex-1 min-[787px]:min-h-0 ${showRecentActivity
-                            ? 'order-3 min-[787px]:col-start-1 min-[787px]:row-start-2'
+                            ? 'order-1 min-[787px]:col-start-1 min-[1536px]:order-3 min-[1536px]:row-start-2'
                             : 'order-2'
                             }`}>
-                            <div className="bg-white rounded-xl border border-[var(--color-card-border)] shadow-[var(--shadow-sm)] px-4 py-3 h-full flex flex-col">
+                            <div className="bg-white rounded-xl border border-[var(--color-card-border)] shadow-[var(--shadow-sm)] px-4 py-3 h-full flex flex-col overflow-hidden">
                                 <div className="flex items-center justify-between mb-2 shrink-0">
                                     <h3 className="text-sm font-semibold text-[var(--color-text-primary)] flex items-center gap-1.5" style={{ fontFamily: 'var(--font-headline)' }}>
                                         <TrendingUp className="w-4 h-4 text-[var(--color-accent)]" />
@@ -650,13 +664,13 @@ const UserDashboard: React.FC = () => {
                                     </div>
                                 </div>
 
-                                <div ref={chartContainerRef} className="flex-1 min-h-[180px] min-w-0 -ml-2">
+                                <div ref={chartContainerRef} className="flex-1 min-h-[180px] min-w-0 overflow-hidden">
                                     {periodData.length === 0 ? (
                                         <div className="h-full flex items-center justify-center text-xs text-[var(--color-text-muted)]">No chart data</div>
                                     ) : chartSize.width < 16 || chartSize.height < 16 ? (
                                         <div className="h-full flex items-center justify-center text-xs text-[var(--color-text-muted)]">Preparing chart...</div>
                                     ) : (
-                                        <BarChart width={chartSize.width} height={chartSize.height} data={periodData} margin={{ top: 8, right: 12, left: 12, bottom: 20 }}>
+                                        <BarChart width={chartSize.width} height={chartSize.height} data={periodData} margin={{ top: 8, right: 8, left: 8, bottom: 20 }}>
                                                 <CartesianGrid vertical={false} stroke="var(--color-card-border)" strokeDasharray="0" />
                                                 <XAxis
                                                     dataKey="name"
@@ -686,8 +700,10 @@ const UserDashboard: React.FC = () => {
                                                     dataKey="volume"
                                                     fill="#235347"
                                                     radius={[2, 2, 0, 0]}
-                                                    barSize={period === 'Day' ? 8 : 32}
+                                                    barSize={dynamicBarSize}
+                                                    maxBarSize={period === 'Day' ? 8 : 28}
                                                     opacity={0.75}
+                                                    isAnimationActive={false}
                                                 />
                                             </BarChart>
                                     )}

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
 import { ReactLenis } from 'lenis/react';
 import './styles.css';
 
@@ -12,7 +12,6 @@ import {
     PricingSection,
     CTASection,
     Footer,
-    Modals,
     FAQSection,
 } from './components';
 
@@ -35,44 +34,6 @@ class ParallaxLayer {
 }
 
 const LandingPage = () => {
-    const [activeModal, setActiveModal] = useState<string | null>(null);
-
-    useEffect(() => {
-        if (activeModal) {
-            document.documentElement.style.overflow = 'hidden';
-            document.body.style.overflow = 'hidden';
-
-            const preventScroll = (event: Event) => {
-                event.preventDefault();
-            };
-
-            const preventKeys = (event: KeyboardEvent) => {
-                const blocked = ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '];
-                if (blocked.includes(event.key)) event.preventDefault();
-            };
-
-            window.addEventListener('wheel', preventScroll, { passive: false });
-            window.addEventListener('touchmove', preventScroll, { passive: false });
-            window.addEventListener('keydown', preventKeys, { passive: false });
-
-            return () => {
-                window.removeEventListener('wheel', preventScroll);
-                window.removeEventListener('touchmove', preventScroll);
-                window.removeEventListener('keydown', preventKeys);
-                document.documentElement.style.overflow = '';
-                document.body.style.overflow = '';
-            };
-        }
-
-        document.documentElement.style.overflow = '';
-        document.body.style.overflow = '';
-
-        return () => {
-            document.documentElement.style.overflow = '';
-            document.body.style.overflow = '';
-        };
-    }, [activeModal]);
-
     useEffect(() => {
         // Universal scroll reveal - fire once, unobserve immediately.
         const revealObserver = new IntersectionObserver((entries) => {
@@ -109,6 +70,8 @@ const LandingPage = () => {
         return () => {
             revealObserver.disconnect();
             window.removeEventListener('scroll', handleScroll);
+            document.documentElement.style.overflow = '';
+            document.body.style.overflow = '';
         };
     }, []);
 
@@ -134,11 +97,7 @@ const LandingPage = () => {
                 </div>
                 <FAQSection />
                 <CTASection />
-                <Footer onOpenModal={setActiveModal} />
-            </div>
-            {/* Rendered outside landing-wrapper so position:fixed modal escapes contain:paint */}
-            <div className="landing-modal-portal">
-                <Modals activeModal={activeModal} onClose={() => setActiveModal(null)} />
+                <Footer />
             </div>
         </ReactLenis>
     );

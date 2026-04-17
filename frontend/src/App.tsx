@@ -6,6 +6,7 @@ import ForgotPassword from './pages/auth/ForgotPassword';
 import ResetPassword from './pages/auth/ResetPassword';
 import VerifyEmail from './pages/auth/VerifyEmail';
 import AuthCodePage from './pages/auth/AuthCodePage';
+import LegalPage from './pages/legal/LegalPage';
 import OnboardingPage from './pages/auth/OnboardingPage';
 import MfaSetup from './components/MfaSetup';
 import RequireAuth from './components/RequireAuth';
@@ -47,6 +48,9 @@ function App() {
                 <Route path="/reset-password" element={<ResetPassword />} />
                 <Route path="/verify-email" element={<VerifyEmail />} />
                 <Route path="/auth-code" element={<AuthCodePage />} />
+                <Route path="/privacy-policy" element={<LegalPage />} />
+                <Route path="/privacy" element={<Navigate to="/privacy-policy" replace />} />
+                <Route path="/terms" element={<LegalPage />} />
                 <Route path="/onboarding" element={<OnboardingPage />} />
                 <Route path="/accept-invite" element={<AcceptInvite />} />
                 <Route path="/invite/:token" element={<AcceptInvite />} />

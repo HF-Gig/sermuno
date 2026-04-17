@@ -4,11 +4,7 @@ import { useLenis } from 'lenis/react';
 
 const HEADER_OFFSET = 80;
 
-interface FooterProps {
-    onOpenModal: (id: string) => void;
-}
-
-const Footer: React.FC<FooterProps> = ({ onOpenModal }) => {
+const Footer: React.FC = () => {
     const lenis = useLenis();
     const currentYear = new Date().getFullYear();
 
@@ -62,8 +58,8 @@ const Footer: React.FC<FooterProps> = ({ onOpenModal }) => {
 
                     <div className="footer-col">
                         <div className="footer-col-title">Legal</div>
-                        <button onClick={() => onOpenModal('privacy')} className="footer-link" style={{ background: 'none', border: 'none', padding: 0, textAlign: 'left', cursor: 'pointer', fontFamily: 'inherit' }}>Privacy Policy</button>
-                        <button onClick={() => onOpenModal('terms')} className="footer-link" style={{ background: 'none', border: 'none', padding: 0, textAlign: 'left', cursor: 'pointer', fontFamily: 'inherit' }}>Terms of Service</button>
+                        <Link to="/privacy-policy" className="footer-link">Privacy Policy</Link>
+                        <Link to="/terms" className="footer-link">Terms of Service</Link>
                     </div>
                 </div>
                 <div className="footer-bottom">

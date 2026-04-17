@@ -407,9 +407,9 @@ export default function Register() {
                         </p>
                         <p className="mt-4 text-xs">
                             {t('auth_terms_prefix', 'By creating an account, you agree to our')}{' '}
-                            <a href="#terms" className="hover:text-[#111827] underline underline-offset-4">{t('auth_terms_of_service', 'Terms of Service')}</a>
+                            <Link to="/terms" className="hover:text-[#111827] underline underline-offset-4">{t('auth_terms_of_service', 'Terms of Service')}</Link>
                             {' '}{t('auth_and', 'and')}{' '}
-                            <a href="#privacy" className="hover:text-[#111827] underline underline-offset-4">{t('auth_privacy_policy', 'Privacy Policy')}</a>.
+                            <Link to="/privacy-policy" className="hover:text-[#111827] underline underline-offset-4">{t('auth_privacy_policy', 'Privacy Policy')}</Link>.
                         </p>
                     </div>
                 </div>

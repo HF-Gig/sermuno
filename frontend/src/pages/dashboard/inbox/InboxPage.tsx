@@ -151,6 +151,17 @@ const formatSize = (bytes?: number) => {
     return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 };
 
+const formatThreadListTimestamp = (value?: string | null) => {
+    const date = new Date(String(value || ''));
+    if (!value || Number.isNaN(date.getTime())) return '--';
+    return date.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+    });
+};
+
 const normalizeAddressList = (input: unknown): string[] => {
     if (!Array.isArray(input)) return [];
     return input
@@ -1370,7 +1381,7 @@ const InboxPage: React.FC = () => {
                 assignedToTeamId: t.assignedTeam?.id || null,
                 status: apiStatusToUiStatus(t.status, t.assignedUser?.id),
                 tags: (t.tags || []).map((tt: any) => tt.tag?.name || ''),
-                time: t.updatedAt || new Date().toISOString(),
+                time: t.messages?.[0]?.createdAt || t.updatedAt || t.createdAt || new Date().toISOString(),
                 snippet: t.messages?.[0]?.bodyText?.substring(0, 100) || '',
                 read: t.messages?.[0]?.isRead ?? true,
                 unreadCount: t.messages?.[0]?.isRead === false ? 1 : 0,
@@ -1622,7 +1633,7 @@ const InboxPage: React.FC = () => {
                         slaBreached: Boolean(res.data.slaBreached),
                         firstResponseDueAt: res.data.firstResponseDueAt || null,
                         resolutionDueAt: res.data.resolutionDueAt || null,
-                        time: res.data.createdAt || new Date().toISOString(),
+                        time: rawMessages?.[0]?.createdAt || res.data.updatedAt || res.data.createdAt || new Date().toISOString(),
                         snippet: (rawMessages?.[0]?.bodyText || rawMessages?.[0]?.bodyHtml || '').substring(0, 100),
                         contactName: res.data.contact?.name || res.data.contact?.fullName || '',
                         companyName: res.data.company?.name || '',
@@ -2019,7 +2030,13 @@ const InboxPage: React.FC = () => {
                 }
                 setReplyError(attachmentFailureMessage);
             } else {
-                const res = await api.post('/messages/send', payload);
+                const replyPayload = {
+                    bodyHtml: finalBodyHtml,
+                    bodyText: finalBodyText,
+                    cc: ccRecipients,
+                    bcc: bccRecipients,
+                };
+                const res = await api.post(`/threads/${normalizeThreadApiId(actualThreadId)}/reply`, replyPayload);
                 if (!res?.data?.id) {
                     throw new Error('Message send API did not return message details.');
                 }
@@ -3278,7 +3295,7 @@ const InboxPage: React.FC = () => {
                                                             <Star className={clsx('w-3.5 h-3.5', thread.starred && 'fill-yellow-400 text-yellow-500')} />
                                                         </span>
                                                         <span className="text-[10px] text-[var(--color-text-muted)]">
-                                                            {new Date(thread.time || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                                            {formatThreadListTimestamp(thread.time)}
                                                         </span>
                                                     </div>
                                                 </div>
@@ -4501,7 +4518,7 @@ const InboxPage: React.FC = () => {
                                             {thread.from.split('@')[0]}
                                         </span>
                                         <span className="text-[11px] text-[var(--color-text-muted)] shrink-0">
-                                            {new Date(thread.time || Date.now()).toLocaleDateString('en', { month: 'short', day: 'numeric' })}
+                                            {formatThreadListTimestamp(thread.time)}
                                         </span>
                                     </div>
                                     <div className={clsx('text-[13px] truncate mb-0.5', thread.unreadCount > 0 ? 'font-semibold text-[var(--color-text-primary)]' : 'text-[var(--color-text-primary)]')}>

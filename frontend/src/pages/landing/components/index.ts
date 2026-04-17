@@ -12,6 +12,5 @@ export { default as PricingSection } from './PricingSection';
 export { default as FAQSection } from './FAQSection';
 export { default as CTASection } from './CTASection';
 export { default as Footer } from './Footer';
-export { default as Modals } from './Modals';
 export { default as UseCasesSection } from './UseCasesSection';
 export { default as SpiralBackground } from './SpiralBackground';
