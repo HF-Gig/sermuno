@@ -190,6 +190,8 @@ export default () => ({
         10,
       ),
       onDownload: process.env.ATTACHMENT_SCAN_ON_DOWNLOAD === 'true',
+      failOpenOnError:
+        process.env.ATTACHMENT_SCAN_FAIL_OPEN_ON_ERROR === 'true',
     },
   },
   featureFlags: {

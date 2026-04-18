@@ -6,8 +6,6 @@ import SaasCalendarPicker from '../ui/SaasCalendarPicker';
 import api from '../../lib/api';
 import {
     formatAttachmentSize,
-    summarizeAttachmentUploadFailure,
-    uploadAttachmentsForMessage,
 } from '../../lib/attachmentUploads';
 
 interface ComposeDrawerProps {
@@ -26,6 +24,20 @@ type RecurrencePreset = 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly';
 type PendingAttachment = {
     id: string;
     file: File;
+};
+
+const decodeHtmlEntities = (value: string) => {
+    if (!value || typeof window === 'undefined') return value;
+    const textarea = document.createElement('textarea');
+    textarea.innerHTML = value;
+    return textarea.value;
+};
+
+const htmlToPlainText = (value: string) => {
+    return decodeHtmlEntities(String(value || '').replace(/<[^>]*>/g, ' '))
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 };
 
 const weekdayByIndex = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
@@ -205,45 +217,41 @@ const ComposeDrawer: React.FC<ComposeDrawerProps> = ({ isOpen, onClose, defaultM
 
         const normalizedRecurrence = recurrence || 'none';
         const rrule = buildRrule(normalizedRecurrence, scheduledFor || null);
+        const payload = {
+            mailboxId: formData.mailboxId,
+            to: [formData.to.trim()],
+            subject: formData.subject.trim(),
+            bodyHtml: formData.body,
+            bodyText: htmlToPlainText(formData.body),
+            ...(scheduledFor ? { scheduledAt: scheduledFor.toISOString() } : {}),
+            ...(rrule ? { rrule, timezone: detectedTimezone } : {}),
+        };
 
         setSubmitting(true);
         setError(null);
         try {
-            const response = await api.post('/threads/compose', {
-                mailboxId: formData.mailboxId,
-                to: [formData.to.trim()],
-                subject: formData.subject.trim(),
-                bodyHtml: formData.body,
-                bodyText: formData.body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(),
-                ...(scheduledFor ? { scheduledAt: scheduledFor.toISOString() } : {}),
-                ...(rrule ? { rrule, timezone: detectedTimezone } : {}),
-            });
+            const response = pendingAttachments.length > 0
+                ? await (() => {
+                    const form = new FormData();
+                    form.append('mailboxId', payload.mailboxId);
+                    form.append('subject', payload.subject);
+                    form.append('to', JSON.stringify(payload.to));
+                    if (payload.bodyHtml) form.append('bodyHtml', payload.bodyHtml);
+                    if (payload.bodyText) form.append('bodyText', payload.bodyText);
+                    if (payload.scheduledAt) form.append('scheduledAt', payload.scheduledAt);
+                    if (payload.rrule) form.append('rrule', payload.rrule);
+                    pendingAttachments.forEach((attachment) => {
+                        form.append('files', attachment.file, attachment.file.name);
+                    });
+                    return api.post('/threads/compose-with-attachments', form, {
+                        headers: { 'Content-Type': 'multipart/form-data' },
+                    });
+                })()
+                : await api.post('/threads/compose', payload);
 
             const createdMessageId = String(response.data?.message?.id || '').trim();
             if (!createdMessageId) {
                 throw new Error('Compose response did not include a message id.');
-            }
-
-            if (pendingAttachments.length > 0) {
-                const { failed } = await uploadAttachmentsForMessage(
-                    createdMessageId,
-                    pendingAttachments.map((attachment) => attachment.file),
-                );
-
-                if (failed.length > 0) {
-                    setFormData({
-                        mailboxId: defaultMailboxId || '',
-                        to: '',
-                        subject: '',
-                        body: '',
-                    });
-                    setPendingAttachments([]);
-                    setIsScheduleOpen(false);
-                    setScheduledAt(null);
-                    setRecurrencePreset('none');
-                    setError(`Message sent, but ${summarizeAttachmentUploadFailure(failed)}`);
-                    return;
-                }
             }
 
             window.dispatchEvent(new CustomEvent('sermuno:compose-sent'));

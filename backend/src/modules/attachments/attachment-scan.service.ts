@@ -489,6 +489,77 @@ export class AttachmentScanService {
       );
     }
 
+    if (this.scanner.shouldFailOpenOnError()) {
+      let fallbackStorageKey = attachment.storageKey;
+
+      try {
+        if (params.uploadBuffer) {
+          await this.storage.upload(
+            attachment.storageKey,
+            params.uploadBuffer,
+            contentType,
+          );
+        } else if (sourceStorageKey && finalStorageKey) {
+          fallbackStorageKey = await this.storage.move(
+            sourceStorageKey,
+            finalStorageKey,
+          );
+        }
+      } catch (error) {
+        await this.prisma.attachment.update({
+          where: { id: attachment.id },
+          data: {
+            scanStatus: AttachmentScanStatus.FAILED,
+            scannerName: result.scannerName,
+            scannerVersion: result.scannerVersion,
+            scannedAt: result.scannedAt,
+            scanFailureReason: `Scan fallback storage failed: ${this.stringifyError(error)}`,
+            quarantinedAt: new Date(),
+          },
+        });
+
+        throw new ServiceUnavailableException(
+          'Attachment upload failed while recovering from a scanner error',
+        );
+      }
+
+      const updated = await this.prisma.attachment.update({
+        where: { id: attachment.id },
+        data: {
+          ...(fallbackStorageKey !== attachment.storageKey
+            ? { storageKey: fallbackStorageKey }
+            : {}),
+          scanStatus: AttachmentScanStatus.UNSCANNED,
+          scannerName: result.scannerName,
+          scannerVersion: result.scannerVersion,
+          scannedAt: result.scannedAt,
+          scanFailureReason: result.failureReason,
+          malwareSignature: null,
+          quarantinedAt: null,
+        },
+      });
+
+      await this.audit.log({
+        organizationId,
+        userId: actorUserId,
+        action: 'attachment.scan.failed_open',
+        entityType: 'attachment',
+        entityId: attachment.id,
+        newValue: {
+          filename: attachment.filename,
+          storageKey: updated.storageKey,
+          failureReason: result.failureReason,
+          scanner: result.scannerName,
+        },
+      });
+
+      this.logger.warn(
+        `[attachment-scan] attachment=${attachment.id} status=failed-open reason=${result.failureReason}`,
+      );
+
+      return updated;
+    }
+
     const quarantineKey = sourceStorageKey
       ? this.storage.generateQuarantineKey(
           organizationId,
@@ -612,6 +683,26 @@ export class AttachmentScanService {
       throw new ForbiddenException(
         'Attachment is quarantined and cannot be downloaded',
       );
+    }
+
+    if (this.scanner.shouldFailOpenOnError()) {
+      const updated = await this.prisma.attachment.update({
+        where: { id: attachment.id },
+        data: {
+          scanStatus: AttachmentScanStatus.UNSCANNED,
+          scannerName: result.scannerName,
+          scannerVersion: result.scannerVersion,
+          scannedAt: result.scannedAt,
+          scanFailureReason: result.failureReason,
+          quarantinedAt: null,
+        },
+      });
+
+      this.logger.warn(
+        `[attachment-scan] attachment=${attachment.id} status=download-failed-open reason=${result.failureReason}`,
+      );
+
+      return updated;
     }
 
     await this.prisma.attachment.update({

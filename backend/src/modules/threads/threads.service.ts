@@ -6,6 +6,7 @@ import {
   InternalServerErrorException,
   ServiceUnavailableException,
   Logger,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
@@ -28,9 +29,11 @@ import {
   ThreadPriority,
   MessageDirection,
   Prisma,
+  AttachmentScanStatus,
 } from '@prisma/client';
 import * as crypto from 'crypto';
 import * as nodemailer from 'nodemailer';
+import type { Express } from 'express';
 import { EventsGateway } from '../websockets/events.gateway';
 import sanitizeHtml from 'sanitize-html';
 import { SlaService } from '../sla/sla.service';
@@ -40,6 +43,11 @@ import { AuditService } from '../audit/audit.service';
 import type { RequestMeta } from '../../common/http/request-meta';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
 import { CrmService } from '../crm/crm.service';
+import {
+  AttachmentVirusScannerService,
+  type AttachmentVirusScanResult,
+} from '../attachments/attachment-virus-scanner.service';
+import { AttachmentStorageService } from '../attachments/attachment-storage.service';
 
 const ALGORITHM = 'aes-256-gcm';
 
@@ -60,6 +68,18 @@ type MailboxSmtpConfig = {
   googleRefreshToken: string | null;
   syncStatus?: string | null;
   lastSyncError?: string | null;
+};
+
+type OutboundPreparedAttachment = {
+  content: Buffer;
+  contentType: string;
+  filename: string;
+  scannedAt: Date | null;
+  scanFailureReason: string | null;
+  scannerName: string | null;
+  scannerVersion: string | null;
+  scanStatus: AttachmentScanStatus;
+  sizeBytes: number;
 };
 
 // RFC 5322 threading interfaces (per spec)
@@ -131,6 +151,8 @@ export class ThreadsService {
     private readonly notificationsService: NotificationsService,
     private readonly auditService: AuditService,
     private readonly crmService: CrmService,
+    private readonly attachmentScanner: AttachmentVirusScannerService,
+    private readonly attachmentStorage: AttachmentStorageService,
   ) {}
 
   private async getUserTeamIds(userId: string): Promise<string[]> {
@@ -314,6 +336,203 @@ export class ThreadsService {
       .filter((item) => item.length > 0);
   }
 
+  private decodeHtmlEntities(value: string): string {
+    if (!value) return '';
+
+    const namedEntities: Record<string, string> = {
+      amp: '&',
+      lt: '<',
+      gt: '>',
+      quot: '"',
+      apos: "'",
+      nbsp: ' ',
+    };
+
+    return value.replace(
+      /&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);/g,
+      (fullMatch, rawEntity: string) => {
+        if (rawEntity.startsWith('#')) {
+          const isHex =
+            rawEntity.charAt(1).toLowerCase() === 'x';
+          const numericPart = isHex
+            ? rawEntity.slice(2)
+            : rawEntity.slice(1);
+          const parsed = parseInt(numericPart, isHex ? 16 : 10);
+
+          if (Number.isFinite(parsed) && parsed > 0) {
+            try {
+              return String.fromCodePoint(parsed);
+            } catch {
+              return fullMatch;
+            }
+          }
+          return fullMatch;
+        }
+
+        const named = namedEntities[rawEntity.toLowerCase()];
+        return typeof named === 'string' ? named : fullMatch;
+      },
+    );
+  }
+
+  private normalizeExplicitBodyText(
+    value?: string | null,
+  ): string | undefined {
+    const raw = String(value ?? '');
+    if (!raw.trim()) return undefined;
+    return this.decodeHtmlEntities(raw).replace(/\u00A0/g, ' ');
+  }
+
+  private htmlToPlainText(value?: string | null): string | undefined {
+    const raw = String(value ?? '');
+    if (!raw.trim()) return undefined;
+    const withoutTags = raw.replace(/<[^>]*>/g, ' ');
+    const normalized = this.decodeHtmlEntities(withoutTags)
+      .replace(/\u00A0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return normalized || undefined;
+  }
+
+  private resolveBodyText(
+    bodyText?: string | null,
+    bodyHtml?: string | null,
+    fallbackBodyText?: string | null,
+  ): string | undefined {
+    const explicitText = this.normalizeExplicitBodyText(bodyText);
+    if (explicitText) return explicitText;
+
+    const derivedText = this.htmlToPlainText(bodyHtml);
+    if (derivedText) return derivedText;
+
+    return this.normalizeExplicitBodyText(fallbackBodyText);
+  }
+
+  private scanFailureResult(error: unknown): AttachmentVirusScanResult {
+    return {
+      failureReason: error instanceof Error ? error.message : String(error),
+      scannedAt: new Date(),
+      scannerName: this.attachmentScanner.getScannerName(),
+      scannerVersion: null,
+      status: 'failed',
+    };
+  }
+
+  private async prepareComposeAttachments(
+    files: Express.Multer.File[],
+  ): Promise<OutboundPreparedAttachment[]> {
+    if (!Array.isArray(files) || files.length === 0) {
+      return [];
+    }
+
+    const prepared: OutboundPreparedAttachment[] = [];
+    for (const file of files) {
+      const filename = String(file.originalname || '').trim() || 'attachment';
+      const contentType = file.mimetype || 'application/octet-stream';
+
+      if (!this.attachmentScanner.isEnabled()) {
+        prepared.push({
+          content: file.buffer,
+          contentType,
+          filename,
+          scannedAt: null,
+          scanFailureReason: null,
+          scannerName: null,
+          scannerVersion: null,
+          scanStatus: AttachmentScanStatus.UNSCANNED,
+          sizeBytes: file.size,
+        });
+        continue;
+      }
+
+      let scanResult: AttachmentVirusScanResult;
+      try {
+        scanResult = await this.attachmentScanner.scanBuffer(file.buffer);
+      } catch (error) {
+        scanResult = this.scanFailureResult(error);
+      }
+
+      if (scanResult.status === 'infected') {
+        throw new UnprocessableEntityException(
+          `Attachment blocked by malware scan: ${scanResult.malwareSignature}`,
+        );
+      }
+
+      if (
+        scanResult.status === 'failed' &&
+        !this.attachmentScanner.shouldFailOpenOnError()
+      ) {
+        throw new ServiceUnavailableException(
+          'Attachment scan failed and the upload was blocked',
+        );
+      }
+
+      prepared.push({
+        content: file.buffer,
+        contentType,
+        filename,
+        scannedAt: scanResult.scannedAt,
+        scanFailureReason:
+          scanResult.status === 'failed' ? scanResult.failureReason : null,
+        scannerName: scanResult.scannerName,
+        scannerVersion: scanResult.scannerVersion,
+        scanStatus:
+          scanResult.status === 'clean'
+            ? AttachmentScanStatus.CLEAN
+            : AttachmentScanStatus.UNSCANNED,
+        sizeBytes: file.size,
+      });
+    }
+
+    return prepared;
+  }
+
+  private async persistComposeAttachments(params: {
+    attachments: OutboundPreparedAttachment[];
+    messageId: string;
+    organizationId: string;
+  }): Promise<void> {
+    const { attachments, messageId, organizationId } = params;
+    if (!attachments.length) return;
+
+    for (const attachment of attachments) {
+      const storageKey = this.attachmentStorage.generateStorageKey(
+        organizationId,
+        attachment.filename,
+      );
+
+      try {
+        await this.attachmentStorage.upload(
+          storageKey,
+          attachment.content,
+          attachment.contentType,
+        );
+
+        await this.prisma.attachment.create({
+          data: {
+            messageId,
+            filename: attachment.filename,
+            contentType: attachment.contentType,
+            sizeBytes: attachment.sizeBytes,
+            storageKey,
+            scanStatus: attachment.scanStatus,
+            scannerName: attachment.scannerName,
+            scannerVersion: attachment.scannerVersion,
+            scannedAt: attachment.scannedAt,
+            scanFailureReason: attachment.scanFailureReason,
+            malwareSignature: null,
+            quarantinedAt: null,
+          },
+        });
+      } catch (error) {
+        this.logger.error(
+          `[compose-attachment-persist-failed] message=${messageId} file=${attachment.filename} error=${error instanceof Error ? error.message : String(error)}`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
+    }
+  }
+
   private extractFirstEmail(input: unknown): string | null {
     if (Array.isArray(input)) {
       for (const entry of input) {
@@ -387,6 +606,11 @@ export class ThreadsService {
     inReplyTo?: string;
     references?: string[];
     threadId: string;
+    attachments?: Array<{
+      filename: string;
+      contentType: string;
+      content: Buffer;
+    }>;
   }): Promise<{ providerMessageId?: string; fromEmail: string }> {
     if (this.featureFlags.get('DISABLE_SMTP_SEND')) {
       this.logger.warn(
@@ -503,6 +727,10 @@ export class ThreadsService {
         text: params.bodyText,
         inReplyTo: params.inReplyTo,
         references: params.references,
+        attachments:
+          params.attachments && params.attachments.length > 0
+            ? params.attachments
+            : undefined,
       });
 
       return {
@@ -1194,10 +1422,50 @@ export class ThreadsService {
     return updated;
   }
 
-  async compose(dto: ComposeThreadDto, user: JwtUser) {
+  async compose(
+    dto: ComposeThreadDto,
+    user: JwtUser,
+    uploadedFiles: Express.Multer.File[] = [],
+  ) {
     const to = this.sanitizeEmails(dto.to);
     const cc = this.sanitizeEmails(dto.cc);
     const bcc = this.sanitizeEmails(dto.bcc);
+    if (!to.length) {
+      throw new BadRequestException('No valid recipient found for this email.');
+    }
+
+    const mailbox = await this.prisma.mailbox.findFirst({
+      where: {
+        id: dto.mailboxId,
+        organizationId: user.organizationId,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        provider: true,
+        smtpHost: true,
+        smtpPort: true,
+        smtpSecure: true,
+        smtpUser: true,
+        smtpPass: true,
+        oauthProvider: true,
+        oauthAccessToken: true,
+        oauthRefreshToken: true,
+        googleAccessToken: true,
+        googleRefreshToken: true,
+        syncStatus: true,
+        lastSyncError: true,
+      },
+    });
+    if (!mailbox) throw new NotFoundException('Mailbox not found');
+
+    const bodyHtml = dto.bodyHtml || undefined;
+    const bodyText = this.resolveBodyText(dto.bodyText, dto.bodyHtml);
+    const preparedAttachments = await this.prepareComposeAttachments(
+      uploadedFiles,
+    );
 
     let contactId: string | null = null;
     let companyId: string | null = null;
@@ -1230,7 +1498,24 @@ export class ThreadsService {
       }
     }
 
-    // Create a new thread + first outbound message
+    const sendResult = await this.sendReplyThroughProvider({
+      mailbox,
+      actor: user,
+      to,
+      cc,
+      bcc,
+      subject: dto.subject,
+      bodyHtml,
+      bodyText,
+      threadId: `compose:${dto.mailboxId}`,
+      attachments: preparedAttachments.map((attachment) => ({
+        filename: attachment.filename,
+        contentType: attachment.contentType,
+        content: attachment.content,
+      })),
+    });
+
+    // Create a new thread + first outbound message after successful provider send
     const thread = await this.prisma.thread.create({
       data: {
         mailboxId: dto.mailboxId,
@@ -1247,13 +1532,14 @@ export class ThreadsService {
         threadId: thread.id,
         mailboxId: dto.mailboxId,
         direction: MessageDirection.OUTBOUND,
-        fromEmail: user.email,
+        fromEmail: sendResult.fromEmail,
         to: to as unknown as import('@prisma/client').Prisma.InputJsonValue,
         cc: cc as unknown as import('@prisma/client').Prisma.InputJsonValue,
         bcc: bcc as unknown as import('@prisma/client').Prisma.InputJsonValue,
         subject: dto.subject,
-        bodyHtml: dto.bodyHtml,
-        bodyText: dto.bodyText,
+        bodyHtml,
+        bodyText,
+        messageId: sendResult.providerMessageId,
         isOutbound: true,
         isDraft: false,
       },
@@ -1270,6 +1556,12 @@ export class ThreadsService {
         messageId: message.id,
       });
     }
+
+    await this.persistComposeAttachments({
+      attachments: preparedAttachments,
+      messageId: message.id,
+      organizationId: user.organizationId,
+    });
 
     return { thread, message };
   }
@@ -1365,14 +1657,7 @@ export class ThreadsService {
     );
 
     const bodyHtml = dto.bodyHtml || undefined;
-    const bodyText =
-      dto.bodyText ||
-      (dto.bodyHtml
-        ? dto.bodyHtml
-            .replace(/<[^>]*>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-        : undefined);
+    const bodyText = this.resolveBodyText(dto.bodyText, dto.bodyHtml);
 
     const sendResult = await this.sendReplyThroughProvider({
       mailbox: thread.mailbox,
@@ -1552,14 +1837,11 @@ export class ThreadsService {
     const fallbackBodyText = latestMessage?.bodyText
       ? `---------- Forwarded message ----------\n${latestMessage.bodyText}`
       : undefined;
-    const bodyText =
-      dto.bodyText ||
-      (dto.bodyHtml
-        ? dto.bodyHtml
-            .replace(/<[^>]*>/g, ' ')
-            .replace(/\s+/g, ' ')
-            .trim()
-        : fallbackBodyText);
+    const bodyText = this.resolveBodyText(
+      dto.bodyText,
+      dto.bodyHtml,
+      fallbackBodyText,
+    );
 
     const sendResult = await this.sendReplyThroughProvider({
       mailbox: thread.mailbox,

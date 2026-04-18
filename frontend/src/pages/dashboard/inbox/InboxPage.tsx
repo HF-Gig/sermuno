@@ -108,6 +108,31 @@ const decodeHtmlEntities = (value: string) => {
     return textarea.value;
 };
 
+const normalizeDecodedText = (value: string) => {
+    return decodeHtmlEntities(String(value || ''))
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+};
+
+const decodeTextPreserveLineBreaks = (value: string) => {
+    return String(value || '')
+        .replace(/&nbsp;|&#160;|&#xA0;/gi, ' ')
+        .replace(/\u00A0/g, ' ');
+};
+
+const htmlToPlainText = (value: string) => {
+    return normalizeDecodedText(String(value || '').replace(/<[^>]*>/g, ' '));
+};
+
+const buildThreadSnippet = (bodyText?: string, bodyHtml?: string, maxLength = 100) => {
+    const explicit = normalizeDecodedText(String(bodyText || ''));
+    if (explicit) {
+        return explicit.slice(0, maxLength);
+    }
+    return htmlToPlainText(String(bodyHtml || '')).slice(0, maxLength);
+};
+
 const extractMimePart = (raw: string, contentType: 'text/html' | 'text/plain') => {
     const pattern = new RegExp(
         `Content-Type:\\s*${contentType.replace('/', '\\/')}[\\s\\S]*?(?:\\r?\\n){2}([\\s\\S]*?)(?=\\r?\\n--|$)`,
@@ -126,7 +151,7 @@ const normalizeMessageBody = (bodyHtml?: string, bodyText?: string) => {
     const looksLikeMime = /content-type:\s*multipart\//i.test(raw) || /content-transfer-encoding:\s*quoted-printable/i.test(raw);
 
     if (!looksLikeMime) {
-        return raw.replace(/\n/g, '<br/>');
+        return decodeTextPreserveLineBreaks(raw).replace(/\r?\n/g, '<br/>');
     }
 
     const rawHtmlPart = extractMimePart(raw, 'text/html');
@@ -413,10 +438,7 @@ const serializeNoteTextForApi = (text: string, mentionedUsers: MentionedUser[]) 
 
 const extractNotePlainText = (html: string) => {
     if (!html) return '';
-    return decodeHtmlEntities(String(html).replace(/<[^>]*>/g, ' '))
-        .replace(/\u00A0/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    return htmlToPlainText(html);
 };
 
 const getNoteMentionDraft = (editor: NoteEditorReader): NoteMentionDraft | null => {
@@ -1382,7 +1404,10 @@ const InboxPage: React.FC = () => {
                 status: apiStatusToUiStatus(t.status, t.assignedUser?.id),
                 tags: (t.tags || []).map((tt: any) => tt.tag?.name || ''),
                 time: t.messages?.[0]?.createdAt || t.updatedAt || t.createdAt || new Date().toISOString(),
-                snippet: t.messages?.[0]?.bodyText?.substring(0, 100) || '',
+                snippet: buildThreadSnippet(
+                    t.messages?.[0]?.bodyText,
+                    t.messages?.[0]?.bodyHtml,
+                ),
                 read: t.messages?.[0]?.isRead ?? true,
                 unreadCount: t.messages?.[0]?.isRead === false ? 1 : 0,
                 folderId: t.messages?.[0]?.folderId || seedThreadFolderById.get(String(t.id)) || 'f1',
@@ -1634,7 +1659,10 @@ const InboxPage: React.FC = () => {
                         firstResponseDueAt: res.data.firstResponseDueAt || null,
                         resolutionDueAt: res.data.resolutionDueAt || null,
                         time: rawMessages?.[0]?.createdAt || res.data.updatedAt || res.data.createdAt || new Date().toISOString(),
-                        snippet: (rawMessages?.[0]?.bodyText || rawMessages?.[0]?.bodyHtml || '').substring(0, 100),
+                        snippet: buildThreadSnippet(
+                            rawMessages?.[0]?.bodyText,
+                            rawMessages?.[0]?.bodyHtml,
+                        ),
                         contactName: res.data.contact?.name || res.data.contact?.fullName || '',
                         companyName: res.data.company?.name || '',
                     });
@@ -1952,7 +1980,7 @@ const InboxPage: React.FC = () => {
         recurrencePreset?: RecurrencePreset,
         scheduledStatePreset?: ScheduledStatePreset,
     ) => {
-        const plainText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        const plainText = htmlToPlainText(replyHtml);
         if (!plainText) {
             setReplyError('Message cannot be empty');
             return;
@@ -1979,7 +2007,8 @@ const InboxPage: React.FC = () => {
         const selectedSignature = availableSignatures.find((signature) => signature.id === selectedSignatureId);
         const signatureHtml = String(selectedSignature?.bodyHtml || selectedSignature?.contentHtml || '').trim();
         const finalBodyHtml = signatureHtml ? `${replyHtml}<br/><br/>${signatureHtml}` : replyHtml;
-        const finalBodyText = `${plainText}${signatureHtml ? `\n\n${String(signatureHtml).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()}` : ''}`.trim();
+        const signatureText = htmlToPlainText(signatureHtml);
+        const finalBodyText = `${plainText}${signatureText ? `\n\n${signatureText}` : ''}`.trim();
         const baseSubject = String(openThread.subject || latestInbound?.subject || '(no subject)').trim();
         const sendSubject = /^re:/i.test(baseSubject) ? baseSubject : `Re: ${baseSubject}`;
 

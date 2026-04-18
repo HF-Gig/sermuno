@@ -11,7 +11,11 @@ import {
   HttpCode,
   HttpStatus,
   Req,
+  UseInterceptors,
+  UploadedFiles,
+  BadRequestException,
 } from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import { ThreadsService } from './threads.service';
 import {
   ListThreadsDto,
@@ -34,6 +38,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
 import type { Request } from 'express';
 import { extractRequestMeta } from '../../common/http/request-meta';
+import type { Express } from 'express';
 
 @UseGuards(JwtAuthGuard)
 @Controller('threads')
@@ -70,6 +75,17 @@ export class ThreadsController {
   @Post('compose')
   compose(@Body() dto: ComposeThreadDto, @CurrentUser() user: JwtUser) {
     return this.threadsService.compose(dto, user);
+  }
+
+  @Post('compose-with-attachments')
+  @UseInterceptors(FilesInterceptor('files'))
+  composeWithAttachments(
+    @Body() body: Record<string, unknown>,
+    @UploadedFiles() files: Express.Multer.File[] = [],
+    @CurrentUser() user: JwtUser,
+  ) {
+    const dto = this.parseMultipartComposeDto(body);
+    return this.threadsService.compose(dto, user, files);
   }
 
   // GET /threads/:id/mention-suggestions
@@ -202,6 +218,75 @@ export class ThreadsController {
     @CurrentUser() user: JwtUser,
   ) {
     return this.threadsService.deleteNote(id, noteId, user);
+  }
+
+  private parseMultipartComposeDto(body: Record<string, unknown>): ComposeThreadDto {
+    const mailboxId = String(body.mailboxId || '').trim();
+    const subject = String(body.subject || '').trim();
+    const to = this.parseEmailList(body.to);
+    const cc = this.parseEmailList(body.cc);
+    const bcc = this.parseEmailList(body.bcc);
+    const bodyHtml = String(body.bodyHtml || '').trim();
+    const bodyText = String(body.bodyText || '').trim();
+    const rrule = String(body.rrule || '').trim();
+    const scheduledAtRaw = String(body.scheduledAt || '').trim();
+
+    if (!mailboxId) {
+      throw new BadRequestException('mailboxId is required');
+    }
+    if (!subject) {
+      throw new BadRequestException('subject is required');
+    }
+    if (to.length === 0) {
+      throw new BadRequestException('at least one recipient is required');
+    }
+
+    const dto: ComposeThreadDto = {
+      mailboxId,
+      subject,
+      to,
+      ...(cc.length > 0 ? { cc } : {}),
+      ...(bcc.length > 0 ? { bcc } : {}),
+      ...(bodyHtml ? { bodyHtml } : {}),
+      ...(bodyText ? { bodyText } : {}),
+      ...(rrule ? { rrule } : {}),
+    };
+
+    if (scheduledAtRaw) {
+      const scheduledAt = new Date(scheduledAtRaw);
+      if (Number.isNaN(scheduledAt.getTime())) {
+        throw new BadRequestException('scheduledAt must be a valid ISO date');
+      }
+      dto.scheduledAt = scheduledAt;
+    }
+
+    return dto;
+  }
+
+  private parseEmailList(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => String(item || '').trim())
+        .filter((item) => item.length > 0);
+    }
+
+    const raw = String(value || '').trim();
+    if (!raw) return [];
+
+    if (raw.startsWith('[') && raw.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .map((item) => String(item || '').trim())
+            .filter((item) => item.length > 0);
+        }
+      } catch {
+        // Fall back to treating it as a single email if JSON parsing fails.
+      }
+    }
+
+    return [raw];
   }
 
   // POST /threads/:id/tags

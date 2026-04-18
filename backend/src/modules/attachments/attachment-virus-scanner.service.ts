@@ -36,6 +36,7 @@ export class AttachmentVirusScannerService {
   private readonly port: number;
   private readonly timeoutMs: number;
   private readonly scanOnDownload: boolean;
+  private readonly failOpenOnError: boolean;
   private versionPromise: Promise<string | null> | null = null;
 
   constructor(private readonly config: ConfigService) {
@@ -46,6 +47,8 @@ export class AttachmentVirusScannerService {
     this.timeoutMs = config.get<number>('attachment.scan.timeoutMs') ?? 15_000;
     this.scanOnDownload =
       config.get<boolean>('attachment.scan.onDownload') ?? false;
+    this.failOpenOnError =
+      config.get<boolean>('attachment.scan.failOpenOnError') ?? false;
   }
 
   isEnabled(): boolean {
@@ -54,6 +57,10 @@ export class AttachmentVirusScannerService {
 
   shouldScanOnDownload(): boolean {
     return this.isEnabled() && this.scanOnDownload;
+  }
+
+  shouldFailOpenOnError(): boolean {
+    return this.isEnabled() && this.failOpenOnError;
   }
 
   getScannerName(): string {
