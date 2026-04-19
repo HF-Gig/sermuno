@@ -31,6 +31,7 @@ export class ScheduledMessagesController {
       scheduledAt: string;
       rrule?: string;
       timezone?: string;
+      threadStatusAfterSend?: string;
     },
     @CurrentUser() user: JwtUser,
   ) {

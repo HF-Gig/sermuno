@@ -10,6 +10,7 @@ import { AuditModule } from '../audit/audit.module';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
 import { CrmModule } from '../crm/crm.module';
 import { AttachmentsModule } from '../attachments/attachments.module';
+import { MessagesModule } from '../messages/messages.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { AttachmentsModule } from '../attachments/attachments.module';
     AuditModule,
     CrmModule,
     AttachmentsModule,
+    MessagesModule,
   ],
   controllers: [ThreadsController],
   providers: [ThreadsService, PrismaService, FeatureFlagsService],

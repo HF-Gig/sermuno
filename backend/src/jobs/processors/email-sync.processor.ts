@@ -33,25 +33,172 @@ export interface EmailSyncJobData {
 const STREAM_CHUNK_SIZE = 100;
 const STREAM_DELAY_MS = 50;
 
+type ResolvedMailboxFolderType =
+  | 'inbox'
+  | 'sent'
+  | 'drafts'
+  | 'spam'
+  | 'trash'
+  | 'archive'
+  | 'custom'
+  | 'excluded';
+
 /** Gmail/IMAP folder name → folder type mapping */
-const FOLDER_TYPE_MAP: Record<string, string> = {
-  INBOX: 'inbox',
-  '[Gmail]/Sent Mail': 'sent',
-  '[Gmail]/Drafts': 'drafts',
-  '[Gmail]/Spam': 'spam',
-  '[Gmail]/Trash': 'trash',
-  '[Gmail]/All Mail': 'archive',
-  // Outlook variants
-  'Sent Items': 'sent',
-  Sent: 'sent',
-  Drafts: 'drafts',
-  'Junk Email': 'spam',
-  'Deleted Items': 'trash',
-  Archive: 'archive',
+const CANONICAL_FOLDER_TYPES = new Set([
+  'inbox',
+  'sent',
+  'drafts',
+  'spam',
+  'trash',
+  'archive',
+]);
+
+/** Folders to sync (by resolved type). */
+const SYNC_FOLDER_TYPES = new Set([
+  'inbox',
+  'sent',
+  'drafts',
+  'spam',
+  'trash',
+  'archive',
+]);
+
+const IMAP_SPECIAL_USE_TO_TYPE: Record<string, ResolvedMailboxFolderType> = {
+  '\\inbox': 'inbox',
+  '\\sent': 'sent',
+  '\\drafts': 'drafts',
+  '\\junk': 'spam',
+  '\\spam': 'spam',
+  '\\trash': 'trash',
+  '\\archive': 'archive',
+  '\\all': 'archive',
 };
 
-/** Folders to sync (by resolved type) */
-const SYNC_FOLDER_TYPES = new Set(['inbox', 'sent', 'drafts', 'spam', 'trash']);
+const OUTLOOK_WELL_KNOWN_NAME_TO_TYPE: Record<
+  string,
+  ResolvedMailboxFolderType
+> = {
+  inbox: 'inbox',
+  sentitems: 'sent',
+  drafts: 'drafts',
+  junkemail: 'spam',
+  deleteditems: 'trash',
+  archive: 'archive',
+};
+
+function normalizeToken(value: string): string {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\[\]().]/g, ' ')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function resolveFolderTypeFromName(name: string): ResolvedMailboxFolderType {
+  const raw = String(name || '').trim().toLowerCase();
+  const normalized = normalizeToken(name);
+  if (!normalized) return 'excluded';
+
+  // Provider/system folders that are outside Sermuno's mailbox-folder model.
+  if (
+    normalized === 'gmail' ||
+    raw === '[gmail]' ||
+    raw === '[gmail]/starred' ||
+    raw === '[gmail]/important' ||
+    normalized === 'important' ||
+    normalized === 'starred' ||
+    normalized === 'flagged emails' ||
+    normalized.endsWith('/starred') ||
+    normalized.endsWith('/important')
+  ) {
+    return 'excluded';
+  }
+
+  if (
+    normalized === 'inbox' ||
+    normalized.endsWith('/inbox') ||
+    normalized.includes(' inbox')
+  ) {
+    return 'inbox';
+  }
+
+  if (
+    normalized.includes('sent') ||
+    normalized.includes('sent items') ||
+    normalized.includes('sent mail')
+  ) {
+    return 'sent';
+  }
+
+  if (normalized.includes('draft')) {
+    return 'drafts';
+  }
+
+  if (
+    normalized.includes('spam') ||
+    normalized.includes('junk') ||
+    normalized.includes('bulk mail')
+  ) {
+    return 'spam';
+  }
+
+  if (
+    normalized.includes('trash') ||
+    normalized.includes('deleted') ||
+    normalized.includes('bin')
+  ) {
+    return 'trash';
+  }
+
+  if (
+    normalized.includes('all mail') ||
+    normalized.includes('archive') ||
+    normalized === 'all'
+  ) {
+    return 'archive';
+  }
+
+  return 'custom';
+}
+
+function resolveImapFolderType(folder: {
+  path?: string;
+  specialUse?: string | null;
+  flags?: Set<string> | string[] | null;
+}): ResolvedMailboxFolderType {
+  const specialUse = normalizeToken(folder.specialUse || '').replace(/^\\+/, '');
+  if (specialUse) {
+    const mapped = IMAP_SPECIAL_USE_TO_TYPE[`\\${specialUse}`];
+    if (mapped) return mapped;
+  }
+
+  const flags = folder.flags ? Array.from(folder.flags as Iterable<string>) : [];
+  for (const flag of flags) {
+    const normalizedFlag = normalizeToken(flag).replace(/^\\+/, '');
+    const mapped = IMAP_SPECIAL_USE_TO_TYPE[`\\${normalizedFlag}`];
+    if (mapped) return mapped;
+  }
+
+  return resolveFolderTypeFromName(folder.path || '');
+}
+
+function resolveOutlookFolderType(
+  displayName: string,
+  wellKnownName?: string,
+): ResolvedMailboxFolderType {
+  const normalizedWellKnown = normalizeToken(wellKnownName || '').replace(
+    /\s+/g,
+    '',
+  );
+  if (normalizedWellKnown) {
+    const mapped = OUTLOOK_WELL_KNOWN_NAME_TO_TYPE[normalizedWellKnown];
+    if (mapped) return mapped;
+  }
+
+  return resolveFolderTypeFromName(displayName);
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -849,7 +996,7 @@ export class EmailSyncProcessor extends WorkerHost {
       {
         name: 'graph',
         folderUrl: (top: number) =>
-          `https://graph.microsoft.com/v1.0/me/mailFolders?$top=${top}&$select=id,displayName`,
+          `https://graph.microsoft.com/v1.0/me/mailFolders?$top=${top}&$select=id,displayName,wellKnownName`,
         messagesUrl: (folderId: string, top: number) =>
           `https://graph.microsoft.com/v1.0/me/mailFolders/${encodeURIComponent(folderId)}/messages` +
           `?$top=${top}&$orderby=receivedDateTime%20desc`,
@@ -865,13 +1012,19 @@ export class EmailSyncProcessor extends WorkerHost {
     ];
 
     for (const candidate of apiCandidates) {
-      const folderRows: Array<{ id: string; displayName: string }> = [];
+      const folderRows: Array<{
+        id: string;
+        displayName: string;
+        wellKnownName?: string;
+      }> = [];
       try {
         for await (const folderPage of this.iterateOutlookApiCollection<{
           id?: string;
           displayName?: string;
+          wellKnownName?: string;
           Id?: string;
           DisplayName?: string;
+          WellKnownName?: string;
         }>(
           mailboxId,
           candidate.folderUrl(pageSize),
@@ -884,6 +1037,9 @@ export class EmailSyncProcessor extends WorkerHost {
                 id: String(folder.id ?? folder.Id ?? '').trim(),
                 displayName: String(
                   folder.displayName ?? folder.DisplayName ?? '',
+                ).trim(),
+                wellKnownName: String(
+                  folder.wellKnownName ?? folder.WellKnownName ?? '',
                 ).trim(),
               }))
               .filter((folder) => folder.id && folder.displayName),
@@ -907,22 +1063,26 @@ export class EmailSyncProcessor extends WorkerHost {
         continue;
       }
 
-      const selectedFolders = folderRows
-        .map((folder) => {
-          const folderType =
-            FOLDER_TYPE_MAP[folder.displayName] ||
-            (folder.displayName.toUpperCase() === 'INBOX' ? 'inbox' : 'other');
-          return {
-            id: folder.id,
-            displayName: folder.displayName,
-            folderType,
-          };
-        })
-        .filter(
-          (folder) =>
-            folder.folderType === 'inbox' ||
-            SYNC_FOLDER_TYPES.has(folder.folderType),
+      const resolvedFolders = folderRows.map((folder) => ({
+        id: folder.id,
+        displayName: folder.displayName,
+        folderType: resolveOutlookFolderType(
+          folder.displayName,
+          folder.wellKnownName,
+        ),
+      }));
+
+      for (const folder of resolvedFolders) {
+        await this.upsertMailboxFolderMetadata(
+          mailboxId,
+          folder.displayName,
+          folder.folderType,
         );
+      }
+
+      const selectedFolders = resolvedFolders.filter((folder) =>
+        SYNC_FOLDER_TYPES.has(folder.folderType),
+      );
 
       if (selectedFolders.length === 0) {
         this.logger.warn(
@@ -954,7 +1114,6 @@ export class EmailSyncProcessor extends WorkerHost {
           });
         }
 
-        let createdCount = 0;
         try {
           for await (const messagePage of this.iterateOutlookApiCollection<
             Record<string, unknown>
@@ -970,14 +1129,13 @@ export class EmailSyncProcessor extends WorkerHost {
 
             for (const chunk of chunks) {
               for (const message of chunk) {
-                const created = await this.upsertOutlookApiMessage(
+                await this.upsertOutlookApiMessage(
                   message,
                   mailboxId,
                   organizationId,
                   mailboxFolder.id,
                   folder.folderType,
                 );
-                if (created) createdCount += 1;
               }
               await this.applyChunkDelay(
                 adaptiveBucketKey,
@@ -1002,14 +1160,16 @@ export class EmailSyncProcessor extends WorkerHost {
           continue;
         }
 
+        const counters = await this.refreshMailboxFolderCounters(
+          mailboxFolder.id,
+        );
         await this.prisma.mailboxFolder.update({
           where: { id: mailboxFolder.id },
           data: {
             syncStatus: 'SUCCESS',
             lastSyncedAt: new Date(),
-            ...(createdCount > 0
-              ? { messageCount: { increment: createdCount } }
-              : {}),
+            messageCount: counters.messageCount,
+            unreadCount: counters.unreadCount,
           },
         });
       }
@@ -1297,7 +1457,77 @@ export class EmailSyncProcessor extends WorkerHost {
   }
 
   // ─── Multi-folder sync ────────────────────────────────────────────────────
+  private async upsertMailboxFolderMetadata(
+    mailboxId: string,
+    folderName: string,
+    folderType: ResolvedMailboxFolderType,
+  ): Promise<void> {
+    if (folderType === 'excluded') {
+      const rows = await this.prisma.mailboxFolder.findMany({
+        where: { mailboxId, name: folderName },
+        select: { id: true },
+      });
+      for (const row of rows) {
+        await this.prisma.message.updateMany({
+          where: { folderId: row.id },
+          data: { folderId: null },
+        });
+      }
+      await this.prisma.mailboxFolder.deleteMany({
+        where: {
+          mailboxId,
+          name: folderName,
+        },
+      });
+      return;
+    }
 
+    const normalizedType = CANONICAL_FOLDER_TYPES.has(folderType)
+      ? folderType
+      : 'custom';
+
+    const existing = await this.prisma.mailboxFolder.findFirst({
+      where: { mailboxId, name: folderName },
+      select: { id: true, type: true },
+    });
+
+    if (!existing) {
+      await this.prisma.mailboxFolder.create({
+        data: {
+          mailbox: { connect: { id: mailboxId } },
+          name: folderName,
+          type: normalizedType,
+          uidValidity: BigInt(1),
+          uidNext: BigInt(1),
+          syncStatus: 'PENDING',
+        },
+      });
+      return;
+    }
+
+    if (existing.type !== normalizedType) {
+      await this.prisma.mailboxFolder.update({
+        where: { id: existing.id },
+        data: { type: normalizedType },
+      });
+    }
+  }
+
+  private async refreshMailboxFolderCounters(folderId: string): Promise<{
+    messageCount: number;
+    unreadCount: number;
+  }> {
+    const [messageCount, unreadCount] = await Promise.all([
+      this.prisma.message.count({
+        where: { folderId, deletedAt: null },
+      }),
+      this.prisma.message.count({
+        where: { folderId, deletedAt: null, isRead: false },
+      }),
+    ]);
+
+    return { messageCount, unreadCount };
+  }
   private async syncAllFolders(
     client: ImapFlow,
     mailboxId: string,
@@ -1317,20 +1547,36 @@ export class EmailSyncProcessor extends WorkerHost {
       `[email-sync] mailbox=${mailboxId} found ${folderList.length} IMAP folders`,
     );
 
-    // Always ensure INBOX is in the list
+    const discoveredFolders = folderList
+      .map((folder) => {
+        const path = String(folder.path || '').trim();
+        return {
+          path,
+          type: resolveImapFolderType({
+            path,
+            specialUse: folder.specialUse,
+            flags: folder.flags as Set<string> | string[] | null | undefined,
+          }),
+        };
+      })
+      .filter((folder) => folder.path.length > 0);
+
+    for (const folder of discoveredFolders) {
+      await this.upsertMailboxFolderMetadata(mailboxId, folder.path, folder.type);
+    }
+
     const foldersToSync: Array<{ path: string; type: string }> = [];
-
-    for (const folder of folderList) {
-      const path = folder.path;
-      const mappedType = FOLDER_TYPE_MAP[path];
-
-      if (mappedType && SYNC_FOLDER_TYPES.has(mappedType)) {
-        foldersToSync.push({ path, type: mappedType });
-      }
+    const seenPaths = new Set<string>();
+    for (const folder of discoveredFolders) {
+      if (!SYNC_FOLDER_TYPES.has(folder.type)) continue;
+      if (seenPaths.has(folder.path)) continue;
+      seenPaths.add(folder.path);
+      foldersToSync.push({ path: folder.path, type: folder.type });
     }
 
     // Make sure INBOX is always present even if not returned by list()
     if (!foldersToSync.find((f) => f.path === 'INBOX')) {
+      await this.upsertMailboxFolderMetadata(mailboxId, 'INBOX', 'inbox');
       foldersToSync.unshift({ path: 'INBOX', type: 'inbox' });
     }
 
@@ -1424,8 +1670,8 @@ export class EmailSyncProcessor extends WorkerHost {
             syncStatus: 'SYNCING',
           },
         });
-      } else if (!folder.type) {
-        // Backfill type if missing
+      } else if (folder.type !== folderType) {
+        // Keep folder type in sync when provider mapping changes.
         await this.prisma.mailboxFolder.update({
           where: { id: folder.id },
           data: { type: folderType },
@@ -1475,9 +1721,15 @@ export class EmailSyncProcessor extends WorkerHost {
       );
 
       if (messageUids.length === 0) {
+        const counters = await this.refreshMailboxFolderCounters(folder.id);
         await this.prisma.mailboxFolder.update({
           where: { id: folder.id },
-          data: { syncStatus: 'SUCCESS', lastSyncedAt: new Date() },
+          data: {
+            syncStatus: 'SUCCESS',
+            lastSyncedAt: new Date(),
+            messageCount: counters.messageCount,
+            unreadCount: counters.unreadCount,
+          },
         });
         return;
       }
@@ -1487,7 +1739,6 @@ export class EmailSyncProcessor extends WorkerHost {
         streamingMode,
       );
       const uidBatches = chunkArray(messageUids, fetchBatchSize);
-      let processedCount = 0;
 
       for (const uidBatch of uidBatches) {
         const fetchedMessages: Array<{
@@ -1530,14 +1781,13 @@ export class EmailSyncProcessor extends WorkerHost {
 
         for (const chunk of chunks) {
           for (const msg of chunk) {
-            const created = await this.upsertMessage(
+            await this.upsertMessage(
               msg,
               mailboxId,
               organizationId,
               folder.id,
               folderType,
             );
-            if (created) processedCount += 1;
           }
           await this.applyChunkDelay(
             adaptiveBucketKey,
@@ -1549,6 +1799,7 @@ export class EmailSyncProcessor extends WorkerHost {
       }
 
       const maxUid = Math.max(...messageUids);
+      const counters = await this.refreshMailboxFolderCounters(folder.id);
       await this.prisma.mailboxFolder.update({
         where: { id: folder.id },
         data: {
@@ -1559,9 +1810,8 @@ export class EmailSyncProcessor extends WorkerHost {
               : undefined,
           syncStatus: 'SUCCESS',
           lastSyncedAt: new Date(),
-          ...(processedCount > 0
-            ? { messageCount: { increment: processedCount } }
-            : {}),
+          messageCount: counters.messageCount,
+          unreadCount: counters.unreadCount,
         },
       });
     } finally {
@@ -1922,3 +2172,4 @@ export class EmailSyncProcessor extends WorkerHost {
     return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
   }
 }
+

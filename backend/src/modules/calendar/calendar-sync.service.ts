@@ -47,7 +47,7 @@ interface ParsedCalDavEvent {
 export interface SyncGoogleParams {
   userId: string;
   organizationId: string;
-  accessToken: string;
+  accessToken?: string;
 }
 
 export interface SyncMicrosoftParams {
@@ -75,7 +75,9 @@ interface GoogleCalendarEvent {
   updated?: string;
   recurrence?: string[];
   attendees?: { email?: string; displayName?: string }[];
-  conferenceData?: { entryPoints?: { uri?: string }[] };
+  conferenceData?: {
+    entryPoints?: { uri?: string; entryPointType?: string }[];
+  };
   hangoutLink?: string;
 }
 
@@ -104,7 +106,14 @@ export class CalendarSyncService {
   async syncGoogle(
     params: SyncGoogleParams,
   ): Promise<{ synced: number; deleted: number }> {
-    const { userId, organizationId, accessToken } = params;
+    const { userId, organizationId } = params;
+    const accessToken = await this.resolveGoogleAccessToken(params);
+    if (!accessToken) {
+      this.logger.warn(
+        `[sync:google] Missing usable Google OAuth token for user=${userId} org=${organizationId}`,
+      );
+      return { synced: 0, deleted: 0 };
+    }
 
     const syncFrom = new Date();
     syncFrom.setDate(syncFrom.getDate() - 30);
@@ -541,6 +550,106 @@ export class CalendarSyncService {
         ...connection,
         lastError: this.stringifyError(err),
       });
+    }
+  }
+
+  async syncEventToGoogleIfConnected(params: {
+    eventId: string;
+    userId: string;
+    organizationId: string;
+  }): Promise<void> {
+    const { eventId, userId, organizationId } = params;
+
+    const event = await this.prisma.event.findFirst({
+      where: { id: eventId, organizationId },
+      include: { attendees: true },
+    });
+    if (!event) return;
+    if (event.status === 'cancelled') return;
+    if (event.provider && event.provider !== 'google') return;
+
+    const accessToken = await this.resolveGoogleAccessToken({
+      userId,
+      organizationId,
+    });
+    if (!accessToken) return;
+
+    const payload = this.buildGoogleEventPayload(event, event.attendees);
+    const requiresConferenceData =
+      event.meetingProvider === 'google_meet' &&
+      !(event.meetingLink || '').includes('meet.google.com/');
+    const query = new URLSearchParams();
+    query.set('sendUpdates', 'none');
+    if (requiresConferenceData) {
+      query.set('conferenceDataVersion', '1');
+    }
+    const queryString = query.toString();
+    const path = event.externalId
+      ? `/calendar/v3/calendars/primary/events/${encodeURIComponent(event.externalId)}${queryString ? `?${queryString}` : ''}`
+      : `/calendar/v3/calendars/primary/events${queryString ? `?${queryString}` : ''}`;
+    const method = event.externalId ? 'PATCH' : 'POST';
+
+    try {
+      const body = await this.httpsRequest('www.googleapis.com', {
+        path,
+        method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const remote = this.parseGoogleEventResponse(body);
+
+      await this.prisma.event.update({
+        where: { id: event.id },
+        data: {
+          provider: 'google',
+          syncUserId: userId,
+          externalId: remote.id ?? event.externalId ?? event.id,
+          externalUpdatedAt: remote.updatedAt ?? new Date(),
+          ...(remote.meetingLink
+            ? {
+                meetingLink: remote.meetingLink,
+                meetingProvider: 'google_meet',
+              }
+            : {}),
+        },
+      });
+    } catch (err) {
+      this.logger.error(
+        `[sync:google] Outbound sync failed for event=${event.id} user=${userId}: ${this.stringifyError(err)}`,
+      );
+    }
+  }
+
+  async deleteEventFromGoogleIfConnected(params: {
+    event: Pick<Event, 'id' | 'externalId' | 'provider'>;
+    userId: string;
+    organizationId: string;
+  }): Promise<void> {
+    const { event, userId, organizationId } = params;
+    if (event.provider !== 'google' || !event.externalId) return;
+
+    const accessToken = await this.resolveGoogleAccessToken({
+      userId,
+      organizationId,
+    });
+    if (!accessToken) return;
+
+    try {
+      await this.httpsRequest('www.googleapis.com', {
+        path: `/calendar/v3/calendars/primary/events/${encodeURIComponent(event.externalId)}`,
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+        allowStatusCodes: [404],
+      });
+    } catch (err) {
+      this.logger.error(
+        `[sync:google] Delete failed for event=${event.id} user=${userId}: ${this.stringifyError(err)}`,
+      );
     }
   }
 
@@ -1153,6 +1262,228 @@ export class CalendarSyncService {
     }
   }
 
+  private async resolveGoogleAccessToken(
+    params: SyncGoogleParams,
+  ): Promise<string | null> {
+    if (params.accessToken) {
+      return params.accessToken;
+    }
+
+    const mailbox = await this.prisma.mailbox.findFirst({
+      where: {
+        organizationId: params.organizationId,
+        provider: 'GMAIL',
+        deletedAt: null,
+        OR: [{ oauthAccessToken: { not: null } }, { googleAccessToken: { not: null } }],
+      },
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        oauthAccessToken: true,
+        oauthRefreshToken: true,
+        oauthTokenExpiresAt: true,
+        googleAccessToken: true,
+        googleRefreshToken: true,
+        googleTokenExpiresAt: true,
+      },
+    });
+
+    if (!mailbox) return null;
+
+    const encryptedToken = mailbox.oauthAccessToken || mailbox.googleAccessToken;
+    if (!encryptedToken) return null;
+
+    const accessToken = this.decrypt(encryptedToken);
+    if (!accessToken) return null;
+
+    const expiresAt = mailbox.oauthTokenExpiresAt || mailbox.googleTokenExpiresAt;
+    const expiringSoon = expiresAt
+      ? expiresAt.getTime() - Date.now() < 2 * 60 * 1000
+      : false;
+
+    if (!expiringSoon) {
+      return accessToken;
+    }
+
+    const refreshed = await this.refreshGoogleAccessToken(mailbox);
+    return refreshed ?? accessToken;
+  }
+
+  private async refreshGoogleAccessToken(mailbox: {
+    id: string;
+    oauthRefreshToken: string | null;
+    googleRefreshToken: string | null;
+  }): Promise<string | null> {
+    const encryptedRefreshToken =
+      mailbox.oauthRefreshToken || mailbox.googleRefreshToken;
+    if (!encryptedRefreshToken) return null;
+
+    const refreshToken = this.decrypt(encryptedRefreshToken);
+    if (!refreshToken) return null;
+
+    const clientId = this.config.get<string>('google.clientId') ?? '';
+    const clientSecret = this.config.get<string>('google.clientSecret') ?? '';
+    if (!clientId || !clientSecret) return null;
+
+    try {
+      const response = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token',
+        }),
+      });
+
+      if (!response.ok) {
+        this.logger.warn(
+          `[sync:google] OAuth refresh failed for mailbox=${mailbox.id} status=${response.status}`,
+        );
+        return null;
+      }
+
+      const payload = (await response.json()) as {
+        access_token?: string;
+        expires_in?: number;
+        refresh_token?: string;
+      };
+      if (!payload.access_token) return null;
+
+      const encryptedAccessToken = this.encrypt(payload.access_token);
+      const encryptedRefreshTokenUpdate = payload.refresh_token
+        ? this.encrypt(payload.refresh_token)
+        : encryptedRefreshToken;
+      const expiresAt = payload.expires_in
+        ? new Date(Date.now() + payload.expires_in * 1000)
+        : null;
+
+      await this.prisma.mailbox.update({
+        where: { id: mailbox.id },
+        data: {
+          oauthAccessToken: encryptedAccessToken,
+          googleAccessToken: encryptedAccessToken,
+          oauthRefreshToken: encryptedRefreshTokenUpdate,
+          googleRefreshToken: encryptedRefreshTokenUpdate,
+          ...(expiresAt
+            ? {
+                oauthTokenExpiresAt: expiresAt,
+                googleTokenExpiresAt: expiresAt,
+              }
+            : {}),
+        },
+      });
+
+      return payload.access_token;
+    } catch (err) {
+      this.logger.warn(
+        `[sync:google] OAuth refresh exception for mailbox=${mailbox.id}: ${this.stringifyError(err)}`,
+      );
+      return null;
+    }
+  }
+
+  private buildGoogleEventPayload(
+    event: Pick<
+      Event,
+      | 'title'
+      | 'description'
+      | 'startTime'
+      | 'endTime'
+      | 'timezone'
+      | 'allDay'
+      | 'location'
+      | 'meetingLink'
+      | 'meetingProvider'
+      | 'status'
+      | 'recurrenceRule'
+    >,
+    attendees: Pick<EventAttendee, 'email'>[],
+  ) {
+    const timezone = event.timezone || 'UTC';
+    const start = event.allDay
+      ? { date: this.formatAllDayDate(event.startTime) }
+      : { dateTime: event.startTime.toISOString(), timeZone: timezone };
+    const end = event.allDay
+      ? { date: this.formatAllDayDate(event.endTime) }
+      : { dateTime: event.endTime.toISOString(), timeZone: timezone };
+
+    const mappedStatus =
+      event.status === 'cancelled'
+        ? 'cancelled'
+        : event.status === 'tentative'
+          ? 'tentative'
+          : 'confirmed';
+
+    const payload: Record<string, unknown> = {
+      summary: event.title,
+      description: event.description ?? undefined,
+      start,
+      end,
+      location: event.location ?? undefined,
+      status: mappedStatus,
+      recurrence: event.recurrenceRule ? [`RRULE:${event.recurrenceRule}`] : undefined,
+      attendees:
+        attendees.length > 0
+          ? attendees.map((attendee) => ({ email: attendee.email }))
+          : undefined,
+    };
+
+    const hasValidMeetLink = (event.meetingLink || '').includes(
+      'meet.google.com/',
+    );
+    if (event.meetingProvider === 'google_meet' && !hasValidMeetLink) {
+      payload['conferenceData'] = {
+        createRequest: {
+          requestId: crypto.randomUUID(),
+        },
+      };
+    }
+
+    return payload;
+  }
+
+  private formatAllDayDate(value: Date): string {
+    return value.toISOString().slice(0, 10);
+  }
+
+  private parseGoogleEventResponse(body: string): {
+    id: string | null;
+    updatedAt: Date | null;
+    meetingLink: string | null;
+  } {
+    try {
+      const payload = JSON.parse(body) as {
+        id?: string;
+        updated?: string;
+        hangoutLink?: string;
+        conferenceData?: {
+          entryPoints?: Array<{ uri?: string; entryPointType?: string }>;
+        };
+      };
+
+      const meetingLink =
+        payload.hangoutLink ??
+        payload.conferenceData?.entryPoints?.find((entry) =>
+          entry.entryPointType === 'video' &&
+          entry.uri?.startsWith('https://'),
+        )?.uri ??
+        payload.conferenceData?.entryPoints?.find((entry) =>
+          entry.uri?.startsWith('https://'),
+        )?.uri ??
+        null;
+
+      return {
+        id: payload.id ?? null,
+        updatedAt: payload.updated ? new Date(payload.updated) : null,
+        meetingLink,
+      };
+    } catch {
+      return { id: null, updatedAt: null, meetingLink: null };
+    }
+  }
+
   private async softDeleteAbsent(
     organizationId: string,
     syncUserId: string,
@@ -1185,12 +1516,29 @@ export class CalendarSyncService {
     path: string,
     headers: Record<string, string>,
   ): Promise<string> {
+    return this.httpsRequest(hostname, {
+      path,
+      method: 'GET',
+      headers,
+    });
+  }
+
+  private httpsRequest(
+    hostname: string,
+    params: {
+      path: string;
+      method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+      headers: Record<string, string>;
+      body?: string;
+      allowStatusCodes?: number[];
+    },
+  ): Promise<string> {
     return new Promise((resolve, reject) => {
       const options: https.RequestOptions = {
         hostname,
-        path,
-        method: 'GET',
-        headers,
+        path: params.path,
+        method: params.method,
+        headers: params.headers,
       };
       const req = https.request(options, (res) => {
         let data = '';
@@ -1198,7 +1546,9 @@ export class CalendarSyncService {
           data += chunk.toString();
         });
         res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 400) {
+          const statusCode = res.statusCode ?? 500;
+          const allowedStatus = params.allowStatusCodes?.includes(statusCode);
+          if (statusCode >= 400 && !allowedStatus) {
             reject(new Error(`HTTP ${res.statusCode}: ${data}`));
           } else {
             resolve(data);
@@ -1206,6 +1556,9 @@ export class CalendarSyncService {
         });
       });
       req.on('error', reject);
+      if (params.body) {
+        req.write(params.body);
+      }
       req.end();
     });
   }

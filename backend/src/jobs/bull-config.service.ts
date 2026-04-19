@@ -21,6 +21,7 @@ export class BullConfigService implements SharedBullConfigurationFactory {
           this.configService.get<number>('redis.connectTimeoutMs') ?? 10000,
         maxRetriesPerRequest: null,
       },
+      prefix: this.configService.get<string>('redis.queuePrefix') ?? 'sermuno',
       defaultJobOptions: {
         attempts: 3,
         backoff: {

@@ -27,6 +27,7 @@ export class ScheduledMessagesService {
       scheduledAt: string;
       rrule?: string;
       timezone?: string;
+      threadStatusAfterSend?: string;
     },
     user: JwtUser,
   ) {
@@ -60,6 +61,7 @@ export class ScheduledMessagesService {
         scheduledAt,
         rrule: body.rrule,
         timezone: body.timezone ?? 'UTC',
+        threadStatusAfterSend: body.threadStatusAfterSend,
       },
       user,
     );
@@ -68,7 +70,10 @@ export class ScheduledMessagesService {
       where: {
         organizationId: user.organizationId,
         status: 'pending',
-        payload: { path: ['id'], equals: message.id },
+        OR: [
+          { payload: { path: ['messageId'], equals: message.id } },
+          { payload: { path: ['id'], equals: message.id } },
+        ],
       },
       orderBy: { createdAt: 'desc' },
     });

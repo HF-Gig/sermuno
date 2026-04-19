@@ -9,12 +9,14 @@ import { SCHEDULED_MESSAGES_QUEUE } from '../../jobs/queues/scheduled-messages.q
 import { NotificationsModule } from '../notifications/notifications.module';
 import { AuditModule } from '../audit/audit.module';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { WebsocketsModule } from '../websockets/websockets.module';
 
 @Module({
   imports: [
     AttachmentsModule,
     NotificationsModule,
     AuditModule,
+    WebsocketsModule,
     BullModule.registerQueue({ name: EMAIL_SEND_QUEUE }),
     BullModule.registerQueue({ name: SCHEDULED_MESSAGES_QUEUE }),
   ],

@@ -24,7 +24,7 @@ import {
     AtSign,
     FileText, Paperclip, Type, Reply, FileSignature,
     CheckCircle2, Archive, Trash2,
-    MoreHorizontal, Users, EyeOff, Star,
+    MoreHorizontal, Users, EyeOff, Star, RefreshCw,
     ArrowLeft, Check, Plus, X, Loader2, Columns2, ChevronLeft, ChevronRight
 } from 'lucide-react';
 import { clsx } from 'clsx';
@@ -33,11 +33,12 @@ const statusMap: Record<string, { label: string; variant: 'success' | 'warning' 
     new: { label: 'New', variant: 'info' },
     in_progress: { label: 'In Progress', variant: 'warning' },
     waiting: { label: 'Waiting', variant: 'neutral' },
-    resolved: { label: 'Resolved', variant: 'success' },
+    done: { label: 'Done', variant: 'success' },
     archived: { label: 'Archived', variant: 'error' },
+    resolved: { label: 'Done', variant: 'success' },
     open: { label: 'New', variant: 'info' },
     pending: { label: 'Waiting', variant: 'neutral' },
-    closed: { label: 'Resolved', variant: 'success' },
+    closed: { label: 'Done', variant: 'success' },
 };
 
 const NOTE_MENTION_SUGGESTION_LIMIT = 50;
@@ -51,7 +52,7 @@ const apiStatusToUiStatus = (status?: string | null, assignedUserId?: string | n
         case 'OPEN': return assignedUserId ? 'in_progress' : 'new';
         case 'PENDING': return 'waiting';
         case 'SNOOZED': return 'waiting';
-        case 'CLOSED': return 'resolved';
+        case 'CLOSED': return 'done';
         case 'ARCHIVED': return 'archived';
         case 'TRASH': return 'archived';
         case 'NEW':
@@ -68,9 +69,9 @@ const uiStatusToApiStatus = (status?: string | null) => {
         case 'waiting':
         case 'pending':
             return 'PENDING';
-        case 'resolved':
         case 'done':
         case 'closed':
+        case 'resolved':
             return 'CLOSED';
         case 'archived':
             return 'ARCHIVED';
@@ -194,17 +195,6 @@ const normalizeAddressList = (input: unknown): string[] => {
         .filter(Boolean);
 };
 
-const resolveFolderType = (name: string): FolderNavType | null => {
-    const normalized = String(name || '').toLowerCase();
-    if (normalized === '[gmail]' || normalized.includes('all mail') || normalized.includes('starred')) return null;
-    if (normalized === 'inbox' || normalized.includes('/inbox')) return 'inbox';
-    if (normalized.includes('sent')) return 'sent';
-    if (normalized.includes('draft')) return 'drafts';
-    if (normalized.includes('spam')) return 'spam';
-    if (normalized.includes('trash')) return 'trash';
-    return 'custom';
-};
-
 type SidebarFilterItem = {
     id: string;
     label: string;
@@ -227,21 +217,52 @@ const quickFilters: SidebarFilterItem[] = [
     { id: 'sla-breached', label: 'SLA Breached', icon: AlertCircle },
 ];
 
-const statusFilterOptions = ['All', 'new', 'open', 'pending', 'closed'];
+const statusFilterOptions = ['All', 'new', 'in_progress', 'waiting', 'done', 'archived'];
 const replyAfterSendOptions: Array<{ value: ScheduledStatePreset; label: string }> = [
     { value: 'no_change', label: 'No change' },
     { value: 'new', label: 'New' },
     { value: 'in_progress', label: 'In Progress' },
     { value: 'waiting', label: 'Waiting' },
-    { value: 'resolved', label: 'Resolved' },
+    { value: 'done', label: 'Done' },
 ];
 
 /* ---- Thread type options (for filter) ---- */
 const threadTypes = ['All', 'Return', 'Cancellation', 'Pre-sales', 'Support', 'Billing'];
 
-type FolderNavType = 'inbox' | 'sent' | 'drafts' | 'spam' | 'trash' | 'custom';
+type CanonicalFolderType = 'inbox' | 'sent' | 'drafts' | 'spam' | 'trash' | 'archive';
+type FolderNavType = 'inbox' | 'sent' | 'drafts' | 'spam' | 'trash' | 'archive' | 'custom';
+type ResolvedFolderType = CanonicalFolderType | 'custom' | 'excluded';
 
-const folderOrder: FolderNavType[] = ['inbox', 'sent', 'drafts', 'spam', 'trash'];
+const canonicalFolderTypes = new Set<CanonicalFolderType>(['inbox', 'sent', 'drafts', 'spam', 'trash', 'archive']);
+const folderOrder: FolderNavType[] = ['inbox', 'sent', 'drafts', 'spam', 'trash', 'archive'];
+
+const resolveFolderType = (name: string): ResolvedFolderType => {
+    const raw = String(name || '').trim().toLowerCase();
+    const normalized = String(name || '')
+        .toLowerCase()
+        .replace(/[\[\]().]/g, ' ')
+        .replace(/[_-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!normalized || normalized === '[gmail]' || normalized === 'gmail') return 'excluded';
+    if (
+        raw === '[gmail]/starred'
+        || raw === '[gmail]/important'
+        || normalized === 'gmail /starred'
+        || normalized === 'gmail /important'
+        || raw === 'flagged emails'
+        || raw === 'important'
+        || normalized === 'flagged emails'
+        || normalized === 'important'
+    ) return 'excluded';
+    if (normalized === 'inbox' || normalized.includes('/inbox')) return 'inbox';
+    if (normalized.includes('sent')) return 'sent';
+    if (normalized.includes('draft')) return 'drafts';
+    if (normalized.includes('spam') || normalized.includes('junk')) return 'spam';
+    if (normalized.includes('trash') || normalized.includes('deleted') || normalized.includes('bin')) return 'trash';
+    if (normalized.includes('all mail') || normalized.includes('archive')) return 'archive';
+    return 'custom';
+};
 
 const folderIcons: Record<FolderNavType, React.FC<{ className?: string }>> = {
     inbox: InboxIcon,
@@ -249,6 +270,7 @@ const folderIcons: Record<FolderNavType, React.FC<{ className?: string }>> = {
     drafts: FileText,
     spam: AlertCircle,
     trash: Trash2,
+    archive: Archive,
     custom: Hash,
 };
 
@@ -258,13 +280,14 @@ const folderLabelByType: Record<FolderNavType, string> = {
     drafts: 'Drafts',
     spam: 'Spam',
     trash: 'Trash',
+    archive: 'Archive',
     custom: 'Custom',
 };
 
 type SidebarItemKind = 'folder' | 'filter' | 'tag';
 type AssigneeOption = { id: string; label: string; type: 'user' | 'team' };
 type RecurrencePreset = 'none' | 'daily' | 'weekdays' | 'weekly' | 'monthly';
-type ScheduledStatePreset = 'no_change' | 'new' | 'in_progress' | 'waiting' | 'resolved';
+type ScheduledStatePreset = 'no_change' | 'new' | 'in_progress' | 'waiting' | 'done';
 type MailboxNavItem = { id: string; name: string; email: string; unreadCount: number; provider?: string };
 type MentionedUser = {
     id: string;
@@ -317,6 +340,25 @@ type NoteEditorWriter = NoteEditorReader & {
 
 type SidebarCounts = {
     [id: string]: number;
+};
+
+const getMailboxDisplayName = (mailbox?: { name?: string | null; email?: string | null } | null) => {
+    const name = String(mailbox?.name || '').trim();
+    const email = String(mailbox?.email || '').trim();
+    return name || email || 'Select mailbox';
+};
+
+const getMailboxSecondaryEmail = (mailbox?: { name?: string | null; email?: string | null } | null) => {
+    const name = String(mailbox?.name || '').trim().toLowerCase();
+    const email = String(mailbox?.email || '').trim();
+    if (!email) return '';
+    if (name && name === email.toLowerCase()) return '';
+    return email;
+};
+
+const formatSelectedStatusLabel = (status: string) => {
+    if (status === 'All') return 'All statuses';
+    return status.replace(/_/g, ' ');
 };
 
 const getProviderKey = (provider?: string | null): 'gmail' | 'microsoft' | 'smtp' => {
@@ -759,7 +801,6 @@ const InboxPage: React.FC = () => {
     const replyAttachmentInputRef = useRef<HTMLInputElement | null>(null);
 
     const [isThreadLoading, setIsThreadLoading] = useState(false);
-    const [isThreadListLoading, setIsThreadListLoading] = useState(false);
     const [showCustomSnoozeDatePicker, setShowCustomSnoozeDatePicker] = useState(false);
     const [customSnoozeDate, setCustomSnoozeDate] = useState<Date | null>(null);
 
@@ -815,6 +856,8 @@ const InboxPage: React.FC = () => {
     const [isXl, setIsXl] = useState(() => window.innerWidth >= 1280);
     const [mailboxDataVersion, setMailboxDataVersion] = useState(0);
     const [realtimeListVersion, setRealtimeListVersion] = useState(0);
+    const [detailRefreshVersion, setDetailRefreshVersion] = useState(0);
+    const [isSidebarManualRefreshing, setIsSidebarManualRefreshing] = useState(false);
     const hasLoadedOnceRef = useRef(false);
     const noteMentionRequestRef = useRef(0);
     const shouldShowMentionLoading = useAdaptiveLoading(isLoadingNoteMentions, {
@@ -1115,6 +1158,7 @@ const InboxPage: React.FC = () => {
     const realtimeRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const sidebarRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const apiThreadsRef = useRef<any[]>([]);
+    const starMutationVersionRef = useRef<Record<string, number>>({});
 
     useEffect(() => {
         apiThreadsRef.current = apiThreads;
@@ -1159,6 +1203,7 @@ const InboxPage: React.FC = () => {
         () => folderItems,
         [folderItems]
     );
+    const activeFolderIdForQuery = activeSidebarItem.kind === 'folder' ? activeFolderId : '';
 
     const activeTagName = useMemo(
         () => apiTags.find((tag: any) => tag.id === activeTagId)?.name ?? null,
@@ -1179,6 +1224,7 @@ const InboxPage: React.FC = () => {
         () => mailboxes.find((mailbox) => String(mailbox.id) === String(activeMailboxId)) || null,
         [mailboxes, activeMailboxId],
     );
+    const showInitialInboxSkeleton = isPageLoading && apiThreads.length === 0 && hasAttachedMailbox !== false;
 
     const allFilterItems = useMemo(() => [...globalItems, ...quickFilters], []);
 
@@ -1208,14 +1254,8 @@ const InboxPage: React.FC = () => {
     const threads = useMemo(() => {
         let list = [...overriddenMocks];
 
-        if (activeSidebarItem.kind === 'folder') {
-            if (activeFolder?.type === 'spam' || activeFolder?.type === 'trash') {
-                list = list.filter(thread => thread.status === activeFolder.type);
-            }
-            // For regular folders (Inbox/Sent/Drafts), backend already filters by folderId.
-            // Avoid re-filtering by latest message folder on client because that can hide
-            // valid threads (e.g. sent threads where latest message moved to another folder).
-        }
+        // Folder filtering is handled server-side via folderId/folder params.
+        // Do not re-filter client-side by thread status or local heuristics.
 
         if (activeSidebarItem.kind === 'tag' && activeTagName) {
             list = list.filter(thread => (thread.tags || []).includes(activeTagName));
@@ -1229,9 +1269,9 @@ const InboxPage: React.FC = () => {
             const normalizedStatus = selectedStatus.toLowerCase();
             list = list.filter(thread => {
                 const threadStatus = String(thread.status || '').toLowerCase();
-                if (normalizedStatus === 'open') return threadStatus === 'open' || threadStatus === 'in_progress';
-                if (normalizedStatus === 'pending') return threadStatus === 'pending' || threadStatus === 'waiting';
-                if (normalizedStatus === 'closed') return threadStatus === 'closed' || threadStatus === 'done';
+                if (threadStatus === 'resolved' || threadStatus === 'closed') {
+                    return normalizedStatus === 'done';
+                }
                 return threadStatus === normalizedStatus;
             });
         }
@@ -1312,7 +1352,13 @@ const InboxPage: React.FC = () => {
             if (!canFetchProtectedData) {
                 return [];
             }
-            if (activeSidebarItem.kind === 'folder' && (!activeMailboxId || !activeFolderId)) {
+            if (hasAttachedMailbox === null) {
+                return [];
+            }
+            if (hasAttachedMailbox === true && !activeMailboxId) {
+                return [];
+            }
+            if (activeSidebarItem.kind === 'folder' && (!activeMailboxId || !activeFolderIdForQuery)) {
                 return [];
             }
 
@@ -1333,11 +1379,8 @@ const InboxPage: React.FC = () => {
             if (activeMailboxId) {
                 params.append('mailboxId', activeMailboxId);
             }
-            if (activeSidebarItem.kind === 'folder' && activeFolderId) {
-                params.append('folderId', activeFolderId);
-            }
-            if (activeSidebarItem.kind === 'folder' && activeFolder?.type) {
-                params.append('folder', activeFolder.type);
+            if (activeSidebarItem.kind === 'folder' && activeFolderIdForQuery) {
+                params.append('folderId', activeFolderIdForQuery);
             }
 
             if (activeSidebarItem.kind === 'tag' && activeTagId) {
@@ -1408,6 +1451,12 @@ const InboxPage: React.FC = () => {
                     t.messages?.[0]?.bodyText,
                     t.messages?.[0]?.bodyHtml,
                 ),
+                hasPendingScheduledReply: Boolean(t.hasPendingScheduledReply),
+                pendingScheduledAt: t.pendingScheduledAt || null,
+                pendingScheduledStatus: String(t.pendingScheduledStatus || '').toLowerCase() || null,
+                latestMessageIsScheduled: Boolean(t.messages?.[0]?.isDraft && !t.messages?.[0]?.messageId),
+                latestScheduledAt: t.messages?.[0]?.scheduledAt || null,
+                latestScheduledStatus: String(t.messages?.[0]?.scheduledStatus || '').toLowerCase() || null,
                 read: t.messages?.[0]?.isRead ?? true,
                 unreadCount: t.messages?.[0]?.isRead === false ? 1 : 0,
                 folderId: t.messages?.[0]?.folderId || seedThreadFolderById.get(String(t.id)) || 'f1',
@@ -1443,7 +1492,13 @@ const InboxPage: React.FC = () => {
             if (!canFetchProtectedData) {
                 return;
             }
-            if (activeSidebarItem.kind === 'folder' && (!activeMailboxId || !activeFolderId)) {
+            if (hasAttachedMailbox === null) {
+                return;
+            }
+            if (hasAttachedMailbox === true && !activeMailboxId) {
+                return;
+            }
+            if (activeSidebarItem.kind === 'folder' && (!activeMailboxId || !activeFolderIdForQuery)) {
                 return;
             }
 
@@ -1451,8 +1506,6 @@ const InboxPage: React.FC = () => {
             const showFullPageLoader = !hasLoadedOnceRef.current && apiThreads.length === 0;
             if (showFullPageLoader) {
                 setIsPageLoading(true);
-            } else if (isSplitMode) {
-                setIsThreadListLoading(true);
             }
             try {
                 const [threadsData, tagsData] = await Promise.all([fetchThreads(), fetchTags()]);
@@ -1464,14 +1517,12 @@ const InboxPage: React.FC = () => {
             } finally {
                 if (showFullPageLoader) {
                     setIsPageLoading(false);
-                } else if (isSplitMode) {
-                    setIsThreadListLoading(false);
                 }
             }
         };
 
         fetchData();
-    }, [activeFolderId, activeFolder?.type, activeMailboxId, activeSidebarItem.kind, activeSidebarItem.id, activeTagId, selectedStatus, currentPage, seedThreadFolderById, isSplitMode, searchTerm, canFetchProtectedData, realtimeListVersion]);
+    }, [activeFolderIdForQuery, activeMailboxId, activeSidebarItem.kind, activeSidebarItem.id, activeTagId, selectedStatus, currentPage, seedThreadFolderById, searchTerm, canFetchProtectedData, realtimeListVersion, hasAttachedMailbox]);
 
     useEffect(() => {
         loadInboxCounts();
@@ -1508,7 +1559,7 @@ const InboxPage: React.FC = () => {
                         : 0;
                     return {
                         id: mailbox.id,
-                        name: mailbox.name || mailbox.email || 'Mailbox',
+                        name: mailbox.name || '',
                         email: mailbox.email || '',
                         unreadCount,
                         provider: String(mailbox.provider || '').toUpperCase(),
@@ -1530,27 +1581,32 @@ const InboxPage: React.FC = () => {
                 folders.forEach((folder: any) => {
                     const apiType = String(folder.type || '').toLowerCase();
                     const inferredType = resolveFolderType(folder.name);
-                    const type = (apiType === 'inbox' || apiType === 'sent' || apiType === 'drafts' || apiType === 'spam' || apiType === 'trash')
-                        ? (apiType as FolderNavType)
+                    const resolvedType = canonicalFolderTypes.has(apiType as CanonicalFolderType)
+                        ? (apiType as CanonicalFolderType)
                         : inferredType;
-                    if (!type) return;
+                    const unreadCount = Number(folder.unreadCount || 0);
 
-                    if (type === 'custom') {
+                    if (resolvedType === 'excluded') {
+                        return;
+                    }
+
+                    if (resolvedType === 'custom') {
                         customFolders.push({
                             id: folder.id,
                             name: folder.name || 'Custom folder',
-                            unreadCount: Number(folder.unreadCount || 0),
+                            unreadCount,
                             type: 'custom',
                         });
                         return;
                     }
 
+                    const type = resolvedType as FolderNavType;
                     if (canonicalFolders.has(type)) return;
 
                     canonicalFolders.set(type, {
                         id: folder.id,
                         name: folderLabelByType[type],
-                        unreadCount: Number(folder.unreadCount || 0),
+                        unreadCount,
                         type,
                     });
                 });
@@ -1561,22 +1617,26 @@ const InboxPage: React.FC = () => {
                     .concat(customFolders);
 
                 setMailboxFolders(nextFolders);
-                if (nextFolders.length > 0 && !nextFolders.some((folder: any) => folder.id === activeFolderId)) {
-                    setActiveFolderId(nextFolders[0].id);
-                }
+                setActiveFolderId((previousFolderId) => {
+                    if (nextFolders.length === 0) return '';
+                    if (nextFolders.some((folder: any) => folder.id === previousFolderId)) {
+                        return previousFolderId;
+                    }
+                    return nextFolders[0].id;
+                });
             } catch (error) {
                 console.error('Failed to fetch mailbox folders:', error);
             }
         };
 
         fetchMailboxFolders();
-    }, [activeMailboxId, activeFolderId, canFetchProtectedData, mailboxDataVersion]);
+    }, [activeMailboxId, canFetchProtectedData, mailboxDataVersion]);
 
     useEffect(() => {
         if (!canFetchProtectedData) return;
         if (hasAttachedMailbox !== true) return;
         if (!activeMailboxId) return;
-        if (isPageLoading || isThreadListLoading) return;
+        if (isPageLoading) return;
         if (apiThreads.length > 0) return;
         if (autoSyncTriggeredMailboxIdRef.current === activeMailboxId) return;
 
@@ -1584,7 +1644,7 @@ const InboxPage: React.FC = () => {
         api.post(`/mailboxes/${activeMailboxId}/sync`).catch((err) => {
             console.error('Failed to trigger inbox auto-sync:', err);
         });
-    }, [activeMailboxId, apiThreads.length, canFetchProtectedData, hasAttachedMailbox, isPageLoading, isThreadListLoading]);
+    }, [activeMailboxId, apiThreads.length, canFetchProtectedData, hasAttachedMailbox, isPageLoading]);
 
     useEffect(() => {
         const fetchAssigneeOptions = async () => {
@@ -1685,6 +1745,10 @@ const InboxPage: React.FC = () => {
                         createdAt: m.createdAt,
                         direction: m.direction,
                         isRead: m.isRead,
+                        isDraft: Boolean(m.isDraft),
+                        messageId: m.messageId || null,
+                        scheduledAt: m.scheduledAt || null,
+                        scheduledStatus: m.scheduledStatus || null,
                         attachments: m.attachments || []
                     })));
                     setInternalNotes(Array.isArray(notesRes.data) ? notesRes.data : []);
@@ -1716,7 +1780,7 @@ const InboxPage: React.FC = () => {
             setInternalNotes([]);
             setLoadedThread(null);
         }
-    }, [resolvedRouteThreadId, canFetchProtectedData, mailboxes]);
+    }, [resolvedRouteThreadId, canFetchProtectedData, mailboxes, detailRefreshVersion]);
 
     useEffect(() => {
         api.get('/templates').then(res => {
@@ -1825,15 +1889,35 @@ const InboxPage: React.FC = () => {
 
     const handleToggleStar = async (threadIdValue: string, nextValue?: boolean) => {
         const threadId = String(threadIdValue).replace('t', '');
-        const existing = apiThreads.find((entry) => String(entry.id) === threadId || String(entry.id) === threadIdValue);
-        const starred = typeof nextValue === 'boolean' ? nextValue : !Boolean(existing?.starred);
-        await api.patch(`/threads/${threadId}/star`, { starred });
-        setApiThreads((prev) => prev.map((entry) => (
-            String(entry.id) === threadId
-                ? { ...entry, starred }
-                : entry
-        )));
-        refreshSidebarDataForEvent(existing?.mailboxId || activeMailboxId || null, threadId);
+        const existing = apiThreadsRef.current.find((entry) => String(entry.id) === threadId || String(entry.id) === threadIdValue);
+        const previousStarred = Boolean(existing?.starred);
+        const starred = typeof nextValue === 'boolean' ? nextValue : !previousStarred;
+
+        const mutationVersion = (starMutationVersionRef.current[threadId] || 0) + 1;
+        starMutationVersionRef.current[threadId] = mutationVersion;
+
+        const applyStarState = (value: boolean) => {
+            setApiThreads((prev) => prev.map((entry) => (
+                String(entry.id) === threadId
+                    ? { ...entry, starred: value }
+                    : entry
+            )));
+            setLoadedThread((prev: any) => {
+                if (!prev || String(prev.id) !== threadId) return prev;
+                return { ...prev, starred: value };
+            });
+        };
+
+        applyStarState(starred);
+        try {
+            await api.patch(`/threads/${threadId}/star`, { starred });
+            refreshSidebarDataForEvent(existing?.mailboxId || activeMailboxId || null, threadId);
+        } catch (error) {
+            if (starMutationVersionRef.current[threadId] === mutationVersion) {
+                applyStarState(previousStarred);
+            }
+            throw error;
+        }
     };
 
     const handleToggleArchive = async (threadIdValue: string, archived: boolean) => {
@@ -2034,6 +2118,9 @@ const InboxPage: React.FC = () => {
                 bodyText: finalBodyText,
                 ...(resolvedScheduledAt ? { scheduledAt: resolvedScheduledAt.toISOString() } : {}),
                 ...(rrule ? { rrule, timezone: detectedTimezone } : {}),
+                ...(resolvedScheduledAt && resolvedScheduledState !== 'no_change'
+                    ? { threadStatusAfterSend: uiStatusToApiStatus(resolvedScheduledState) }
+                    : {}),
             };
             let attachmentFailureMessage = '';
 
@@ -2054,9 +2141,8 @@ const InboxPage: React.FC = () => {
                     }
                 }
 
-                if (resolvedScheduledState !== 'no_change' && actualOpenThread) {
-                    await handleStatusChange(openThread.id, resolvedScheduledState);
-                }
+                scheduleThreadListRefresh();
+                refreshSidebarDataForEvent(mailboxIdForSend, actualThreadId);
                 setReplyError(attachmentFailureMessage);
             } else {
                 const replyPayload = {
@@ -2116,9 +2202,9 @@ const InboxPage: React.FC = () => {
             return;
         }
 
-        if (resolvedScheduledState !== 'no_change' && actualOpenThread) {
+        if (!resolvedScheduledAt && resolvedScheduledState !== 'no_change' && actualOpenThread) {
             await handleStatusChange(openThread.id, resolvedScheduledState);
-        } else if (actualOpenThread?.status === 'new') {
+        } else if (!resolvedScheduledAt && actualOpenThread?.status === 'new') {
             // Auto-change status from New to In Progress on first reply
             await handleStatusChange(openThread.id, 'in_progress');
         }
@@ -2263,6 +2349,7 @@ const InboxPage: React.FC = () => {
             if (!updatedThreadId) return;
             const eventMailboxId = data?.mailboxId || data?.mailbox?.id || null;
             if (!shouldProcessMailboxEvent(eventMailboxId, updatedThreadId)) return;
+            const hasSchedulingLifecycleUpdate = typeof data?.scheduledStatus === 'string' || typeof data?.deliveryState === 'string';
 
             const existsOnCurrentPage = apiThreadsRef.current.some((thread) => String(thread.id) === updatedThreadId);
 
@@ -2281,7 +2368,7 @@ const InboxPage: React.FC = () => {
                 )
             );
 
-            if (!existsOnCurrentPage || currentPage > 1) {
+            if (!existsOnCurrentPage || currentPage > 1 || hasSchedulingLifecycleUpdate) {
                 scheduleThreadListRefresh();
             }
 
@@ -2322,9 +2409,16 @@ const InboxPage: React.FC = () => {
         const handleMailboxSynced = (payload: any) => {
             if (!payload?.mailboxId) return;
             if (!shouldProcessMailboxEvent(payload.mailboxId, null)) return;
+
+            const syncStatus = String(payload.syncStatus || '').toUpperCase();
+            // Ignore "SYNCING" lifecycle events to avoid redundant reload loops.
+            if (syncStatus === 'SYNCING') return;
+
             lastFetchedFoldersMailboxIdRef.current = null;
             setMailboxDataVersion((prev) => prev + 1);
-            scheduleThreadListRefresh();
+            if (syncStatus === 'SUCCESS' || syncStatus === '') {
+                scheduleThreadListRefresh();
+            }
             refreshSidebarDataForEvent(payload.mailboxId, null);
         };
 
@@ -2699,6 +2793,22 @@ const InboxPage: React.FC = () => {
     };
 
     const getSidebarCount = useCallback((id: string) => Number(sidebarCounts[id] || 0), [sidebarCounts]);
+    const activeSidebarButtonClasses = 'bg-[var(--color-cta-primary)]/12 text-[var(--color-cta-primary)] border border-[var(--color-cta-primary)]/35 shadow-sm';
+    const inactiveSidebarButtonClasses = 'text-[var(--color-text-muted)] hover:bg-white/70 hover:text-[var(--color-text-primary)] border border-transparent';
+
+    const handleManualInboxRefresh = useCallback(async () => {
+        if (isSidebarManualRefreshing || !canFetchProtectedData) return;
+        setIsSidebarManualRefreshing(true);
+        try {
+            await loadInboxCounts();
+            lastFetchedFoldersMailboxIdRef.current = null;
+            setMailboxDataVersion((prev) => prev + 1);
+            setRealtimeListVersion((prev) => prev + 1);
+            setDetailRefreshVersion((prev) => prev + 1);
+        } finally {
+            setIsSidebarManualRefreshing(false);
+        }
+    }, [canFetchProtectedData, isSidebarManualRefreshing, loadInboxCounts]);
 
     const expandAllSidebarSections = () => {
         setExpandedStatus(true);
@@ -2728,6 +2838,16 @@ const InboxPage: React.FC = () => {
                     <div className="flex items-center justify-between gap-2">
                         <h2 className="text-sm font-bold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>Inbox</h2>
                         <div className="flex items-center gap-1">
+                            <button
+                                type="button"
+                                onClick={() => { void handleManualInboxRefresh(); }}
+                                disabled={isSidebarManualRefreshing || !canFetchProtectedData}
+                                className="inline-flex h-6 w-6 items-center justify-center rounded border border-[var(--color-card-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-60"
+                                title="Refresh inbox"
+                                aria-label="Refresh inbox"
+                            >
+                                <RefreshCw className={clsx('h-3.5 w-3.5', isSidebarManualRefreshing && 'animate-spin')} />
+                            </button>
                             <button
                                 type="button"
                                 onClick={areSidebarSectionsExpanded ? collapseAllSidebarSections : expandAllSidebarSections}
@@ -2763,8 +2883,14 @@ const InboxPage: React.FC = () => {
                                         <div className="min-w-0 flex items-start gap-2">
                                             <ProviderLogo provider={activeMailbox?.provider} className="h-4 w-4 shrink-0 mt-0.5" />
                                             <div className="min-w-0">
-                                                <div className="text-[12px] font-medium text-[var(--color-text-primary)] break-words">{activeMailbox?.name || activeMailbox?.email || 'Select mailbox'}</div>
-                                                {activeMailbox?.email && <div className="mt-0.5 text-[11px] text-[var(--color-text-muted)] break-all">{activeMailbox.email}</div>}
+                                                <div className="text-[12px] font-medium text-[var(--color-text-primary)] truncate whitespace-nowrap" title={getMailboxDisplayName(activeMailbox)}>
+                                                    {getMailboxDisplayName(activeMailbox)}
+                                                </div>
+                                                {getMailboxSecondaryEmail(activeMailbox) && (
+                                                    <div className="mt-0.5 text-[11px] text-[var(--color-text-muted)] truncate whitespace-nowrap" title={getMailboxSecondaryEmail(activeMailbox)}>
+                                                        {getMailboxSecondaryEmail(activeMailbox)}
+                                                    </div>
+                                                )}
                                             </div>
                                         </div>
                                         <ChevronDown className={clsx('w-3 h-3 shrink-0 text-[var(--color-text-muted)] transition-transform mt-0.5', openDropdown === 'mailbox-switcher' && 'rotate-180')} />
@@ -2795,8 +2921,14 @@ const InboxPage: React.FC = () => {
                                                     <div className="min-w-0 flex items-start gap-2">
                                                         <ProviderLogo provider={mailbox.provider} className="h-4 w-4 shrink-0 mt-0.5" />
                                                         <div className="min-w-0">
-                                                            <div className="text-[12px] font-medium break-words">{mailbox.name || mailbox.email}</div>
-                                                            {mailbox.email && <div className="mt-0.5 text-[11px] opacity-80 break-all">{mailbox.email}</div>}
+                                                            <div className="text-[12px] font-medium truncate whitespace-nowrap" title={getMailboxDisplayName(mailbox)}>
+                                                                {getMailboxDisplayName(mailbox)}
+                                                            </div>
+                                                            {getMailboxSecondaryEmail(mailbox) && (
+                                                                <div className="mt-0.5 text-[11px] opacity-80 truncate whitespace-nowrap" title={getMailboxSecondaryEmail(mailbox)}>
+                                                                    {getMailboxSecondaryEmail(mailbox)}
+                                                                </div>
+                                                            )}
                                                         </div>
                                                     </div>
                                                     {mailbox.unreadCount > 0 && (
@@ -2825,8 +2957,8 @@ const InboxPage: React.FC = () => {
                                     className={clsx(
                                         'w-full flex items-center justify-between px-3 py-1.5 text-[13px] font-medium rounded-lg transition-colors',
                                         activeSidebarItem.kind === 'filter' && activeSidebarItem.id === item.id
-                                            ? 'bg-white text-[var(--color-primary)] shadow-sm'
-                                            : 'text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
+                                            ? activeSidebarButtonClasses
+                                            : inactiveSidebarButtonClasses
                                     )}
                                 >
                                     <div className="flex items-center gap-2.5">
@@ -2837,6 +2969,26 @@ const InboxPage: React.FC = () => {
                                 </button>
                             );
                         })}
+                        <button
+                            onClick={() => {
+                                setActiveTagId(null);
+                                setSelectedType('All');
+                                setActiveFilter('mailbox-starred');
+                                setActiveSidebarItem({ kind: 'filter', id: 'mailbox-starred' });
+                            }}
+                            className={clsx(
+                                'w-full flex items-center justify-between px-3 py-1.5 text-[13px] font-medium rounded-lg transition-colors',
+                                activeSidebarItem.kind === 'filter' && activeSidebarItem.id === 'mailbox-starred'
+                                    ? activeSidebarButtonClasses
+                                    : inactiveSidebarButtonClasses
+                            )}
+                        >
+                            <div className="flex items-center gap-2.5">
+                                <Star className="w-4 h-4" />
+                                Starred
+                            </div>
+                            {mailboxDerivedCounts.starred > 0 && <span className="text-[10px] opacity-50">{mailboxDerivedCounts.starred}</span>}
+                        </button>
                     </div>
 
                     {/* Status */}
@@ -2854,7 +3006,7 @@ const InboxPage: React.FC = () => {
                                     onClick={() => setOpenDropdown(openDropdown === 'sidebar-status' ? null : 'sidebar-status')}
                                     className="w-full text-[12px] border border-[var(--color-card-border)] rounded-lg px-2 py-1.5 bg-white text-[var(--color-text-primary)] flex items-center justify-between gap-2"
                                 >
-                                    <span className="truncate capitalize">{selectedStatus === 'All' ? 'All statuses' : selectedStatus.replace('_', ' ')}</span>
+                                    <span className="truncate capitalize">{formatSelectedStatusLabel(selectedStatus)}</span>
                                     <ChevronDown className={clsx('w-3 h-3 shrink-0 text-[var(--color-text-muted)] transition-transform', openDropdown === 'sidebar-status' && 'rotate-180')} />
                                 </button>
                                 {openDropdown === 'sidebar-status' && (
@@ -2868,7 +3020,7 @@ const InboxPage: React.FC = () => {
                                                 }}
                                                 className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
                                             >
-                                                <span className="capitalize">{status === 'All' ? 'All statuses' : status.replace('_', ' ')}</span>
+                                                <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
                                                 {selectedStatus === status && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
                                             </button>
                                         ))}
@@ -2897,8 +3049,8 @@ const InboxPage: React.FC = () => {
                                     className={clsx(
                                         'w-full flex items-center justify-between px-3 py-1.5 text-[13px] font-medium rounded-lg transition-colors',
                                         activeSidebarItem.kind === 'filter' && activeSidebarItem.id === item.id
-                                            ? 'bg-white text-[var(--color-primary)] shadow-sm'
-                                            : 'text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
+                                            ? activeSidebarButtonClasses
+                                            : inactiveSidebarButtonClasses
                                     )}
                                 >
                                     <div className="flex items-center gap-2.5">
@@ -2940,8 +3092,8 @@ const InboxPage: React.FC = () => {
                                             className={clsx(
                                                 'w-full flex items-center justify-between px-3 py-1.5 text-[13px] rounded-lg border transition-colors',
                                                 isActive
-                                                    ? 'bg-white border-[var(--color-card-border)] text-[var(--color-text-primary)] shadow-sm'
-                                                    : 'bg-transparent border-transparent text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
+                                                    ? activeSidebarButtonClasses
+                                                    : inactiveSidebarButtonClasses
                                             )}
                                         >
                                             <div className="flex items-center gap-2.5 min-w-0">
@@ -2964,54 +3116,6 @@ const InboxPage: React.FC = () => {
                                         </button>
                                     );
                                 })}
-                                <button
-                                    onClick={() => {
-                                        setActiveTagId(null);
-                                        setSelectedType('All');
-                                        setActiveFilter('mailbox-starred');
-                                        setActiveSidebarItem({ kind: 'filter', id: 'mailbox-starred' });
-                                    }}
-                                    className={clsx(
-                                        'w-full flex items-center justify-between px-3 py-1.5 text-[13px] rounded-lg border transition-colors',
-                                        activeSidebarItem.kind === 'filter' && activeSidebarItem.id === 'mailbox-starred'
-                                            ? 'bg-white border-[var(--color-card-border)] text-[var(--color-text-primary)] shadow-sm'
-                                            : 'bg-transparent border-transparent text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
-                                    )}
-                                >
-                                    <div className="flex items-center gap-2.5 min-w-0">
-                                        <Star className="w-4 h-4 shrink-0" />
-                                        <span className="truncate" style={{ fontFamily: 'var(--font-body)' }}>Starred</span>
-                                    </div>
-                                    {mailboxDerivedCounts.starred > 0 && (
-                                        <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-[var(--color-text-muted)] border-[var(--color-card-border)]/70">
-                                            {mailboxDerivedCounts.starred}
-                                        </span>
-                                    )}
-                                </button>
-                                <button
-                                    onClick={() => {
-                                        setActiveTagId(null);
-                                        setSelectedType('All');
-                                        setActiveFilter('mailbox-archive');
-                                        setActiveSidebarItem({ kind: 'filter', id: 'mailbox-archive' });
-                                    }}
-                                    className={clsx(
-                                        'w-full flex items-center justify-between px-3 py-1.5 text-[13px] rounded-lg border transition-colors',
-                                        activeSidebarItem.kind === 'filter' && activeSidebarItem.id === 'mailbox-archive'
-                                            ? 'bg-white border-[var(--color-card-border)] text-[var(--color-text-primary)] shadow-sm'
-                                            : 'bg-transparent border-transparent text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
-                                    )}
-                                >
-                                    <div className="flex items-center gap-2.5 min-w-0">
-                                        <Archive className="w-4 h-4 shrink-0" />
-                                        <span className="truncate" style={{ fontFamily: 'var(--font-body)' }}>Archive</span>
-                                    </div>
-                                    {mailboxDerivedCounts.archive > 0 && (
-                                        <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-[var(--color-text-muted)] border-[var(--color-card-border)]/70">
-                                            {mailboxDerivedCounts.archive}
-                                        </span>
-                                    )}
-                                </button>
                             </div>
                         )}
                     </div>
@@ -3040,8 +3144,8 @@ const InboxPage: React.FC = () => {
                                             className={clsx(
                                                 'w-full flex items-center justify-between px-3 py-1.5 text-[13px] rounded-lg border transition-colors',
                                                 isActive
-                                                    ? 'bg-white border-[var(--color-card-border)] text-[var(--color-text-primary)] shadow-sm'
-                                                    : 'bg-transparent border-transparent text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
+                                                    ? activeSidebarButtonClasses
+                                                    : inactiveSidebarButtonClasses
                                             )}
                                         >
                                             <div className="flex items-center gap-2.5 min-w-0">
@@ -3072,8 +3176,8 @@ const InboxPage: React.FC = () => {
                                             className={clsx(
                                                 'w-full flex items-center justify-between px-3 py-1.5 text-[13px] rounded-lg border transition-colors',
                                                 isActive
-                                                    ? 'bg-white border-[var(--color-card-border)] text-[var(--color-text-primary)] shadow-sm'
-                                                    : 'bg-transparent border-transparent text-[var(--color-text-muted)] hover:bg-white/60 hover:text-[var(--color-text-primary)]'
+                                                    ? activeSidebarButtonClasses
+                                                    : inactiveSidebarButtonClasses
                                             )}
                                         >
                                             <div className="flex items-center gap-2.5 min-w-0">
@@ -3136,10 +3240,15 @@ const InboxPage: React.FC = () => {
 
 
             {/* ── Main Content ── */}
-            {isThreadLoading && !isSplitMode ? (
-                <div className="flex-1 flex overflow-hidden bg-white"><ThreadDetailSkeleton /></div>
-            ) : isPageLoading ? (
-                <div className="flex-1 flex overflow-hidden bg-white"><ThreadDetailSkeleton /></div>
+            {showInitialInboxSkeleton ? (
+                <div className="flex-1 flex overflow-hidden bg-white">
+                    <div className="hidden md:flex w-[24rem] max-w-[38vw] shrink-0 border-r border-[var(--color-card-border)]">
+                        <InboxThreadListSkeleton />
+                    </div>
+                    <div className="flex-1 flex overflow-hidden bg-white">
+                        <ThreadDetailSkeleton />
+                    </div>
+                </div>
             ) : hasAttachedMailbox === false ? (
                 <div className="flex-1 flex items-center justify-center bg-[var(--color-background)]/20 px-6">
                     <div className="max-w-md text-center">
@@ -3250,7 +3359,7 @@ const InboxPage: React.FC = () => {
                                                 : 'hover:bg-[var(--color-background)] text-[var(--color-text-primary)]'
                                         )}
                                     >
-                                        <span className="truncate">Status: {selectedStatus.replace('_', ' ')}</span>
+                                        <span className="truncate">Status: {formatSelectedStatusLabel(selectedStatus)}</span>
                                         <ChevronDown className={clsx('w-3 h-3 absolute right-1.5 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)] transition-transform pointer-events-none', openDropdown === 'split-status' && 'rotate-180')} />
                                     </button>
                                     {openDropdown === 'split-status' && (
@@ -3264,7 +3373,7 @@ const InboxPage: React.FC = () => {
                                                     }}
                                                     className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
                                                 >
-                                                    <span className="capitalize">{status.replace('_', ' ')}</span>
+                                                    <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
                                                     {selectedStatus === status && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
                                                 </button>
                                             ))}
@@ -3283,75 +3392,74 @@ const InboxPage: React.FC = () => {
                                 </div>
                             </div>
                             <div className="flex-1 overflow-y-auto no-scrollbar p-3 space-y-2.5">
-                                {isThreadListLoading ? (
-                                    <InboxThreadListSkeleton />
-                                ) : (
-                                    threads.map((thread) => {
-                                        const isCurrentThread = actualOpenThread && String(thread.id).replace('t', '') === String(actualOpenThread.id).replace('t', '');
-                                        return (
-                                            <button
-                                                type="button"
-                                                key={thread.id}
-                                                onClick={() => navigate(toThreadPath(thread.id))}
-                                                className={clsx(
-                                                    'w-full text-left rounded-xl border p-3 transition-colors',
-                                                    isCurrentThread
-                                                        ? 'border-[var(--color-primary)]/40 bg-[var(--color-background)]'
-                                                        : 'border-[var(--color-card-border)] bg-white hover:border-[var(--color-primary)]/30 hover:bg-[var(--color-background)]/40'
-                                                )}
-                                            >
-                                                <div className="flex items-center justify-between gap-2">
-                                                    <span className="text-[12px] font-semibold text-[var(--color-text-primary)] truncate">{thread.from.split('@')[0]}</span>
-                                                    <div className="flex items-center gap-1.5 shrink-0">
-                                                        <span
-                                                            role="button"
-                                                            tabIndex={0}
-                                                            onClick={(event) => {
+                                {threads.map((thread) => {
+                                    const isCurrentThread = actualOpenThread && String(thread.id).replace('t', '') === String(actualOpenThread.id).replace('t', '');
+                                    return (
+                                        <button
+                                            type="button"
+                                            key={thread.id}
+                                            onClick={() => navigate(toThreadPath(thread.id))}
+                                            className={clsx(
+                                                'w-full text-left rounded-xl border p-3 transition-colors',
+                                                isCurrentThread
+                                                    ? 'border-[var(--color-primary)]/40 bg-[var(--color-background)]'
+                                                    : 'border-[var(--color-card-border)] bg-white hover:border-[var(--color-primary)]/30 hover:bg-[var(--color-background)]/40'
+                                            )}
+                                        >
+                                            <div className="flex items-center justify-between gap-2">
+                                                <span className="text-[12px] font-semibold text-[var(--color-text-primary)] truncate">{thread.from.split('@')[0]}</span>
+                                                <div className="flex items-center gap-1.5 shrink-0">
+                                                    <span
+                                                        role="button"
+                                                        tabIndex={0}
+                                                        onClick={(event) => {
+                                                            event.preventDefault();
+                                                            event.stopPropagation();
+                                                            handleToggleStar(thread.id).catch(console.error);
+                                                        }}
+                                                        onKeyDown={(event) => {
+                                                            if (event.key === 'Enter' || event.key === ' ') {
                                                                 event.preventDefault();
                                                                 event.stopPropagation();
                                                                 handleToggleStar(thread.id).catch(console.error);
-                                                            }}
-                                                            onKeyDown={(event) => {
-                                                                if (event.key === 'Enter' || event.key === ' ') {
-                                                                    event.preventDefault();
-                                                                    event.stopPropagation();
-                                                                    handleToggleStar(thread.id).catch(console.error);
-                                                                }
-                                                            }}
-                                                            className="p-1 rounded-md hover:bg-[var(--color-background)] text-[var(--color-text-muted)]"
-                                                            title={thread.starred ? 'Unstar thread' : 'Star thread'}
-                                                        >
-                                                            <Star className={clsx('w-3.5 h-3.5', thread.starred && 'fill-yellow-400 text-yellow-500')} />
-                                                        </span>
-                                                        <span className="text-[10px] text-[var(--color-text-muted)]">
-                                                            {formatThreadListTimestamp(thread.time)}
-                                                        </span>
-                                                    </div>
+                                                            }
+                                                        }}
+                                                        className="p-1 rounded-md hover:bg-[var(--color-background)] text-[var(--color-text-muted)]"
+                                                        title={thread.starred ? 'Unstar thread' : 'Star thread'}
+                                                    >
+                                                        <Star className={clsx('w-3.5 h-3.5', thread.starred && 'fill-yellow-400 text-yellow-500')} />
+                                                    </span>
+                                                    <span className="text-[10px] text-[var(--color-text-muted)]">
+                                                        {formatThreadListTimestamp(thread.time)}
+                                                    </span>
                                                 </div>
-                                                <div className="mt-1 text-[13px] font-medium text-[var(--color-text-primary)] truncate">{thread.subject}</div>
-                                                <div className="mt-1 text-[11px] text-[var(--color-text-muted)] truncate">{thread.snippet}</div>
-                                                <div className="mt-2 flex items-center justify-between gap-2">
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">{statusMap[thread.status]?.label || thread.status}</span>
-                                                        {Number(thread.noteCount || 0) > 0 && (
-                                                            <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/60">
-                                                                {thread.noteCount} notes
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-primary)]/50" />
+                                            </div>
+                                            <div className="mt-1 text-[13px] font-medium text-[var(--color-text-primary)] truncate">{thread.subject}</div>
+                                            <div className="mt-1 text-[11px] text-[var(--color-text-muted)] truncate">{thread.snippet}</div>
+                                            <div className="mt-2 flex items-center justify-between gap-2">
+                                                <div className="flex items-center gap-2">
+                                                    {thread.latestMessageIsScheduled && (
+                                                        <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                                                            Scheduled
+                                                        </span>
+                                                    )}
+                                                    <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">{statusMap[thread.status]?.label || thread.status}</span>
+                                                    {Number(thread.noteCount || 0) > 0 && (
+                                                        <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/60">
+                                                            {thread.noteCount} notes
+                                                        </span>
+                                                    )}
                                                 </div>
-                                            </button>
-                                        );
-                                    })
-                                )}
+                                                <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-primary)]/50" />
+                                            </div>
+                                        </button>
+                                    );
+                                })}
                             </div>
                         </div>
                     )}
 
-                    {isThreadLoading ? (
-                        <div className="flex-1 flex overflow-hidden bg-white"><ThreadDetailSkeleton /></div>
-                    ) : actualOpenThread ? (
+                    {actualOpenThread ? (
                         <>
                             {/* Main Chat Column */}
                             <div className="flex-1 flex flex-col min-w-0 border-r border-[var(--color-card-border)] bg-white">
@@ -3434,7 +3542,7 @@ const InboxPage: React.FC = () => {
                                                         onClick={() => handleStatusChange(actualOpenThread.id, status).catch(console.error)}
                                                         className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
                                                     >
-                                                        <span className="capitalize">{status.replace('_', ' ')}</span>
+                                                <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
                                                         {actualOpenThread.status === status && <Check className="w-3 h-3 text-[var(--color-primary)]" />}
                                                     </button>
                                                 ))}
@@ -3579,6 +3687,10 @@ const InboxPage: React.FC = () => {
                                 const isInternalNote = msg.type === 'internal-note';
                                 const isInbound = msg.direction === 'INBOUND';
                                 const isRead = msg.isRead !== false;
+                                const isScheduledPending = isOutbound && Boolean(msg.isDraft) && !msg.messageId;
+                                const scheduledAtLabel = msg.scheduledAt
+                                    ? new Date(msg.scheduledAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+                                    : null;
                                 const messageAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
                                 const noteAvatarUrl = resolveAvatarUrl(isInternalNote ? (msg.user?.avatarUrl || user?.avatarUrl) : undefined);
                                 return (
@@ -3597,6 +3709,11 @@ const InboxPage: React.FC = () => {
                                             <span className="text-[11px] text-[var(--color-text-muted)]">
                                                 {new Date(msg.createdAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                                             </span>
+                                            {isScheduledPending && (
+                                                <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                                                    Scheduled
+                                                </span>
+                                            )}
                                             {!isInternalNote && actualOpenThread && (
                                                 <button
                                                     type="button"
@@ -3626,6 +3743,11 @@ const InboxPage: React.FC = () => {
                                                     ? 'bg-[var(--color-primary)]/10 border border-[var(--color-primary)]/20 text-[var(--color-text-primary)] rounded-tr-sm'
                                                     : 'bg-white border border-[var(--color-card-border)] text-[var(--color-text-primary)] rounded-tl-sm'
                                             )}>
+                                                {isScheduledPending && (
+                                                    <p className="mb-2 text-[11px] font-medium text-amber-700">
+                                                        {scheduledAtLabel ? `Pending. Scheduled for ${scheduledAtLabel}` : 'Pending scheduled send.'}
+                                                    </p>
+                                                )}
                                                 {isInternalNote && (
                                                     <div className="absolute top-1.5 right-1.5 dropdown-container">
                                                         <button
@@ -4477,7 +4599,7 @@ const InboxPage: React.FC = () => {
                                             : 'hover:bg-[var(--color-background)] text-[var(--color-text-primary)]'
                                     )}
                                 >
-                                    <span className="truncate">Status: {selectedStatus.replace('_', ' ')}</span>
+                                    <span className="truncate">Status: {formatSelectedStatusLabel(selectedStatus)}</span>
                                     <ChevronDown className={clsx('w-3 h-3 absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)] transition-transform pointer-events-none', openDropdown === 'list-status' && 'rotate-180')} />
                                 </button>
                                 {openDropdown === 'list-status' && (
@@ -4491,7 +4613,7 @@ const InboxPage: React.FC = () => {
                                                 }}
                                                 className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
                                             >
-                                                <span className="capitalize">{status.replace('_', ' ')}</span>
+                                                <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
                                                 {selectedStatus === status && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
                                             </button>
                                         ))}
@@ -4522,6 +4644,22 @@ const InboxPage: React.FC = () => {
                             </div>
                         ) : threads.map(thread => {
                             const rowTags = thread.tags || [];
+                            const isScheduledPending = Boolean(
+                                (thread.hasPendingScheduledReply
+                                    && String(thread.pendingScheduledStatus || '').toLowerCase() === 'pending')
+                                || (thread.latestMessageIsScheduled
+                                    && String(thread.latestScheduledStatus || '').toLowerCase() === 'pending')
+                            );
+                            const resolvedScheduledAt = thread.pendingScheduledAt || thread.latestScheduledAt;
+                            const scheduledAtLabel = resolvedScheduledAt
+                                ? new Date(resolvedScheduledAt).toLocaleString('en', {
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                    hour12: true,
+                                })
+                                : '';
                             return (
                                 <div
                                     key={thread.id}
@@ -4555,8 +4693,20 @@ const InboxPage: React.FC = () => {
                                     </div>
                                     <div className="flex items-center justify-between gap-2">
                                         <span className="text-[12px] text-[var(--color-text-muted)] truncate flex-1">{thread.snippet}</span>
-                                        <StatusBadge label={statusMap[thread.status]?.label || thread.status} variant={statusMap[thread.status]?.variant || 'neutral'} />
+                                        <div className="flex items-center gap-1.5">
+                                            {isScheduledPending && (
+                                                <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700">
+                                                    Scheduled
+                                                </span>
+                                            )}
+                                            <StatusBadge label={statusMap[thread.status]?.label || thread.status} variant={statusMap[thread.status]?.variant || 'neutral'} />
+                                        </div>
                                     </div>
+                                    {isScheduledPending && scheduledAtLabel && (
+                                        <div className="mt-0.5 text-[10px] text-amber-700">
+                                            Pending until {scheduledAtLabel}
+                                        </div>
+                                    )}
                                     {rowTags.length > 0 && (
                                         <div className="flex items-center gap-1 mt-1.5 flex-wrap">
                                             {rowTags.slice(0, 2).map((tag: string) => (
@@ -4599,6 +4749,22 @@ const InboxPage: React.FC = () => {
                                     </tr>
                                 ) : threads.map(thread => {
                                     const rowTags = thread.tags || [];
+                                    const isScheduledPending = Boolean(
+                                        (thread.hasPendingScheduledReply
+                                            && String(thread.pendingScheduledStatus || '').toLowerCase() === 'pending')
+                                        || (thread.latestMessageIsScheduled
+                                            && String(thread.latestScheduledStatus || '').toLowerCase() === 'pending')
+                                    );
+                                    const resolvedScheduledAt = thread.pendingScheduledAt || thread.latestScheduledAt;
+                                    const scheduledAtLabel = resolvedScheduledAt
+                                        ? new Date(resolvedScheduledAt).toLocaleString('en', {
+                                            month: 'short',
+                                            day: 'numeric',
+                                            hour: '2-digit',
+                                            minute: '2-digit',
+                                            hour12: true,
+                                        })
+                                        : '';
                                     return (
                                         <tr
                                             key={thread.id}
@@ -4616,6 +4782,11 @@ const InboxPage: React.FC = () => {
                                         <td className="px-2 py-2.5">
                                             <div className="text-[13px] text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate max-w-xs">{thread.subject}</div>
                                             <div className="text-[10px] text-[var(--color-text-muted)]/60 truncate max-w-xs">{thread.snippet}</div>
+                                            {isScheduledPending && scheduledAtLabel && (
+                                                <div className="mt-1 inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                                                    Scheduled for {scheduledAtLabel}
+                                                </div>
+                                            )}
                                             {Number(thread.noteCount || 0) > 0 && (
                                                 <span className="inline-flex mt-1 text-[10px] px-1.5 py-0.5 rounded-full border border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/60">
                                                     {thread.noteCount} notes
@@ -4623,7 +4794,14 @@ const InboxPage: React.FC = () => {
                                             )}
                                         </td>
                                         <td className="px-2 py-2.5">
-                                            <StatusBadge label={statusMap[thread.status]?.label || thread.status} variant={statusMap[thread.status]?.variant || 'neutral'} />
+                                            <div className="flex items-center gap-1.5">
+                                                {isScheduledPending && (
+                                                    <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700">
+                                                        Scheduled
+                                                    </span>
+                                                )}
+                                                <StatusBadge label={statusMap[thread.status]?.label || thread.status} variant={statusMap[thread.status]?.variant || 'neutral'} />
+                                            </div>
                                         </td>
                                         <td className="px-2 py-2.5 text-[13px] text-[var(--color-text-muted)]">
                                             {thread.assignedTo || <div className="w-5 h-0.5 bg-[var(--color-text-muted)]/40 rounded"></div>}

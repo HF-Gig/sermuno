@@ -225,10 +225,10 @@ export class CalendarController {
   @Post('sync/google')
   @RequirePermission('calendar:manage')
   syncGoogle(
-    @Body() body: { accessToken: string },
+    @Body() body: { accessToken?: string },
     @CurrentUser() user: JwtUser,
   ) {
-    return this.calendarService.syncGoogle(body.accessToken, user);
+    return this.calendarService.syncGoogle(user, body?.accessToken);
   }
 
   @Post('sync/microsoft')

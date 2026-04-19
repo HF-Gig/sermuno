@@ -96,4 +96,18 @@ export class SendMessageDto {
   @IsOptional()
   @IsString()
   timezone?: string;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(['NEW', 'OPEN', 'PENDING', 'CLOSED', 'ARCHIVED'])
+  threadStatusAfterSend?: string;
+
+  @IsOptional()
+  @IsString()
+  inReplyTo?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  references?: string[];
 }

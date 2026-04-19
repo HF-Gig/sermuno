@@ -5,6 +5,7 @@ export default () => ({
   },
   redis: {
     url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+    queuePrefix: process.env.REDIS_QUEUE_PREFIX ?? 'sermuno',
     connectTimeoutMs: parseInt(
       process.env.REDIS_CONNECT_TIMEOUT_MS ?? '10000',
       10,

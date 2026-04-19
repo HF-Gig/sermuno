@@ -50,15 +50,26 @@ export class VideoConferencingService {
     const data = JSON.parse(responseBody) as {
       hangoutLink?: string;
       id?: string;
-      conferenceData?: { entryPoints?: { uri?: string }[] };
+      conferenceData?: {
+        entryPoints?: { uri?: string; entryPointType?: string }[];
+      };
     };
 
     const meetingLink =
       data.hangoutLink ??
       data.conferenceData?.entryPoints?.find((e) =>
+        e.entryPointType === 'video' && e.uri?.startsWith('https://'),
+      )?.uri ??
+      data.conferenceData?.entryPoints?.find((e) =>
         e.uri?.startsWith('https://'),
       )?.uri ??
       '';
+
+    if (!meetingLink) {
+      throw new Error(
+        'Google Meet link was not returned by Google Calendar conference data',
+      );
+    }
 
     return {
       meetingLink,

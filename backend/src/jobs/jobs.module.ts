@@ -11,6 +11,7 @@ import { WebsocketsModule } from '../modules/websockets/websockets.module';
 import { NotificationsModule } from '../modules/notifications/notifications.module';
 import { WebhooksModule } from '../modules/webhooks/webhooks.module';
 import { RulesModule } from '../modules/rules/rules.module';
+import { MessagesModule } from '../modules/messages/messages.module';
 import { FeatureFlagsService } from '../config/feature-flags.service';
 import { AiCategorizationService } from '../modules/ai-categorization/ai-categorization.service';
 
@@ -51,6 +52,7 @@ const QUEUE_NAMES = [
     NotificationsModule,
     WebhooksModule,
     RulesModule,
+    MessagesModule,
     BullModule.forRootAsync({
       useClass: BullConfigService,
     }),

@@ -43,6 +43,7 @@ import { AuditService } from '../audit/audit.service';
 import type { RequestMeta } from '../../common/http/request-meta';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
 import { CrmService } from '../crm/crm.service';
+import { MessagesService } from '../messages/messages.service';
 import {
   AttachmentVirusScannerService,
   type AttachmentVirusScanResult,
@@ -151,6 +152,7 @@ export class ThreadsService {
     private readonly notificationsService: NotificationsService,
     private readonly auditService: AuditService,
     private readonly crmService: CrmService,
+    private readonly messagesService: MessagesService,
     private readonly attachmentScanner: AttachmentVirusScannerService,
     private readonly attachmentStorage: AttachmentStorageService,
   ) {}
@@ -406,6 +408,105 @@ export class ThreadsService {
     if (derivedText) return derivedText;
 
     return this.normalizeExplicitBodyText(fallbackBodyText);
+  }
+
+  private normalizeOutboundBodyHtml(
+    bodyHtml?: string | null,
+  ): string | undefined {
+    const raw = String(bodyHtml ?? '').trim();
+    if (!raw) return undefined;
+
+    const withEmailSafeStyles = raw.replace(
+      /<([a-z0-9]+)([^>]*)>/gi,
+      (match, tagName: string, rawAttributes: string) => {
+        const classMatch = rawAttributes.match(/\bclass=(['"])(.*?)\1/i);
+        if (!classMatch) return match;
+
+        const classes = String(classMatch[2] || '')
+          .split(/\s+/)
+          .map((value) => value.trim())
+          .filter(Boolean);
+
+        const styleParts: string[] = [];
+        if (classes.includes('ql-align-center')) styleParts.push('text-align:center');
+        if (classes.includes('ql-align-right')) styleParts.push('text-align:right');
+        if (classes.includes('ql-align-justify')) styleParts.push('text-align:justify');
+        if (classes.includes('ql-direction-rtl')) {
+          styleParts.push('direction:rtl');
+          styleParts.push('unicode-bidi:embed');
+        }
+
+        const indentClass = classes.find((value) => /^ql-indent-\d+$/.test(value));
+        if (indentClass) {
+          const indentLevel = Number(indentClass.split('-').pop() || '0');
+          if (Number.isFinite(indentLevel) && indentLevel > 0) {
+            styleParts.push(`margin-left:${indentLevel * 3}em`);
+          }
+        }
+
+        const styleMatch = rawAttributes.match(/\bstyle=(['"])(.*?)\1/i);
+        const existingStyle = styleMatch?.[2] ? String(styleMatch[2]).trim() : '';
+        const mergedStyle = [existingStyle, ...styleParts].filter(Boolean).join('; ');
+
+        const sanitizedClasses = classes
+          .filter((value) => !/^ql-(align|indent|direction)-/.test(value))
+          .join(' ');
+
+        let nextAttributes = rawAttributes;
+        nextAttributes = nextAttributes.replace(/\bclass=(['"])(.*?)\1/i, '').replace(/\bstyle=(['"])(.*?)\1/i, '');
+
+        if (sanitizedClasses) {
+          nextAttributes += ` class="${sanitizedClasses}"`;
+        }
+        if (mergedStyle) {
+          nextAttributes += ` style="${mergedStyle}"`;
+        }
+
+        return `<${tagName}${nextAttributes}>`;
+      },
+    );
+
+    const sanitized = sanitizeHtml(withEmailSafeStyles, {
+      allowedTags: [
+        ...sanitizeHtml.defaults.allowedTags,
+        'h1',
+        'h2',
+        'h3',
+        'h4',
+        'h5',
+        'h6',
+        'img',
+        'span',
+        'div',
+        'u',
+        's',
+      ],
+      allowedAttributes: {
+        '*': ['style'],
+        a: ['href', 'name', 'target', 'rel'],
+        img: ['src', 'alt', 'title', 'width', 'height'],
+      },
+      allowedSchemes: ['http', 'https', 'mailto', 'data'],
+      allowedStyles: {
+        '*': {
+          'text-align': [/^(left|right|center|justify)$/i],
+          'margin-left': [/^\d+(\.\d+)?(px|em|rem|%)$/i],
+          direction: [/^(ltr|rtl)$/i],
+          'unicode-bidi': [/^(embed|bidi-override|normal)$/i],
+          'font-weight': [/^[\w\s-]+$/i],
+          'font-style': [/^[\w\s-]+$/i],
+          'text-decoration': [/^[\w\s-]+$/i],
+        },
+      },
+      transformTags: {
+        a: sanitizeHtml.simpleTransform('a', {
+          target: '_blank',
+          rel: 'noopener noreferrer',
+        }),
+      },
+    }).trim();
+
+    return sanitized || undefined;
   }
 
   private scanFailureResult(error: unknown): AttachmentVirusScanResult {
@@ -889,6 +990,7 @@ export class ThreadsService {
     });
 
     const folder = String(query.folder || query.folderType || '').toLowerCase();
+    const hasExplicitFolderId = Boolean(query.folderId);
     const now = Date.now();
     const soonThreshold = now + 60 * 60 * 1000;
     const filteredCandidates = candidates.filter((candidate) => {
@@ -899,9 +1001,9 @@ export class ThreadsService {
       }
 
       if (!folder) return true;
-
-      if (folder === 'archive') {
-        return candidate.status === ThreadStatus.ARCHIVED;
+      if (hasExplicitFolderId && folder !== 'starred') {
+        // When a concrete mailbox folder is selected, folderId is authoritative.
+        return true;
       }
 
       if (folder === 'starred') {
@@ -913,7 +1015,8 @@ export class ThreadsService {
         folder === 'sent' ||
         folder === 'drafts' ||
         folder === 'spam' ||
-        folder === 'trash'
+        folder === 'trash' ||
+        folder === 'archive'
       ) {
         const latestMessage = candidate.messages[0];
         const latestFolderType = String(
@@ -949,7 +1052,10 @@ export class ThreadsService {
                   id: true,
                   fromEmail: true,
                   bodyText: true,
+                  bodyHtml: true,
                   isRead: true,
+                  isDraft: true,
+                  messageId: true,
                   folderId: true,
                   createdAt: true,
                   folder: { select: { type: true, name: true } },
@@ -982,20 +1088,116 @@ export class ThreadsService {
         Boolean(thread),
       );
 
+    const pendingScheduledByThreadId = new Map<
+      string,
+      { scheduledAt: Date; status: string }
+    >();
+    if (pageIds.length > 0) {
+      const pendingScheduledRows = await this.prisma.scheduledMessage.findMany({
+        where: {
+          organizationId: user.organizationId,
+          threadId: { in: pageIds },
+          status: { in: ['pending', 'processing'] },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          threadId: true,
+          scheduledAt: true,
+          status: true,
+        },
+      });
+      for (const row of pendingScheduledRows) {
+        const threadId = String(row.threadId || '').trim();
+        if (!threadId || pendingScheduledByThreadId.has(threadId)) continue;
+        pendingScheduledByThreadId.set(threadId, {
+          scheduledAt: row.scheduledAt,
+          status: row.status,
+        });
+      }
+    }
+
+    const latestMessageIds = threads
+      .map((thread) => String(thread.messages?.[0]?.id || '').trim())
+      .filter((id) => id.length > 0);
+
+    const scheduledRows =
+      latestMessageIds.length > 0
+        ? await this.prisma.scheduledMessage.findMany({
+            where: {
+              organizationId: user.organizationId,
+              status: { in: ['pending', 'processing', 'failed', 'cancelled'] },
+              OR: latestMessageIds.flatMap((id) => [
+                { payload: { path: ['messageId'], equals: id } },
+                { payload: { path: ['id'], equals: id } },
+              ]),
+            },
+            orderBy: { createdAt: 'desc' },
+            select: {
+              payload: true,
+              scheduledAt: true,
+              status: true,
+            },
+          })
+        : [];
+
+    const scheduledByMessageId = new Map<
+      string,
+      { scheduledAt: Date; status: string }
+    >();
+    for (const row of scheduledRows) {
+      const payload =
+        row.payload &&
+        typeof row.payload === 'object' &&
+        !Array.isArray(row.payload)
+          ? (row.payload as Record<string, unknown>)
+          : null;
+      const messageId = String(payload?.messageId ?? payload?.id ?? '').trim();
+      if (!messageId || scheduledByMessageId.has(messageId)) continue;
+      scheduledByMessageId.set(messageId, {
+        scheduledAt: row.scheduledAt,
+        status: row.status,
+      });
+    }
+
+    const threadsWithSchedule = threads.map((thread) => {
+      const pendingByThread = pendingScheduledByThreadId.get(String(thread.id));
+      const latest = thread.messages?.[0];
+      const scheduled = latest
+        ? scheduledByMessageId.get(String(latest.id))
+        : undefined;
+      const nextThread: any = {
+        ...thread,
+        hasPendingScheduledReply: Boolean(pendingByThread),
+        pendingScheduledAt: pendingByThread?.scheduledAt ?? null,
+        pendingScheduledStatus: pendingByThread?.status ?? null,
+      };
+      if (latest && scheduled) {
+        nextThread.messages = [
+          {
+            ...latest,
+            scheduledAt: scheduled.scheduledAt,
+            scheduledStatus: scheduled.status,
+          },
+          ...thread.messages.slice(1),
+        ];
+      }
+      return nextThread;
+    });
+
     const totalPages = Math.max(Math.ceil(total / limit), 1);
     const hasMore = page < totalPages;
     const nextCursor =
-      hasMore && threads.length > 0
-        ? threads[threads.length - 1].id
+      hasMore && threadsWithSchedule.length > 0
+        ? threadsWithSchedule[threadsWithSchedule.length - 1].id
         : undefined;
 
     return {
       // Nest-style shape
-      items: threads,
+      items: threadsWithSchedule,
       nextCursor,
       hasMore,
       // Legacy Express-style compatibility shape (used by current frontend)
-      threads,
+      threads: threadsWithSchedule,
       pagination: {
         page,
         limit,
@@ -1461,8 +1663,8 @@ export class ThreadsService {
     });
     if (!mailbox) throw new NotFoundException('Mailbox not found');
 
-    const bodyHtml = dto.bodyHtml || undefined;
-    const bodyText = this.resolveBodyText(dto.bodyText, dto.bodyHtml);
+    const bodyHtml = this.normalizeOutboundBodyHtml(dto.bodyHtml);
+    const bodyText = this.resolveBodyText(dto.bodyText, bodyHtml);
     const preparedAttachments = await this.prepareComposeAttachments(
       uploadedFiles,
     );
@@ -1496,6 +1698,48 @@ export class ThreadsService {
         contactId = autoLinked.contactId;
         companyId = autoLinked.companyId;
       }
+    }
+
+    if (dto.scheduledAt) {
+      const message = await this.messagesService.send(
+        {
+          mailboxId: dto.mailboxId,
+          to,
+          cc,
+          bcc,
+          subject: dto.subject,
+          bodyHtml,
+          bodyText,
+          scheduledAt: dto.scheduledAt,
+          rrule: dto.rrule,
+        },
+        user,
+      );
+
+      await this.persistComposeAttachments({
+        attachments: preparedAttachments,
+        messageId: message.id,
+        organizationId: user.organizationId,
+      });
+
+      let thread = await this.prisma.thread.findUnique({
+        where: { id: message.threadId },
+      });
+      if (!thread) {
+        throw new NotFoundException('Thread not found for scheduled compose');
+      }
+
+      if (contactId || companyId) {
+        thread = await this.prisma.thread.update({
+          where: { id: thread.id },
+          data: {
+            ...(contactId ? { contactId } : {}),
+            ...(companyId ? { companyId } : {}),
+          },
+        });
+      }
+
+      return { thread, message };
     }
 
     const sendResult = await this.sendReplyThroughProvider({
@@ -1656,8 +1900,31 @@ export class ThreadsService {
       ),
     );
 
-    const bodyHtml = dto.bodyHtml || undefined;
-    const bodyText = this.resolveBodyText(dto.bodyText, dto.bodyHtml);
+    const bodyHtml = this.normalizeOutboundBodyHtml(dto.bodyHtml);
+    const bodyText = this.resolveBodyText(dto.bodyText, bodyHtml);
+    const normalizedSubject = this.normalizeSubject(
+      thread.subject || lastInbound?.subject,
+    );
+
+    if (dto.scheduledAt) {
+      return this.messagesService.send(
+        {
+          mailboxId: thread.mailboxId,
+          threadId,
+          to,
+          cc,
+          bcc,
+          subject: normalizedSubject,
+          bodyHtml,
+          bodyText,
+          inReplyTo,
+          references,
+          scheduledAt: dto.scheduledAt,
+          rrule: dto.rrule,
+        },
+        user,
+      );
+    }
 
     const sendResult = await this.sendReplyThroughProvider({
       mailbox: thread.mailbox,
@@ -1665,7 +1932,7 @@ export class ThreadsService {
       to,
       cc,
       bcc,
-      subject: this.normalizeSubject(thread.subject || lastInbound?.subject),
+      subject: normalizedSubject,
       bodyHtml,
       bodyText,
       inReplyTo,
@@ -1682,7 +1949,7 @@ export class ThreadsService {
         to: to as unknown as import('@prisma/client').Prisma.InputJsonValue,
         cc: cc as unknown as import('@prisma/client').Prisma.InputJsonValue,
         bcc: bcc as unknown as import('@prisma/client').Prisma.InputJsonValue,
-        subject: this.normalizeSubject(thread.subject || lastInbound?.subject),
+        subject: normalizedSubject,
         bodyHtml,
         bodyText,
         messageId: sendResult.providerMessageId,
@@ -1833,13 +2100,13 @@ export class ThreadsService {
     const subject = this.normalizeForwardSubject(
       dto.subject || thread.subject || latestMessage?.subject,
     );
-    const bodyHtml = dto.bodyHtml || undefined;
+    const bodyHtml = this.normalizeOutboundBodyHtml(dto.bodyHtml);
     const fallbackBodyText = latestMessage?.bodyText
       ? `---------- Forwarded message ----------\n${latestMessage.bodyText}`
       : undefined;
     const bodyText = this.resolveBodyText(
       dto.bodyText,
-      dto.bodyHtml,
+      bodyHtml,
       fallbackBodyText,
     );
 

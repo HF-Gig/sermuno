@@ -14,25 +14,97 @@ export class IntegrationsService {
   ) {}
 
   async getStatus(user: JwtUser) {
-    const userRecord = await this.prisma.user.findUnique({
-      where: { id: user.sub },
-    });
+    const [googleMailbox, microsoftMailbox, userRecord] = await Promise.all([
+      this.prisma.mailbox.findFirst({
+        where: {
+          organizationId: user.organizationId,
+          provider: 'GMAIL',
+          deletedAt: null,
+          OR: [
+            { oauthAccessToken: { not: null } },
+            { googleAccessToken: { not: null } },
+          ],
+        },
+        orderBy: { updatedAt: 'desc' },
+        select: {
+          email: true,
+          oauthAccessToken: true,
+          oauthRefreshToken: true,
+          oauthTokenExpiresAt: true,
+          googleAccessToken: true,
+          googleRefreshToken: true,
+          googleTokenExpiresAt: true,
+          updatedAt: true,
+        },
+      }),
+      this.prisma.mailbox.findFirst({
+        where: {
+          organizationId: user.organizationId,
+          provider: 'OUTLOOK',
+          deletedAt: null,
+          OR: [
+            { oauthAccessToken: { not: null } },
+            { oauthRefreshToken: { not: null } },
+          ],
+        },
+        orderBy: { updatedAt: 'desc' },
+        select: {
+          email: true,
+          oauthAccessToken: true,
+          oauthRefreshToken: true,
+          oauthTokenExpiresAt: true,
+          updatedAt: true,
+        },
+      }),
+      this.prisma.user.findUnique({
+        where: { id: user.sub },
+      }),
+    ]);
+
     const prefs =
       (userRecord?.preferences as Record<string, string> | null) ?? {};
+    const googleConnected = Boolean(
+      googleMailbox &&
+        this.hasUsableToken({
+          accessToken:
+            googleMailbox.oauthAccessToken || googleMailbox.googleAccessToken,
+          refreshToken:
+            googleMailbox.oauthRefreshToken || googleMailbox.googleRefreshToken,
+          expiresAt:
+            googleMailbox.oauthTokenExpiresAt || googleMailbox.googleTokenExpiresAt,
+        }),
+    );
+    const microsoftConnected = Boolean(
+      microsoftMailbox &&
+        this.hasUsableToken({
+          accessToken: microsoftMailbox.oauthAccessToken,
+          refreshToken: microsoftMailbox.oauthRefreshToken,
+          expiresAt: microsoftMailbox.oauthTokenExpiresAt,
+        }),
+    );
 
     return {
       google: {
-        connected: !!prefs['googleAccessToken'],
+        connected: googleConnected,
+        healthy: googleConnected,
+        account: googleMailbox?.email ?? null,
+        lastCheckedAt: googleMailbox?.updatedAt?.toISOString() ?? null,
       },
       microsoft: {
-        connected: !!prefs['microsoftAccessToken'],
+        connected: microsoftConnected,
+        healthy: microsoftConnected,
+        account: microsoftMailbox?.email ?? null,
+        lastCheckedAt: microsoftMailbox?.updatedAt?.toISOString() ?? null,
       },
       zoom: {
         connected: !!prefs['zoomAccessToken'],
         expiresAt: prefs['zoomTokenExpiresAt'] ?? null,
       },
       caldav: {
-        connected: !!prefs['calDavUrl'] && !!prefs['calDavUsername'] && !!prefs['calDavPassword'],
+        connected:
+          !!prefs['calDavUrl'] &&
+          !!prefs['calDavUsername'] &&
+          !!prefs['calDavPassword'],
         url: prefs['calDavUrl'] ?? null,
         username: prefs['calDavUsername'] ?? null,
         calendarName: prefs['calDavCalendarDisplayName'] ?? null,
@@ -118,6 +190,20 @@ export class IntegrationsService {
       where: { id: user.sub },
       data: { preferences: rest },
     });
+  }
+
+  private hasUsableToken(params: {
+    accessToken: string | null | undefined;
+    refreshToken: string | null | undefined;
+    expiresAt: Date | null | undefined;
+  }): boolean {
+    const { accessToken, refreshToken, expiresAt } = params;
+    if (!accessToken && !refreshToken) return false;
+    if (!expiresAt) return true;
+    return (
+      expiresAt.getTime() - Date.now() > 2 * 60 * 1000 ||
+      Boolean(refreshToken)
+    );
   }
 
   // ──────────────────────────────────────────────────────────────────────────

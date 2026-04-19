@@ -14,6 +14,27 @@ interface MailboxFolder {
     special?: 'inbox' | 'sent' | 'trash' | 'spam' | 'drafts' | 'starred';
 }
 
+const shouldExcludeProviderSystemFolder = (name: string) => {
+    const raw = String(name || '').trim().toLowerCase();
+    const normalized = raw
+        .replace(/[\[\]().]/g, ' ')
+        .replace(/[_-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return (
+        normalized === 'gmail'
+        || raw === '[gmail]'
+        || raw === '[gmail]/starred'
+        || raw === '[gmail]/important'
+        || normalized === 'starred'
+        || normalized === 'important'
+        || normalized === 'flagged emails'
+        || normalized.endsWith('/starred')
+        || normalized.endsWith('/important')
+    );
+};
+
 const sanitizeFolderLabel = (name: string, type?: string) => {
     const normalizedType = String(type || '').toLowerCase();
     if (normalizedType === 'inbox') return 'INBOX';
@@ -21,6 +42,7 @@ const sanitizeFolderLabel = (name: string, type?: string) => {
     if (normalizedType === 'drafts') return 'Drafts';
     if (normalizedType === 'spam') return 'Spam';
     if (normalizedType === 'trash') return 'Trash';
+    if (normalizedType === 'archive') return 'Archive';
 
     const trimmed = String(name || '').trim();
     if (!trimmed) return 'Unknown';
@@ -72,7 +94,8 @@ const MailboxFoldersModal: React.FC<MailboxFoldersModalProps> = ({ isOpen, onClo
         api.get(`/mailboxes/${mailbox.id}/folders`)
             .then((response) => {
                 const data = Array.isArray(response.data) ? response.data : [];
-                setFolders(data.map((folder: any) => ({
+                const visible = data.filter((folder: any) => !shouldExcludeProviderSystemFolder(folder?.name || ''));
+                setFolders(visible.map((folder: any) => ({
                     id: folder.id,
                     name: folder.name,
                     label: sanitizeFolderLabel(folder.name, folder.type),

@@ -6,13 +6,11 @@ import {
   forwardRef,
   Inject,
 } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bullmq';
-import type { Queue } from 'bullmq';
 import { PrismaService } from '../../database/prisma.service';
 import { Prisma } from '@prisma/client';
 import * as crypto from 'crypto';
+import * as nodemailer from 'nodemailer';
 import { ConfigService } from '@nestjs/config';
-import { NOTIFICATION_DISPATCH_QUEUE } from '../../jobs/queues/notification-dispatch.queue';
 import { IcsGeneratorService } from './ics-generator.service';
 import { VideoConferencingService } from './video-conferencing.service';
 import { CalendarSyncService } from './calendar-sync.service';
@@ -38,8 +36,6 @@ export class CalendarService {
     private readonly videoConf: VideoConferencingService,
     private readonly calendarSync: CalendarSyncService,
     private readonly templates: CalendarTemplatesService,
-    @InjectQueue(NOTIFICATION_DISPATCH_QUEUE)
-    private readonly dispatchQueue: Queue,
     @Inject(forwardRef(() => 'NOTIFICATIONS_SERVICE'))
     private readonly notifications: NotificationsService | null,
     private readonly eventsGateway: EventsGateway,
@@ -78,19 +74,14 @@ export class CalendarService {
         user.sub,
         dto.meetingProvider,
       );
+      if (dto.meetingProvider === 'google_meet' && !accessToken) {
+        throw new BadRequestException(
+          'Google Meet is selected but no valid Google OAuth token is available.',
+        );
+      }
       if (accessToken) {
         try {
-          if (dto.meetingProvider === 'google_meet') {
-            const result = await this.videoConf.createGoogleMeet(
-              accessToken,
-              dto.title,
-              dto.startTime,
-              dto.endTime,
-            );
-            meetingLink = result.meetingLink;
-            meetingId = result.meetingId;
-            meetingProvider = result.meetingProvider;
-          } else if (dto.meetingProvider === 'zoom') {
+          if (dto.meetingProvider === 'zoom') {
             const durationMs = dto.endTime.getTime() - dto.startTime.getTime();
             const durationMinutes = Math.max(1, Math.round(durationMs / 60000));
             const result = await this.videoConf.createZoomMeeting(
@@ -197,14 +188,38 @@ export class CalendarService {
         userId: user.sub,
         organizationId: user.organizationId,
       });
+      await this.calendarSync.syncEventToGoogleIfConnected({
+        eventId: createdEvent.id,
+        userId: user.sub,
+        organizationId: user.organizationId,
+      });
     }
 
     if (!createdEvent) return createdEvent;
 
-    return this.prisma.event.findUnique({
+    const finalCreatedEvent = await this.prisma.event.findUnique({
       where: { id: createdEvent.id },
       include: { attendees: true },
     });
+    if (
+      dto.meetingProvider === 'google_meet' &&
+      finalCreatedEvent &&
+      !finalCreatedEvent.meetingLink
+    ) {
+      throw new BadRequestException(
+        'Failed to provision a valid Google Meet link for this event.',
+      );
+    }
+    if (finalCreatedEvent && finalCreatedEvent.attendees.length > 0) {
+      // Keep create-event invite delivery consistent with manual "Send Invitation".
+      await this.sendInvite(
+        finalCreatedEvent.id,
+        { additionalEmails: [] },
+        user,
+        meta,
+      );
+    }
+    return finalCreatedEvent;
   }
 
   async findOne(id: string, user: JwtUser) {
@@ -236,22 +251,14 @@ export class CalendarService {
         user.sub,
         resolvedMeetingProvider,
       );
+      if (resolvedMeetingProvider === 'google_meet' && !accessToken) {
+        throw new BadRequestException(
+          'Google Meet is selected but no valid Google OAuth token is available.',
+        );
+      }
       if (accessToken) {
         try {
-          if (resolvedMeetingProvider === 'google_meet') {
-            const result = await this.videoConf.createGoogleMeet(
-              accessToken,
-              title,
-              startTime,
-              endTime,
-            );
-            meetingPatch = {
-              meetingProvider: result.meetingProvider,
-              meetingLink: result.meetingLink ?? null,
-              meetingId: result.meetingId ?? null,
-              meetingPassword: null,
-            };
-          } else if (resolvedMeetingProvider === 'zoom') {
+          if (resolvedMeetingProvider === 'zoom') {
             const durationMinutes = Math.max(
               1,
               Math.round((endTime.getTime() - startTime.getTime()) / 60000),
@@ -383,11 +390,26 @@ export class CalendarService {
       userId: user.sub,
       organizationId: user.organizationId,
     });
+    await this.calendarSync.syncEventToGoogleIfConnected({
+      eventId: finalUpdated.id,
+      userId: user.sub,
+      organizationId: user.organizationId,
+    });
 
-    return this.prisma.event.findUnique({
+    const finalEvent = await this.prisma.event.findUnique({
       where: { id: finalUpdated.id },
       include: { attendees: true },
     });
+    if (
+      resolvedMeetingProvider === 'google_meet' &&
+      finalEvent &&
+      !finalEvent.meetingLink
+    ) {
+      throw new BadRequestException(
+        'Failed to provision a valid Google Meet link for this event.',
+      );
+    }
+    return finalEvent;
   }
 
   async remove(id: string, user: JwtUser) {
@@ -399,6 +421,15 @@ export class CalendarService {
         provider: event.provider,
       },
       userId: user.sub,
+    });
+    await this.calendarSync.deleteEventFromGoogleIfConnected({
+      event: {
+        id: event.id,
+        externalId: event.externalId,
+        provider: event.provider,
+      },
+      userId: user.sub,
+      organizationId: user.organizationId,
     });
     await this.prisma.eventAttendee.deleteMany({ where: { eventId: id } });
     await this.prisma.event.delete({ where: { id } });
@@ -468,6 +499,11 @@ export class CalendarService {
     }
 
     const attendees = allEmails.map((email) => ({ email }));
+    if (attendees.length === 0) {
+      throw new BadRequestException(
+        'No attendees found. Add attendee emails before sending invites.',
+      );
+    }
     const formattedStart = event.startTime.toLocaleString('en-US', {
       dateStyle: 'medium',
       timeStyle: 'short',
@@ -553,22 +589,64 @@ export class CalendarService {
       recurrenceEnd: event.recurrenceEnd ?? undefined,
     });
 
-    // Enqueue email with ICS attachment for each attendee
+    const mailbox = await this.resolveInviteMailbox(
+      user.organizationId,
+      organizer?.email ?? null,
+    );
+    if (!mailbox) {
+      throw new BadRequestException(
+        'No connected mailbox is available to send calendar invites.',
+      );
+    }
+    const { transport, fromEmail, replyTo } = this.buildInviteTransport(
+      mailbox,
+      organizer?.email ?? undefined,
+    );
+
+    let sent = 0;
+    const failures: Array<{ email: string; error: string }> = [];
     for (const email of allEmails) {
-      await this.dispatchQueue.add('dispatch', {
-        channel: 'email',
-        to: email,
-        subject: `Invitation: ${event.title}`,
-        text: inviteText,
-        html: inviteHtml,
-        attachments: [
-          {
-            filename: 'invite.ics',
-            content: icsContent,
-            contentType: 'text/calendar',
-          },
-        ],
-      });
+      try {
+        const info = await transport.sendMail({
+          from: mailbox.name ? `"${mailbox.name}" <${fromEmail}>` : fromEmail,
+          to: email,
+          subject: `Invitation: ${event.title}`,
+          text: inviteText,
+          html: inviteHtml,
+          replyTo,
+          attachments: [
+            {
+              filename: 'invite.ics',
+              content: icsContent,
+              contentType: 'text/calendar',
+            },
+          ],
+        });
+        const rejected = Array.isArray((info as any)?.rejected)
+          ? ((info as any).rejected as string[])
+          : [];
+        if (rejected.length > 0) {
+          failures.push({
+            email,
+            error: `Provider rejected recipient(s): ${rejected.join(', ')}`,
+          });
+          continue;
+        }
+        sent++;
+      } catch (err) {
+        failures.push({
+          email,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    if (sent === 0 && failures.length > 0) {
+      throw new BadRequestException(
+        `Failed to deliver calendar invites to all attendees: ${failures
+          .map((failure) => `${failure.email} (${failure.error})`)
+          .join(', ')}`,
+      );
     }
 
     // Dispatch notification
@@ -577,7 +655,10 @@ export class CalendarService {
       organizationId: user.organizationId,
       type: 'calendar.invite',
       title: `Invite sent for: ${event.title}`,
-      message: `Invites sent to ${allEmails.length} attendee(s).`,
+      message:
+        failures.length > 0
+          ? `Invites sent to ${sent} attendee(s). ${failures.length} failed.`
+          : `Invites sent to ${sent} attendee(s).`,
       resourceId: event.id,
       channels: {
         email: false,
@@ -592,7 +673,7 @@ export class CalendarService {
       'calendar_event',
       eventId,
       null,
-      { attendees: allEmails },
+      { sent, failed: failures.length, attendees: allEmails, failures },
       meta,
     );
     this.eventsGateway.emitToOrganization(
@@ -601,7 +682,7 @@ export class CalendarService {
       { eventId, action: 'invited' },
     );
 
-    return { sent: allEmails.length, ics: icsContent };
+    return { sent, failed: failures.length, failures, ics: icsContent };
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -848,7 +929,7 @@ export class CalendarService {
   // Sync (delegate to CalendarSyncService)
   // ──────────────────────────────────────────────────────────────────────────
 
-  async syncGoogle(accessToken: string, user: JwtUser) {
+  async syncGoogle(user: JwtUser, accessToken?: string) {
     return this.calendarSync.syncGoogle({
       userId: user.sub,
       organizationId: user.organizationId,
@@ -1018,17 +1099,17 @@ export class CalendarService {
     userId: string,
     provider: string,
   ): Promise<string | null> {
+    if (provider === 'google_meet') {
+      return this.resolveGoogleMailboxAccessToken(userId);
+    }
+
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user?.preferences) return null;
 
     const prefs = user.preferences as Record<string, string>;
     const encKey = this.config.get<string>('encryption.key') ?? '';
 
-    if (provider === 'google_meet') {
-      const enc = prefs['googleAccessToken'];
-      if (!enc) return null;
-      return this.decrypt(enc, encKey);
-    } else if (provider === 'zoom') {
+    if (provider === 'zoom') {
       const enc = prefs['zoomAccessToken'];
       if (!enc) return null;
       return this.decrypt(enc, encKey);
@@ -1038,6 +1119,120 @@ export class CalendarService {
       return this.decrypt(enc, encKey);
     }
     return null;
+  }
+
+  private async resolveGoogleMailboxAccessToken(
+    userId: string,
+  ): Promise<string | null> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { organizationId: true },
+    });
+    if (!user?.organizationId) return null;
+
+    const mailbox = await this.prisma.mailbox.findFirst({
+      where: {
+        organizationId: user.organizationId,
+        provider: 'GMAIL',
+        deletedAt: null,
+        OR: [{ oauthAccessToken: { not: null } }, { googleAccessToken: { not: null } }],
+      },
+      orderBy: { updatedAt: 'desc' },
+      select: {
+        id: true,
+        oauthAccessToken: true,
+        oauthRefreshToken: true,
+        oauthTokenExpiresAt: true,
+        googleAccessToken: true,
+        googleRefreshToken: true,
+        googleTokenExpiresAt: true,
+      },
+    });
+    if (!mailbox) return null;
+
+    const encryptedAccessToken =
+      mailbox.oauthAccessToken || mailbox.googleAccessToken;
+    if (!encryptedAccessToken) return null;
+
+    const key = this.config.get<string>('encryption.key') ?? '';
+    const decryptedAccessToken = this.decrypt(encryptedAccessToken, key);
+    if (!decryptedAccessToken) return null;
+
+    const expiresAt = mailbox.oauthTokenExpiresAt || mailbox.googleTokenExpiresAt;
+    const expiringSoon = expiresAt
+      ? expiresAt.getTime() - Date.now() < 2 * 60 * 1000
+      : false;
+    if (!expiringSoon) return decryptedAccessToken;
+
+    const encryptedRefreshToken =
+      mailbox.oauthRefreshToken || mailbox.googleRefreshToken;
+    if (!encryptedRefreshToken) return decryptedAccessToken;
+    const refreshToken = this.decrypt(encryptedRefreshToken, key);
+    if (!refreshToken) return decryptedAccessToken;
+
+    const clientId = this.config.get<string>('google.clientId') ?? '';
+    const clientSecret = this.config.get<string>('google.clientSecret') ?? '';
+    if (!clientId || !clientSecret) return decryptedAccessToken;
+
+    try {
+      const response = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token',
+        }),
+      });
+      if (!response.ok) {
+        this.logger.warn(
+          `[calendar] Google token refresh failed status=${response.status}`,
+        );
+        return decryptedAccessToken;
+      }
+
+      const refreshed = (await response.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      if (!refreshed.access_token) return decryptedAccessToken;
+
+      const encryptedNewAccessToken = this.encrypt(
+        refreshed.access_token,
+        key,
+      );
+      const encryptedNewRefreshToken = refreshed.refresh_token
+        ? this.encrypt(refreshed.refresh_token, key)
+        : encryptedRefreshToken;
+      const newExpiresAt = refreshed.expires_in
+        ? new Date(Date.now() + refreshed.expires_in * 1000)
+        : null;
+
+      await this.prisma.mailbox.update({
+        where: { id: mailbox.id },
+        data: {
+          oauthAccessToken: encryptedNewAccessToken,
+          googleAccessToken: encryptedNewAccessToken,
+          oauthRefreshToken: encryptedNewRefreshToken,
+          googleRefreshToken: encryptedNewRefreshToken,
+          ...(newExpiresAt
+            ? {
+                oauthTokenExpiresAt: newExpiresAt,
+                googleTokenExpiresAt: newExpiresAt,
+              }
+            : {}),
+        },
+      });
+
+      return refreshed.access_token;
+    } catch (err) {
+      this.logger.warn(
+        `[calendar] Google token refresh exception: ${String(err)}`,
+      );
+      return decryptedAccessToken;
+    }
   }
 
   private decrypt(encrypted: string, key: string): string {
@@ -1074,6 +1269,146 @@ export class CalendarService {
         return '';
       }
     }
+  }
+
+  private encrypt(plaintext: string, key: string): string {
+    if (!key) {
+      throw new Error('Missing encryption key');
+    }
+    const iv = crypto.randomBytes(12);
+    const keyBuffer = Buffer.from(
+      crypto.createHash('sha256').update(key).digest(),
+    );
+    const cipher = crypto.createCipheriv('aes-256-gcm', keyBuffer, iv);
+    const ciphertext = Buffer.concat([
+      cipher.update(plaintext, 'utf8'),
+      cipher.final(),
+    ]);
+    const authTag = cipher.getAuthTag();
+    return [
+      iv.toString('hex'),
+      authTag.toString('hex'),
+      ciphertext.toString('hex'),
+    ].join(':');
+  }
+
+  private decryptSecretIfNeeded(value: string | null | undefined): string | null {
+    if (!value) return null;
+    if (!value.includes(':')) return value;
+    const key = this.config.get<string>('encryption.key') ?? '';
+    return this.decrypt(value, key) || null;
+  }
+
+  private async resolveInviteMailbox(
+    organizationId: string,
+    organizerEmail: string | null,
+  ) {
+    if (organizerEmail) {
+      const organizerMailbox = await this.prisma.mailbox.findFirst({
+        where: {
+          organizationId,
+          deletedAt: null,
+          email: organizerEmail,
+        },
+      });
+      if (organizerMailbox) {
+        return organizerMailbox;
+      }
+    }
+
+    return this.prisma.mailbox.findFirst({
+      where: {
+        organizationId,
+        deletedAt: null,
+      },
+      orderBy: { updatedAt: 'desc' },
+    });
+  }
+
+  private buildInviteTransport(
+    mailbox: {
+      name: string;
+      email: string | null;
+      smtpHost: string | null;
+      smtpPort: number | null;
+      smtpSecure: boolean;
+      smtpUser: string | null;
+      smtpPass: string | null;
+      oauthAccessToken: string | null;
+      oauthRefreshToken: string | null;
+      googleAccessToken: string | null;
+      googleRefreshToken: string | null;
+    },
+    fallbackFrom?: string,
+  ): {
+    transport: nodemailer.Transporter;
+    fromEmail: string;
+    replyTo: string;
+  } {
+    const globalHost = this.config.get<string>('smtp.host') ?? '';
+    const globalPort = this.config.get<number>('smtp.port') ?? 587;
+    const globalUser = this.config.get<string>('smtp.user') ?? '';
+    const globalPass = this.config.get<string>('smtp.pass') ?? '';
+    const globalFrom = this.config.get<string>('smtp.from') ?? '';
+
+    const host = mailbox.smtpHost || globalHost;
+    const port = mailbox.smtpPort || globalPort;
+    const secure = mailbox.smtpSecure ?? port === 465;
+    const smtpUser = mailbox.smtpUser || globalUser;
+    const smtpPass =
+      this.decryptSecretIfNeeded(mailbox.smtpPass) || globalPass || null;
+    const oauthAccessToken =
+      this.decryptSecretIfNeeded(mailbox.oauthAccessToken) ||
+      this.decryptSecretIfNeeded(mailbox.googleAccessToken) ||
+      null;
+    const oauthRefreshToken =
+      this.decryptSecretIfNeeded(mailbox.oauthRefreshToken) ||
+      this.decryptSecretIfNeeded(mailbox.googleRefreshToken) ||
+      null;
+
+    if (!host) {
+      throw new BadRequestException(
+        'SMTP host is not configured for invite delivery.',
+      );
+    }
+
+    const fromEmail = mailbox.email || fallbackFrom || globalFrom;
+    if (!fromEmail) {
+      throw new BadRequestException(
+        'From email is not configured for invite delivery.',
+      );
+    }
+
+    const transportOptions: any = {
+      host,
+      port,
+      secure,
+      tls: { rejectUnauthorized: false },
+    };
+
+    if (oauthAccessToken) {
+      transportOptions.auth = {
+        type: 'OAuth2',
+        user: mailbox.email || fromEmail,
+        accessToken: oauthAccessToken,
+        ...(oauthRefreshToken ? { refreshToken: oauthRefreshToken } : {}),
+      };
+    } else if (smtpUser && smtpPass) {
+      transportOptions.auth = {
+        user: smtpUser,
+        pass: smtpPass,
+      };
+    } else {
+      throw new BadRequestException(
+        'Mailbox authentication is missing for invite delivery.',
+      );
+    }
+
+    return {
+      transport: nodemailer.createTransport(transportOptions),
+      fromEmail,
+      replyTo: mailbox.email || fromEmail,
+    };
   }
 
   private async auditLog(

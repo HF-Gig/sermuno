@@ -1176,18 +1176,18 @@ const SettingsPage: React.FC = () => {
     };
     const integrationStates = useMemo(() => ({
         google: {
-            connected: integrationStatus.google.connected || mailboxes.some(mailbox => mailbox.provider === 'GMAIL'),
-            account: integrationStatus.google.account || mailboxes.find(mailbox => mailbox.provider === 'GMAIL')?.email || null,
+            connected: integrationStatus.google.connected,
+            account: integrationStatus.google.account || null,
         },
         microsoft: {
-            connected: integrationStatus.microsoft.connected || mailboxes.some(mailbox => mailbox.provider === 'OUTLOOK'),
-            account: integrationStatus.microsoft.account || mailboxes.find(mailbox => mailbox.provider === 'OUTLOOK')?.email || null,
+            connected: integrationStatus.microsoft.connected,
+            account: integrationStatus.microsoft.account || null,
         },
         zoom: {
             connected: integrationStatus.zoom.connected,
             account: integrationStatus.zoom.account,
         },
-    }), [mailboxes, integrationStatus]);
+    }), [integrationStatus]);
 
     const handleDisconnect = async (provider: IntegrationProvider) => {
         if (provider === 'zoom') {

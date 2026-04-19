@@ -87,6 +87,27 @@ export class MailboxesService {
     return value ? this.encrypt(value) : undefined;
   }
 
+  private shouldExcludeProviderSystemFolder(name: string): boolean {
+    const raw = String(name || '').trim().toLowerCase();
+    const normalized = raw
+      .replace(/[\[\]().]/g, ' ')
+      .replace(/[_-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return (
+      normalized === 'gmail' ||
+      raw === '[gmail]' ||
+      raw === '[gmail]/starred' ||
+      raw === '[gmail]/important' ||
+      normalized === 'starred' ||
+      normalized === 'important' ||
+      normalized === 'flagged emails' ||
+      normalized.endsWith('/starred') ||
+      normalized.endsWith('/important')
+    );
+  }
+
   // ─── Mailboxes ────────────────────────────────────────────────────────────
 
   async findAll(user: JwtUser) {
@@ -155,14 +176,16 @@ export class MailboxesService {
 
   async getUnreadCount(id: string, user: JwtUser) {
     await this.assertMailboxOwner(id, user);
-    const aggregate = await this.prisma.mailboxFolder.aggregate({
+    const rows = await this.prisma.mailboxFolder.findMany({
       where: { mailboxId: id },
-      _sum: { unreadCount: true },
+      select: { name: true, unreadCount: true },
     });
 
     return {
       mailboxId: id,
-      unreadCount: Number(aggregate._sum.unreadCount ?? 0),
+      unreadCount: rows
+        .filter((row) => !this.shouldExcludeProviderSystemFolder(row.name))
+        .reduce((sum, row) => sum + Number(row.unreadCount ?? 0), 0),
     };
   }
 
@@ -692,13 +715,15 @@ export class MailboxesService {
       },
     });
 
-    return rows.map((row) => ({
-      ...row,
-      uidValidity: row.uidValidity != null ? row.uidValidity.toString() : null,
-      uidNext: row.uidNext != null ? row.uidNext.toString() : null,
-      highestModSeq:
-        row.highestModSeq != null ? row.highestModSeq.toString() : null,
-    }));
+    return rows
+      .filter((row) => !this.shouldExcludeProviderSystemFolder(row.name))
+      .map((row) => ({
+        ...row,
+        uidValidity: row.uidValidity != null ? row.uidValidity.toString() : null,
+        uidNext: row.uidNext != null ? row.uidNext.toString() : null,
+        highestModSeq:
+          row.highestModSeq != null ? row.highestModSeq.toString() : null,
+      }));
   }
 
   async createFolder(mailboxId: string, dto: CreateFolderDto, user: JwtUser) {

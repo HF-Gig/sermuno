@@ -7,6 +7,7 @@ import {
     ChevronRight,
     Clock3,
     List,
+    Loader2,
     MapPin,
     PanelsTopLeft,
     Pencil,
@@ -153,11 +154,29 @@ const CalendarPage: React.FC = () => {
     const [editingEvent, setEditingEvent] = useState<CalendarEvent | null>(null);
     const [form, setForm] = useState<CalendarFormState>(createForm());
     const [formError, setFormError] = useState('');
+    const [isSavingEvent, setIsSavingEvent] = useState(false);
+    const [isSendingInvite, setIsSendingInvite] = useState(false);
+    const [isDeletingEvent, setIsDeletingEvent] = useState(false);
 
-    const load = useCallback(async (background = false) => {
+    const syncGoogleCalendar = useCallback(async () => {
+        if (!canManage) return;
+        try {
+            const integrations = await api.get('/integrations/status');
+            if (integrations.data?.google?.connected) {
+                await api.post('/calendar/sync/google', {});
+            }
+        } catch (err) {
+            console.error('Failed to sync Google calendar', err);
+        }
+    }, [canManage]);
+
+    const load = useCallback(async (background = false, syncExternal = false) => {
         if (!background) setLoading(true);
         setError('');
         try {
+            if (syncExternal) {
+                await syncGoogleCalendar();
+            }
             const response = await api.get('/calendar/events');
             setEvents(Array.isArray(response.data) ? response.data : []);
         } catch (err: any) {
@@ -165,15 +184,15 @@ const CalendarPage: React.FC = () => {
         } finally {
             setLoading(false);
         }
-    }, []);
+    }, [syncGoogleCalendar]);
 
     useEffect(() => {
-        void load();
+        void load(false, true);
     }, [load]);
 
     useEffect(() => {
         if (!socket) return;
-        const refresh = () => { void load(true); };
+        const refresh = () => { void load(true, false); };
         socket.on('calendar:event_updated', refresh);
         socket.on('calendar:rsvp_received', refresh);
         socket.on('calendar:meeting_created', refresh);
@@ -183,6 +202,14 @@ const CalendarPage: React.FC = () => {
             socket.off('calendar:meeting_created', refresh);
         };
     }, [load, socket]);
+
+    useEffect(() => {
+        if (!canManage) return undefined;
+        const interval = window.setInterval(() => {
+            void load(true, true);
+        }, 5 * 60 * 1000);
+        return () => window.clearInterval(interval);
+    }, [canManage, load]);
 
     const normalizedEvents = useMemo(() => events
         .map((event) => ({
@@ -302,6 +329,7 @@ const CalendarPage: React.FC = () => {
     };
 
     const saveEvent = async () => {
+        if (isSavingEvent) return;
         if (!form.title.trim()) {
             setFormError('Event title is required.');
             return;
@@ -322,6 +350,7 @@ const CalendarPage: React.FC = () => {
             meetingProvider: form.meetingProvider || undefined,
         };
 
+        setIsSavingEvent(true);
         try {
             if (editingEvent) {
                 await api.patch(`/calendar/events/${editingEvent.id}`, payload);
@@ -332,27 +361,43 @@ const CalendarPage: React.FC = () => {
             await load(true);
         } catch (err: any) {
             setFormError(err?.response?.data?.message || 'Failed to save event.');
+        } finally {
+            setIsSavingEvent(false);
         }
     };
 
     const deleteEvent = async (eventId: string) => {
+        if (isDeletingEvent) return;
+        setIsDeletingEvent(true);
         try {
             await api.delete(`/calendar/events/${eventId}`);
             setSelectedEvent(null);
             await load(true);
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to delete event.');
+        } finally {
+            setIsDeletingEvent(false);
         }
     };
 
     const sendInvite = async (eventId: string) => {
+        if (isSendingInvite) return;
+        setIsSendingInvite(true);
         setInviteStatus('');
         try {
             const response = await api.post('/calendar/invite', { eventId });
-            setInviteStatus(`Invite sent to ${response.data?.sent || 0} attendee(s).`);
+            const sent = Number(response.data?.sent || 0);
+            const failed = Number(response.data?.failed || 0);
+            if (failed > 0) {
+                setInviteStatus(`Invites sent to ${sent} attendee(s). ${failed} failed.`);
+            } else {
+                setInviteStatus(`Invite sent to ${sent} attendee(s).`);
+            }
             await load(true);
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to send invite.');
+        } finally {
+            setIsSendingInvite(false);
         }
     };
 
@@ -378,7 +423,7 @@ const CalendarPage: React.FC = () => {
                             ))}
                         </div>
                         {canCreate && (
-                            <button type="button" onClick={() => openCreate(currentDate)} className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-3 py-2.5 text-sm font-semibold text-white hover:bg-[var(--color-cta-secondary)]">
+                            <button type="button" disabled={isSavingEvent} onClick={() => openCreate(currentDate)} className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-3 py-2.5 text-sm font-semibold text-white hover:bg-[var(--color-cta-secondary)] disabled:cursor-not-allowed disabled:opacity-60">
                                 <CalendarPlus className="h-4 w-4 shrink-0" /> <span className="whitespace-nowrap">Create Event</span>
                             </button>
                         )}
@@ -506,7 +551,7 @@ const CalendarPage: React.FC = () => {
                                             <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--color-text-muted)]">Selected Day</div>
                                             <div className="mt-2 text-xl font-semibold text-[var(--color-text-primary)]">{currentDate.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}</div>
                                         </div>
-                                        {canCreate && <button type="button" onClick={() => openCreate(currentDate)} className="rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--color-cta-secondary)]">Create Event</button>}
+                                        {canCreate && <button type="button" disabled={isSavingEvent} onClick={() => openCreate(currentDate)} className="rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-semibold text-white hover:bg-[var(--color-cta-secondary)] disabled:cursor-not-allowed disabled:opacity-60">Create Event</button>}
                                     </div>
                                     <div className="space-y-3">
                                         {selectedDayEvents.length === 0 ? (
@@ -618,9 +663,29 @@ const CalendarPage: React.FC = () => {
                         )}
 
                         <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-                            {canCreate && <button type="button" onClick={() => void sendInvite(selectedEvent.id)} className="inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--color-card-border)] px-4 py-2.5 text-sm font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)]"><Send className="h-4 w-4" /> Send Invite</button>}
-                            {canManage && <button type="button" onClick={() => openEdit(selectedEvent)} className="inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--color-card-border)] px-4 py-2.5 text-sm font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)]"><Pencil className="h-4 w-4" /> Edit</button>}
-                            {canManage && <button type="button" onClick={() => void deleteEvent(selectedEvent.id)} className="inline-flex items-center justify-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-red-700"><Trash2 className="h-4 w-4" /> Delete</button>}
+                            {canCreate && (
+                                <button
+                                    type="button"
+                                    disabled={isSendingInvite || isDeletingEvent}
+                                    onClick={() => void sendInvite(selectedEvent.id)}
+                                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--color-card-border)] px-4 py-2.5 text-sm font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)] disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                    {isSendingInvite ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                                    {isSendingInvite ? 'Sending...' : 'Send Invite'}
+                                </button>
+                            )}
+                            {canManage && <button type="button" disabled={isSendingInvite || isDeletingEvent} onClick={() => openEdit(selectedEvent)} className="inline-flex items-center justify-center gap-2 rounded-xl border border-[var(--color-card-border)] px-4 py-2.5 text-sm font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)] disabled:cursor-not-allowed disabled:opacity-60"><Pencil className="h-4 w-4" /> Edit</button>}
+                            {canManage && (
+                                <button
+                                    type="button"
+                                    disabled={isDeletingEvent || isSendingInvite}
+                                    onClick={() => void deleteEvent(selectedEvent.id)}
+                                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                    {isDeletingEvent ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                                    {isDeletingEvent ? 'Deleting...' : 'Delete'}
+                                </button>
+                            )}
                         </div>
                     </div>
                 )}
@@ -667,8 +732,11 @@ const CalendarPage: React.FC = () => {
                     {formError && <div className="text-sm text-red-600">{formError}</div>}
 
                     <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-                        <button type="button" onClick={() => setIsModalOpen(false)} className="rounded-lg px-4 py-2 text-sm font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-background)]">Cancel</button>
-                        <button type="button" onClick={() => void saveEvent()} className="rounded-lg bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white">{editingEvent ? 'Update Event' : 'Create Event'}</button>
+                        <button type="button" disabled={isSavingEvent} onClick={() => setIsModalOpen(false)} className="rounded-lg px-4 py-2 text-sm font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-background)] disabled:cursor-not-allowed disabled:opacity-60">Cancel</button>
+                        <button type="button" disabled={isSavingEvent} onClick={() => void saveEvent()} className="inline-flex items-center justify-center gap-2 rounded-lg bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60">
+                            {isSavingEvent ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                            {isSavingEvent ? (editingEvent ? 'Updating...' : 'Creating...') : (editingEvent ? 'Update Event' : 'Create Event')}
+                        </button>
                     </div>
                 </div>
             </Modal>

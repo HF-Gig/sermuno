@@ -5,6 +5,8 @@ import { SCHEDULED_MESSAGES_QUEUE } from '../queues/scheduled-messages.queue';
 import { PrismaService } from '../../database/prisma.service';
 import { Prisma } from '@prisma/client';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
+import { MessagesService } from '../../modules/messages/messages.service';
+import { EventsGateway } from '../../modules/websockets/events.gateway';
 
 export interface ScheduledMessageJobData {
   scheduledMessageId?: string;
@@ -25,6 +27,8 @@ export class ScheduledMessagesProcessor extends WorkerHost {
   constructor(
     private readonly prisma: PrismaService,
     private readonly featureFlags: FeatureFlagsService,
+    private readonly messagesService: MessagesService,
+    private readonly eventsGateway: EventsGateway,
   ) {
     super();
   }
@@ -49,7 +53,10 @@ export class ScheduledMessagesProcessor extends WorkerHost {
       : await this.prisma.scheduledMessage.findFirst({
           where: {
             status: 'pending',
-            payload: { path: ['id'], equals: messageId },
+            OR: [
+              { payload: { path: ['messageId'], equals: messageId } },
+              { payload: { path: ['id'], equals: messageId } },
+            ],
           },
           orderBy: { createdAt: 'desc' },
         });
@@ -79,10 +86,78 @@ export class ScheduledMessagesProcessor extends WorkerHost {
       where: { id: scheduled.id },
       data: { status: 'processing' },
     });
+    await this.emitScheduledStatusEvent(
+      scheduled.mailboxId,
+      scheduled.threadId,
+      messageId,
+      'processing',
+      scheduled.scheduledAt,
+    );
 
     try {
-      // Actual SMTP dispatch is handled by email-send queue integration.
-      // Here we mark lifecycle state transitions for scheduling workflow.
+      const deliveryResult = await this.messagesService.deliverQueuedMessage(
+        messageId,
+        scheduled.organizationId,
+      );
+      if (!deliveryResult.providerMessageId) {
+        throw new Error(
+          `Provider delivery missing message id for scheduled ${scheduled.id}`,
+        );
+      }
+
+      const deliveredMessage = await this.prisma.message.findFirst({
+        where: {
+          id: messageId,
+          mailbox: { organizationId: scheduled.organizationId },
+          deletedAt: null,
+        },
+        select: {
+          isDraft: true,
+          messageId: true,
+        },
+      });
+      if (!deliveredMessage || deliveredMessage.isDraft || !deliveredMessage.messageId) {
+        throw new Error(
+          `Persisted message state invalid after delivery for scheduled ${scheduled.id}`,
+        );
+      }
+
+      const payloadRecord =
+        scheduled.payload &&
+        typeof scheduled.payload === 'object' &&
+        !Array.isArray(scheduled.payload)
+          ? (scheduled.payload as Record<string, unknown>)
+          : null;
+      const requestedThreadStatus = String(
+        payloadRecord?.threadStatusAfterSend ?? '',
+      ).toUpperCase();
+      const supportedThreadStatuses = new Set([
+        'NEW',
+        'OPEN',
+        'PENDING',
+        'CLOSED',
+        'ARCHIVED',
+      ]);
+      if (
+        scheduled.threadId &&
+        supportedThreadStatuses.has(requestedThreadStatus)
+      ) {
+        await this.prisma.thread.updateMany({
+          where: {
+            id: scheduled.threadId,
+            organizationId: scheduled.organizationId,
+          },
+          data: {
+            status: requestedThreadStatus as
+              | 'NEW'
+              | 'OPEN'
+              | 'PENDING'
+              | 'CLOSED'
+              | 'ARCHIVED',
+          },
+        });
+      }
+
       await this.prisma.scheduledMessage.update({
         where: { id: scheduled.id },
         data: {
@@ -94,6 +169,13 @@ export class ScheduledMessagesProcessor extends WorkerHost {
           lastError: null,
         },
       });
+      await this.emitScheduledStatusEvent(
+        scheduled.mailboxId,
+        scheduled.threadId,
+        messageId,
+        'sent',
+        scheduled.scheduledAt,
+      );
 
       if (scheduled.rrule) {
         const nextAt = this.computeNextRun(
@@ -130,6 +212,13 @@ export class ScheduledMessagesProcessor extends WorkerHost {
           lastError: String(err),
         },
       });
+      await this.emitScheduledStatusEvent(
+        scheduled.mailboxId,
+        scheduled.threadId,
+        messageId,
+        retryCount >= maxRetries ? 'failed' : 'pending',
+        scheduled.scheduledAt,
+      );
       throw err;
     }
   }
@@ -147,5 +236,29 @@ export class ScheduledMessagesProcessor extends WorkerHost {
       return d;
     }
     return null;
+  }
+
+  private async emitScheduledStatusEvent(
+    mailboxId: string,
+    threadId: string | null,
+    messageId: string,
+    scheduledStatus: 'pending' | 'processing' | 'sent' | 'failed',
+    scheduledAt: Date,
+  ): Promise<void> {
+    try {
+      await this.eventsGateway.emitToMailbox(mailboxId, 'thread:updated', {
+        mailboxId,
+        threadId,
+        messageId,
+        scheduledStatus,
+        scheduledAt: scheduledAt.toISOString(),
+      });
+    } catch (error) {
+      this.logger.warn(
+        `[scheduled-messages] failed to emit status=${scheduledStatus} for mailbox=${mailboxId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 }
