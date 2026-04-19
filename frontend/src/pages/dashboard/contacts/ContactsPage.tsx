@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Building2, Mail, Pencil, Plus, Trash2, UserRound } from 'lucide-react';
+import { Building2, ChevronLeft, ChevronRight, Clock3, Eye, Mail, MessageSquare, Pencil, Plus, Trash2, UserRound } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import PageHeader from '../../../components/ui/PageHeader';
 import EmptyState from '../../../components/ui/EmptyState';
 import Modal from '../../../components/ui/Modal';
@@ -41,6 +42,19 @@ type CompanyRecord = {
     threadCount?: number;
 };
 
+type PagedResponse<T> = {
+    items: T[];
+    total: number;
+    page: number;
+    limit: number;
+};
+
+type DeleteConfirmState = {
+    entity: 'contact' | 'company';
+    ids: string[];
+    names: string[];
+};
+
 type ContactNotificationPreference = {
     contactId: string;
     notificationType: 'contact_activity';
@@ -77,7 +91,10 @@ const blankCompany = {
     customFields: '{}',
 };
 
+const PAGE_LIMIT = 20;
+
 const ContactsPage: React.FC = () => {
+    const [searchParams, setSearchParams] = useSearchParams();
     const { user } = useAuth();
     const canCreate = hasPermission(user?.permissions, 'contacts:create');
     const canManage = hasPermission(user?.permissions, 'contacts:manage');
@@ -86,6 +103,10 @@ const ContactsPage: React.FC = () => {
     const [tab, setTab] = useState<TabKey>('contacts');
     const [contacts, setContacts] = useState<ContactRecord[]>([]);
     const [companies, setCompanies] = useState<CompanyRecord[]>([]);
+    const [contactsTotal, setContactsTotal] = useState(0);
+    const [companiesTotal, setCompaniesTotal] = useState(0);
+    const [contactsPage, setContactsPage] = useState(1);
+    const [companiesPage, setCompaniesPage] = useState(1);
     const [users, setUsers] = useState<Array<{ id: string; fullName?: string; email: string }>>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -93,6 +114,8 @@ const ContactsPage: React.FC = () => {
     const [selectedCompanyId, setSelectedCompanyId] = useState<string>('');
     const [contactDetail, setContactDetail] = useState<ContactRecord | null>(null);
     const [companyDetail, setCompanyDetail] = useState<CompanyRecord | null>(null);
+    const [contactDetailLoading, setContactDetailLoading] = useState(false);
+    const [companyDetailLoading, setCompanyDetailLoading] = useState(false);
     const [contactModalOpen, setContactModalOpen] = useState(false);
     const [companyModalOpen, setCompanyModalOpen] = useState(false);
     const [editingContactId, setEditingContactId] = useState<string | null>(null);
@@ -104,23 +127,46 @@ const ContactsPage: React.FC = () => {
     const [contactNotificationLoading, setContactNotificationLoading] = useState(false);
     const [contactNotificationSaving, setContactNotificationSaving] = useState(false);
     const [contactNotificationError, setContactNotificationError] = useState('');
+    const [selectedContactIds, setSelectedContactIds] = useState<string[]>([]);
+    const [selectedCompanyIds, setSelectedCompanyIds] = useState<string[]>([]);
+    const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+    const [contactDetailsOpen, setContactDetailsOpen] = useState(false);
+    const [companyDetailsOpen, setCompanyDetailsOpen] = useState(false);
+    const [contactQuery, setContactQuery] = useState('');
+    const [companyQuery, setCompanyQuery] = useState('');
+
+    useEffect(() => {
+        const tabQuery = searchParams.get('tab');
+        if (tabQuery === 'companies') {
+            setTab('companies');
+        } else if (tabQuery === 'contacts') {
+            setTab('contacts');
+        }
+    }, [searchParams]);
 
     const load = async () => {
         setLoading(true);
         setError('');
         try {
             const [contactsRes, companiesRes, usersRes] = await Promise.all([
-                api.get('/contacts'),
-                api.get('/companies'),
+                api.get('/contacts', { params: { page: contactsPage, limit: PAGE_LIMIT } }),
+                api.get('/companies', { params: { page: companiesPage, limit: PAGE_LIMIT } }),
                 api.get('/users').catch(() => ({ data: [] })),
             ]);
-            const contactRows = Array.isArray(contactsRes.data) ? contactsRes.data : [];
-            const companyRows = Array.isArray(companiesRes.data) ? companiesRes.data : [];
+            const contactPayload = contactsRes.data as ContactRecord[] | PagedResponse<ContactRecord>;
+            const companyPayload = companiesRes.data as CompanyRecord[] | PagedResponse<CompanyRecord>;
+            const contactRows = Array.isArray(contactPayload) ? contactPayload : contactPayload.items || [];
+            const companyRows = Array.isArray(companyPayload) ? companyPayload : companyPayload.items || [];
+            const nextContactsTotal = Array.isArray(contactPayload) ? contactRows.length : Number(contactPayload.total || contactRows.length);
+            const nextCompaniesTotal = Array.isArray(companyPayload) ? companyRows.length : Number(companyPayload.total || companyRows.length);
             setContacts(contactRows);
             setCompanies(companyRows);
+            setContactsTotal(nextContactsTotal);
+            setCompaniesTotal(nextCompaniesTotal);
             setUsers(Array.isArray(usersRes.data) ? usersRes.data : []);
-            setSelectedContactId((prev) => prev || contactRows[0]?.id || '');
-            setSelectedCompanyId((prev) => prev || companyRows[0]?.id || '');
+            setSelectedContactIds((prev) => prev.filter((id) => contactRows.some((entry) => entry.id === id)));
+            setSelectedCompanyIds((prev) => prev.filter((id) => companyRows.some((entry) => entry.id === id)));
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to load CRM data.');
         } finally {
@@ -130,15 +176,18 @@ const ContactsPage: React.FC = () => {
 
     useEffect(() => {
         void load();
-    }, []);
+    }, [contactsPage, companiesPage]);
 
     useEffect(() => {
         if (!selectedContactId) {
             setContactDetail(null);
             setContactNotificationPreference(null);
             setContactNotificationError('');
+            setContactDetailLoading(false);
             return;
         }
+        setContactDetailLoading(true);
+        setContactDetail(null);
         setContactNotificationLoading(true);
         setContactNotificationError('');
         void Promise.allSettled([
@@ -159,15 +208,25 @@ const ContactsPage: React.FC = () => {
                     setContactNotificationError('Failed to load contact notification preference.');
                 }
             })
-            .finally(() => setContactNotificationLoading(false));
+            .finally(() => {
+                setContactNotificationLoading(false);
+                setContactDetailLoading(false);
+            });
     }, [selectedContactId]);
 
     useEffect(() => {
         if (!selectedCompanyId) {
             setCompanyDetail(null);
+            setCompanyDetailLoading(false);
             return;
         }
-        void api.get(`/companies/${selectedCompanyId}`).then((res) => setCompanyDetail(res.data)).catch(() => setCompanyDetail(null));
+        setCompanyDetailLoading(true);
+        setCompanyDetail(null);
+        void api
+            .get(`/companies/${selectedCompanyId}`)
+            .then((res) => setCompanyDetail(res.data))
+            .catch(() => setCompanyDetail(null))
+            .finally(() => setCompanyDetailLoading(false));
     }, [selectedCompanyId]);
 
     const companyMap = useMemo(() => Object.fromEntries(companies.map((company) => [company.id, company.name])), [companies]);
@@ -242,6 +301,26 @@ const ContactsPage: React.FC = () => {
         setCompanyModalOpen(true);
     };
 
+    const openContactDetails = (contactId: string) => {
+        setSelectedContactId(contactId);
+        setContactDetailsOpen(true);
+    };
+
+    const closeContactDetails = () => {
+        setContactDetailsOpen(false);
+        setSelectedContactId('');
+    };
+
+    const openCompanyDetails = (companyId: string) => {
+        setSelectedCompanyId(companyId);
+        setCompanyDetailsOpen(true);
+    };
+
+    const closeCompanyDetails = () => {
+        setCompanyDetailsOpen(false);
+        setSelectedCompanyId('');
+    };
+
     const saveContact = async () => {
         try {
             const payload = {
@@ -289,14 +368,66 @@ const ContactsPage: React.FC = () => {
         }
     };
 
-    const removeContact = async (id: string) => {
-        await api.delete(`/contacts/${id}`);
-        await load();
+    const contactsTotalPages = Math.max(Math.ceil(Math.max(contactsTotal, 0) / PAGE_LIMIT), 1);
+    const companiesTotalPages = Math.max(Math.ceil(Math.max(companiesTotal, 0) / PAGE_LIMIT), 1);
+
+    useEffect(() => {
+        if (contactsPage > contactsTotalPages) {
+            setContactsPage(contactsTotalPages);
+        }
+    }, [contactsPage, contactsTotalPages]);
+
+    useEffect(() => {
+        if (companiesPage > companiesTotalPages) {
+            setCompaniesPage(companiesTotalPages);
+        }
+    }, [companiesPage, companiesTotalPages]);
+
+    const contactPageIds = useMemo(() => contacts.map((entry) => entry.id), [contacts]);
+    const companyPageIds = useMemo(() => companies.map((entry) => entry.id), [companies]);
+    const allContactsOnPageSelected = contactPageIds.length > 0 && contactPageIds.every((id) => selectedContactIds.includes(id));
+    const allCompaniesOnPageSelected = companyPageIds.length > 0 && companyPageIds.every((id) => selectedCompanyIds.includes(id));
+
+    const toggleContactSelection = (id: string, checked: boolean) => {
+        setSelectedContactIds((prev) => checked ? (prev.includes(id) ? prev : [...prev, id]) : prev.filter((entry) => entry !== id));
     };
 
-    const removeCompany = async (id: string) => {
-        await api.delete(`/companies/${id}`);
-        await load();
+    const toggleCompanySelection = (id: string, checked: boolean) => {
+        setSelectedCompanyIds((prev) => checked ? (prev.includes(id) ? prev : [...prev, id]) : prev.filter((entry) => entry !== id));
+    };
+
+    const toggleAllContactsOnPage = (checked: boolean) => {
+        setSelectedContactIds((prev) => checked ? Array.from(new Set([...prev, ...contactPageIds])) : prev.filter((id) => !contactPageIds.includes(id)));
+    };
+
+    const toggleAllCompaniesOnPage = (checked: boolean) => {
+        setSelectedCompanyIds((prev) => checked ? Array.from(new Set([...prev, ...companyPageIds])) : prev.filter((id) => !companyPageIds.includes(id)));
+    };
+
+    const requestDelete = (entity: 'contact' | 'company', ids: string[], names: string[]) => {
+        if (ids.length === 0) return;
+        setDeleteConfirm({ entity, ids, names });
+    };
+
+    const confirmDelete = async () => {
+        if (!deleteConfirm) return;
+        setDeleteSubmitting(true);
+        setError('');
+        try {
+            const endpoint = deleteConfirm.entity === 'contact' ? '/contacts' : '/companies';
+            await Promise.all(deleteConfirm.ids.map((id) => api.delete(`${endpoint}/${id}`)));
+            if (deleteConfirm.entity === 'contact') {
+                setSelectedContactIds((prev) => prev.filter((id) => !deleteConfirm.ids.includes(id)));
+            } else {
+                setSelectedCompanyIds((prev) => prev.filter((id) => !deleteConfirm.ids.includes(id)));
+            }
+            setDeleteConfirm(null);
+            await load();
+        } catch (err: any) {
+            setError(err?.response?.data?.message || 'Failed to delete selected records.');
+        } finally {
+            setDeleteSubmitting(false);
+        }
     };
 
     const updateContactNotificationPreference = (patch: Partial<ContactNotificationPreference>) => {
@@ -340,11 +471,19 @@ const ContactsPage: React.FC = () => {
 
     const displayContacts = loading
         ? Array.from({ length: contactsLoadingRows }, (_, index) => ({ id: `loading-contact-${index}`, email: '', fullName: '', lifecycleStage: '', source: '', assignedToUserId: '', emailCount: 0, threadCount: 0, lastContactedAt: '' } as ContactRecord))
-        : contacts;
+        : contacts.filter((entry) => {
+            const q = contactQuery.trim().toLowerCase();
+            if (!q) return true;
+            return `${entry.fullName || ''} ${entry.email || ''}`.toLowerCase().includes(q);
+        });
 
     const displayCompanies = loading
         ? Array.from({ length: companiesLoadingRows }, (_, index) => ({ id: `loading-company-${index}`, tenantId: '', name: '', primaryDomain: '', additionalDomains: [], customFields: {}, contactCount: 0, threadCount: 0 } as CompanyRecord))
-        : companies;
+        : companies.filter((entry) => {
+            const q = companyQuery.trim().toLowerCase();
+            if (!q) return true;
+            return `${entry.name || ''} ${entry.primaryDomain || ''}`.toLowerCase().includes(q);
+        });
 
     return (
         <div className="mx-auto max-w-[1280px] space-y-6">
@@ -353,8 +492,8 @@ const ContactsPage: React.FC = () => {
                 subtitle="Manage contacts, companies, linking, lifecycle data, and CRM activity stats."
                 actions={(
                     <div className="flex items-center gap-2">
-                        <button type="button" onClick={() => setTab('contacts')} className={`rounded-xl px-4 py-2 text-sm font-medium ${tab === 'contacts' ? 'bg-[var(--color-cta-primary)] text-white' : 'border border-[var(--color-card-border)] bg-white text-[var(--color-text-primary)]'}`}>Contacts</button>
-                        <button type="button" onClick={() => setTab('companies')} className={`rounded-xl px-4 py-2 text-sm font-medium ${tab === 'companies' ? 'bg-[var(--color-cta-primary)] text-white' : 'border border-[var(--color-card-border)] bg-white text-[var(--color-text-primary)]'}`}>Companies</button>
+                        <button type="button" onClick={() => { setTab('contacts'); setSearchParams({ tab: 'contacts' }); }} className={`rounded-xl px-4 py-2 text-sm font-medium ${tab === 'contacts' ? 'bg-[var(--color-cta-primary)] text-white' : 'border border-[var(--color-card-border)] bg-white text-[var(--color-text-primary)]'}`}>Contacts</button>
+                        <button type="button" onClick={() => { setTab('companies'); setSearchParams({ tab: 'companies' }); }} className={`rounded-xl px-4 py-2 text-sm font-medium ${tab === 'companies' ? 'bg-[var(--color-cta-primary)] text-white' : 'border border-[var(--color-card-border)] bg-white text-[var(--color-text-primary)]'}`}>Companies</button>
                     </div>
                 )}
             />
@@ -362,45 +501,99 @@ const ContactsPage: React.FC = () => {
             {error && <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
 
             {tab === 'contacts' ? (
-                <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_420px]">
+                <div className="block">
                     <section className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
                         <div className="flex items-center justify-between border-b border-[var(--color-card-border)] px-5 py-4">
                             <div>
-                                <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">Contacts</h2>
+                                <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">Contacts Directory</h2>
                                 <p className="text-sm text-[var(--color-text-muted)]">Manual, imported, and email-sync contacts.</p>
                             </div>
-                            {canCreate && <button type="button" onClick={openContactCreate} className="inline-flex items-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white"><Plus className="h-4 w-4" /> Create</button>}
+                            <div className="flex items-center gap-2">
+                                <input
+                                    value={contactQuery}
+                                    onChange={(event) => setContactQuery(event.target.value)}
+                                    placeholder="Search records..."
+                                    className="w-56 rounded-lg border border-[var(--color-card-border)] bg-[var(--color-background)]/60 px-3 py-2 text-sm text-[var(--color-text-primary)]"
+                                />
+                                {canDelete && selectedContactIds.length > 0 && (
+                                    <button
+                                        type="button"
+                                        onClick={() => requestDelete('contact', selectedContactIds, contacts.filter((entry) => selectedContactIds.includes(entry.id)).map((entry) => entry.fullName || entry.email || entry.id))}
+                                        className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-100"
+                                    >
+                                        <Trash2 className="h-4 w-4" />
+                                        Delete Selected ({selectedContactIds.length})
+                                    </button>
+                                )}
+                                {canCreate && <button type="button" onClick={openContactCreate} className="inline-flex items-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white"><Plus className="h-4 w-4" /> Create</button>}
+                            </div>
                         </div>
-                        <div className="overflow-x-auto">
-                            <table className="w-full min-w-[1180px] text-left">
+                        <div className="w-full overflow-x-auto overflow-y-hidden pb-2 [scrollbar-gutter:stable]">
+                            <table className="w-full min-w-[980px] text-left">
                                 <thead>
                                     <tr className="border-b border-[var(--color-card-border)] text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
-                                        <th className="px-4 py-3">Full Name</th>
-                                        <th className="px-4 py-3">Email</th>
-                                        <th className="px-4 py-3">Lifecycle</th>
-                                        <th className="px-4 py-3">Source</th>
-                                        <th className="px-4 py-3">Assigned</th>
-                                        <th className="px-4 py-3">Email Count</th>
-                                        <th className="px-4 py-3">Thread Count</th>
-                                        <th className="px-4 py-3">Last Contacted</th>
+                                        <th className="px-4 py-3">
+                                            <input
+                                                type="checkbox"
+                                                aria-label="Select all contacts on page"
+                                                checked={allContactsOnPageSelected}
+                                                onChange={(event) => toggleAllContactsOnPage(event.target.checked)}
+                                                disabled={loading || contactPageIds.length === 0}
+                                                className="h-4 w-4 rounded border-[var(--color-card-border)]"
+                                            />
+                                        </th>
+                                        <th className="px-4 py-3">Name & Email</th>
+                                        <th className="px-4 py-3">Status</th>
+                                        <th className="px-4 py-3">Activity</th>
                                         <th className="px-4 py-3 text-right">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {displayContacts.map((contact) => (
-                                        <tr key={contact.id} className={`border-b border-[var(--color-card-border)]/70 text-sm hover:bg-[var(--color-background)]/35 ${selectedContactId === contact.id ? 'bg-[var(--color-background)]/30' : ''}`}>
-                                            <td className="px-4 py-3 font-medium text-[var(--color-text-primary)] cursor-pointer" onClick={() => !loading && setSelectedContactId(contact.id)}>{loading ? <InlineSkeleton className="h-4 w-28" /> : (contact.fullName || '--')}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-40" /> : contact.email}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)] capitalize">{loading ? <InlineSkeleton className="h-4 w-16" /> : (contact.lifecycleStage || '--')}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-16" /> : (contact.source || '--')}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-20" /> : (userMap[contact.assignedToUserId || ''] || '--')}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-8" /> : Number(contact.emailCount || 0).toLocaleString()}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-8" /> : Number(contact.threadCount || 0).toLocaleString()}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-28" /> : (contact.lastContactedAt ? new Date(contact.lastContactedAt).toLocaleString() : '--')}</td>
+                                        <tr key={contact.id} className="border-b border-[var(--color-card-border)]/70 text-sm hover:bg-[var(--color-background)]/35">
+                                            <td className="px-4 py-3">
+                                                {loading ? (
+                                                    <InlineSkeleton className="h-4 w-4" />
+                                                ) : (
+                                                    <input
+                                                        type="checkbox"
+                                                        aria-label={`Select ${contact.fullName || contact.email || 'contact'}`}
+                                                        checked={selectedContactIds.includes(contact.id)}
+                                                        onChange={(event) => toggleContactSelection(contact.id, event.target.checked)}
+                                                        className="h-4 w-4 rounded border-[var(--color-card-border)]"
+                                                    />
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                {loading ? <InlineSkeleton className="h-10 w-56" /> : (
+                                                    <div>
+                                                        <p className="font-medium text-[var(--color-text-primary)]">{contact.fullName || '--'}</p>
+                                                        <p className="mt-0.5 text-xs text-[var(--color-text-muted)]">{contact.email}</p>
+                                                    </div>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                {loading ? <InlineSkeleton className="h-6 w-32" /> : (
+                                                    <div className="flex flex-wrap gap-1.5">
+                                                        <span className="rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[11px] font-medium text-blue-700 capitalize">{contact.lifecycleStage || '--'}</span>
+                                                        <span className="rounded-full border border-slate-200 bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700">{contact.source || '--'}</span>
+                                                    </div>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">
+                                                {loading ? <InlineSkeleton className="h-6 w-52" /> : (
+                                                    <div className="flex items-center gap-3 text-xs">
+                                                        <span className="inline-flex items-center gap-1"><Mail className="h-3.5 w-3.5" /> {Number(contact.emailCount || 0).toLocaleString()}</span>
+                                                        <span className="inline-flex items-center gap-1"><MessageSquare className="h-3.5 w-3.5" /> {Number(contact.threadCount || 0).toLocaleString()}</span>
+                                                        <span className="inline-flex items-center gap-1"><Clock3 className="h-3.5 w-3.5" /> {contact.lastContactedAt ? new Date(contact.lastContactedAt).toLocaleDateString() : '--'}</span>
+                                                    </div>
+                                                )}
+                                            </td>
                                             <td className="px-4 py-3">
                                                 <div className="flex justify-end gap-1">
+                                                    {!loading && <button type="button" onClick={() => openContactDetails(contact.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]" aria-label="View contact details"><Eye className="h-4 w-4" /></button>}
                                                     {!loading && canManage && <button type="button" onClick={() => openContactEdit(contact)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="h-4 w-4" /></button>}
-                                                    {!loading && canDelete && <button type="button" onClick={() => void removeContact(contact.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>}
+                                                    {!loading && canDelete && <button type="button" onClick={() => requestDelete('contact', [contact.id], [contact.fullName || contact.email || contact.id])} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>}
                                                 </div>
                                             </td>
                                         </tr>
@@ -408,9 +601,15 @@ const ContactsPage: React.FC = () => {
                                 </tbody>
                             </table>
                         </div>
+                        <PaginationBar
+                            page={contactsPage}
+                            total={contactsTotal}
+                            limit={PAGE_LIMIT}
+                            totalPages={contactsTotalPages}
+                            onPageChange={(nextPage) => setContactsPage(nextPage)}
+                        />
                     </section>
-
-                    <section className="rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)] min-w-0">
+                    {false && <section className="rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)] min-w-0">
                         {loading ? (
                             <div className="space-y-5">
                                 <InlineSkeleton className="h-7 w-32" />
@@ -524,46 +723,102 @@ const ContactsPage: React.FC = () => {
                                 <JsonBlock title="Linked Messages" value={contactDetail.linkedMessages || []} />
                             </div>
                         ) : <EmptyState icon={UserRound} title="Select a contact" description="Choose a contact to inspect full CRM details, linking, and stats." />}
-                    </section>
+                    </section>}
                 </div>
             ) : (
-                <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+                <div className="block">
                     <section className="rounded-2xl border border-[var(--color-card-border)] bg-white shadow-[var(--shadow-sm)] overflow-hidden">
                         <div className="flex items-center justify-between border-b border-[var(--color-card-border)] px-5 py-4">
                             <div>
-                                <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">Companies</h2>
+                                <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">Companies Directory</h2>
                                 <p className="text-sm text-[var(--color-text-muted)]">Primary domain, additional domains, and custom fields.</p>
                             </div>
-                            {canCreate && <button type="button" onClick={openCompanyCreate} className="inline-flex items-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white"><Plus className="h-4 w-4" /> Create</button>}
+                            <div className="flex items-center gap-2">
+                                <input
+                                    value={companyQuery}
+                                    onChange={(event) => setCompanyQuery(event.target.value)}
+                                    placeholder="Search records..."
+                                    className="w-56 rounded-lg border border-[var(--color-card-border)] bg-[var(--color-background)]/60 px-3 py-2 text-sm text-[var(--color-text-primary)]"
+                                />
+                                {canDelete && selectedCompanyIds.length > 0 && (
+                                    <button
+                                        type="button"
+                                        onClick={() => requestDelete('company', selectedCompanyIds, companies.filter((entry) => selectedCompanyIds.includes(entry.id)).map((entry) => entry.name || entry.id))}
+                                        className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700 hover:bg-red-100"
+                                    >
+                                        <Trash2 className="h-4 w-4" />
+                                        Delete Selected ({selectedCompanyIds.length})
+                                    </button>
+                                )}
+                                {canCreate && <button type="button" onClick={openCompanyCreate} className="inline-flex items-center gap-2 rounded-xl bg-[var(--color-cta-primary)] px-4 py-2 text-sm font-medium text-white"><Plus className="h-4 w-4" /> Create</button>}
+                            </div>
                         </div>
-                        <div className="overflow-x-auto">
-                            <table className="w-full min-w-[760px] text-left">
+                        <div className="w-full overflow-x-auto overflow-y-hidden pb-2 [scrollbar-gutter:stable]">
+                            <table className="w-full min-w-[920px] text-left">
                                 <thead>
                                     <tr className="border-b border-[var(--color-card-border)] text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
-                                        <th className="px-4 py-3">Name</th>
-                                        <th className="px-4 py-3">Primary Domain</th>
-                                        <th className="px-4 py-3">Additional Domains</th>
-                                        <th className="px-4 py-3">Threads</th>
-                                        <th className="px-4 py-3">Contacts</th>
+                                        <th className="px-4 py-3">
+                                            <input
+                                                type="checkbox"
+                                                aria-label="Select all companies on page"
+                                                checked={allCompaniesOnPageSelected}
+                                                onChange={(event) => toggleAllCompaniesOnPage(event.target.checked)}
+                                                disabled={loading || companyPageIds.length === 0}
+                                                className="h-4 w-4 rounded border-[var(--color-card-border)]"
+                                            />
+                                        </th>
+                                        <th className="px-4 py-3">Name & Domains</th>
+                                        <th className="px-4 py-3">Activity</th>
                                         <th className="px-4 py-3 text-right">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
                                     {displayCompanies.map((company) => (
-                                        <tr key={company.id} className={`border-b border-[var(--color-card-border)]/70 text-sm hover:bg-[var(--color-background)]/35 ${selectedCompanyId === company.id ? 'bg-[var(--color-background)]/30' : ''}`}>
-                                            <td className="px-4 py-3 font-medium text-[var(--color-text-primary)] cursor-pointer" onClick={() => !loading && setSelectedCompanyId(company.id)}>{loading ? <InlineSkeleton className="h-4 w-28" /> : company.name}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-28" /> : (company.primaryDomain || '--')}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-36" /> : ((company.additionalDomains || []).join(', ') || '--')}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-8" /> : (company.threadCount || 0)}</td>
-                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">{loading ? <InlineSkeleton className="h-4 w-8" /> : (company.contactCount || 0)}</td>
-                                            <td className="px-4 py-3"><div className="flex justify-end gap-1">{!loading && canManage && <button type="button" onClick={() => openCompanyEdit(company)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="h-4 w-4" /></button>}{!loading && canDelete && <button type="button" onClick={() => void removeCompany(company.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>}</div></td>
+                                        <tr key={company.id} className="border-b border-[var(--color-card-border)]/70 text-sm hover:bg-[var(--color-background)]/35">
+                                            <td className="px-4 py-3">
+                                                {loading ? (
+                                                    <InlineSkeleton className="h-4 w-4" />
+                                                ) : (
+                                                    <input
+                                                        type="checkbox"
+                                                        aria-label={`Select ${company.name || 'company'}`}
+                                                        checked={selectedCompanyIds.includes(company.id)}
+                                                        onChange={(event) => toggleCompanySelection(company.id, event.target.checked)}
+                                                        className="h-4 w-4 rounded border-[var(--color-card-border)]"
+                                                    />
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                {loading ? <InlineSkeleton className="h-10 w-64" /> : (
+                                                    <div>
+                                                        <p className="font-medium text-[var(--color-text-primary)]">{company.name}</p>
+                                                        <p className="mt-0.5 text-xs text-[var(--color-text-muted)]">{company.primaryDomain || '--'}</p>
+                                                    </div>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3 text-[var(--color-text-muted)]">
+                                                {loading ? <InlineSkeleton className="h-6 w-40" /> : (
+                                                    <div className="flex items-center gap-3 text-xs">
+                                                        <span className="inline-flex items-center gap-1"><MessageSquare className="h-3.5 w-3.5" /> {company.threadCount || 0}</span>
+                                                        <span className="inline-flex items-center gap-1"><UserRound className="h-3.5 w-3.5" /> {company.contactCount || 0}</span>
+                                                    </div>
+                                                )}
+                                            </td>
+                                            <td className="px-4 py-3"><div className="flex justify-end gap-1">{!loading && <button type="button" onClick={() => openCompanyDetails(company.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]" aria-label="View company details"><Eye className="h-4 w-4" /></button>}{!loading && canManage && <button type="button" onClick={() => openCompanyEdit(company)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="h-4 w-4" /></button>}{!loading && canDelete && <button type="button" onClick={() => requestDelete('company', [company.id], [company.name || company.id])} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>}</div></td>
                                         </tr>
                                     ))}
                                 </tbody>
                             </table>
                         </div>
+                        <PaginationBar
+                            page={companiesPage}
+                            total={companiesTotal}
+                            limit={PAGE_LIMIT}
+                            totalPages={companiesTotalPages}
+                            onPageChange={(nextPage) => setCompaniesPage(nextPage)}
+                        />
                     </section>
-                    <section className="rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)] min-w-0">
+                    {false && <section className="rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)] min-w-0">
                         {loading ? (
                             <div className="space-y-5">
                                 <InlineSkeleton className="h-7 w-32" />
@@ -584,9 +839,151 @@ const ContactsPage: React.FC = () => {
                                 <JsonBlock title="Custom Fields" value={companyDetail.customFields || {}} />
                             </div>
                         ) : <EmptyState icon={Building2} title="Select a company" description="Choose a company to inspect domains and custom fields." />}
-                    </section>
+                    </section>}
                 </div>
             )}
+
+            <Modal
+                isOpen={contactDetailsOpen}
+                onClose={closeContactDetails}
+                title={contactDetail?.fullName || 'Contact Details'}
+                size="xl"
+            >
+                {contactDetailLoading ? (
+                    <div className="space-y-5">
+                        <InlineSkeleton className="h-7 w-32" />
+                        <InlineSkeleton className="h-4 w-40" />
+                        <div className="space-y-3">{Array.from({ length: contactDetailSkeletonRows }, (_, index) => <div key={index} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3"><InlineSkeleton className="h-4 w-full" /></div>)}</div>
+                    </div>
+                ) : contactDetail ? (
+                    <div className="space-y-5">
+                        <p className="text-sm text-[var(--color-text-muted)]">{contactDetail.email}</p>
+                        <DetailBlock title="Identity" rows={[
+                            ['ID', contactDetail.id],
+                            ['Tenant ID', contactDetail.tenantId],
+                            ['Lifecycle', contactDetail.lifecycleStage || '--'],
+                            ['Source', contactDetail.source || '--'],
+                            ['Assigned User ID', userMap[contactDetail.assignedToUserId || ''] || '--'],
+                            ['Company', companyMap[contactDetail.companyId || ''] || '--'],
+                        ]} />
+                        <DetailBlock title="Contact Details" rows={[['Primary Email', contactDetail.email]]} />
+                        <JsonBlock title="Phone Numbers" value={contactDetail.phoneNumbers || []} />
+                        <JsonBlock title="Addresses" value={contactDetail.addresses || []} />
+                        <JsonBlock title="Social Profiles" value={contactDetail.socialProfiles || []} />
+                        <JsonBlock title="Custom Fields" value={contactDetail.customFields || {}} />
+
+                        <div className="space-y-3 rounded-2xl border border-[var(--color-card-border)] p-4">
+                            <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">Contact Notifications</h3>
+                            {contactNotificationLoading ? (
+                                <InlineSkeleton className="h-4 w-full" />
+                            ) : contactNotificationPreference ? (
+                                <div className="space-y-3">
+                                    <label className="flex items-center gap-2 text-sm text-[var(--color-text-primary)]">
+                                        <input
+                                            type="checkbox"
+                                            checked={contactNotificationPreference.enabled}
+                                            onChange={(event) => updateContactNotificationPreference({ enabled: event.target.checked })}
+                                            className="h-4 w-4 rounded border-[var(--color-card-border)]"
+                                        />
+                                        Enable contact activity notifications
+                                    </label>
+                                    <div className="grid gap-2 sm:grid-cols-2">
+                                        {(['in_app', 'email', 'push', 'desktop'] as const).map((channel) => (
+                                            <label key={channel} className="flex items-center gap-2 text-sm text-[var(--color-text-primary)] capitalize">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={contactNotificationPreference.channels[channel]}
+                                                    onChange={(event) => updateContactNotificationPreference({ channels: { [channel]: event.target.checked } as ContactNotificationPreference['channels'] })}
+                                                    className="h-4 w-4 rounded border-[var(--color-card-border)]"
+                                                />
+                                                {channel.replace('_', ' ')}
+                                            </label>
+                                        ))}
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => void saveContactNotificationPreference()}
+                                        disabled={contactNotificationSaving}
+                                        className="rounded-lg bg-[var(--color-cta-primary)] px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+                                    >
+                                        {contactNotificationSaving ? 'Saving...' : 'Save Preferences'}
+                                    </button>
+                                </div>
+                            ) : (
+                                <p className="text-sm text-[var(--color-text-muted)]">No notification override found.</p>
+                            )}
+                            {contactNotificationError && <p className="text-xs text-red-600">{contactNotificationError}</p>}
+                        </div>
+                        <DetailBlock title="Activity Stats" rows={[
+                            ['Email Count', String(contactDetail.emailCount || 0)],
+                            ['Thread Count', String(contactDetail.threadCount || 0)],
+                            ['Last Contacted', contactDetail.lastContactedAt ? new Date(contactDetail.lastContactedAt).toLocaleString() : '--'],
+                        ]} />
+                        <LinkedThreadsBlock title="Linked Threads" threads={Array.isArray(contactDetail.linkedThreads) ? contactDetail.linkedThreads : []} />
+                        <JsonBlock title="Linked Messages" value={contactDetail.linkedMessages || []} />
+                    </div>
+                ) : (
+                    <EmptyState icon={UserRound} title="Contact not found" description="The selected contact could not be loaded." />
+                )}
+            </Modal>
+
+            <Modal
+                isOpen={companyDetailsOpen}
+                onClose={closeCompanyDetails}
+                title={companyDetail?.name || 'Company Details'}
+                size="xl"
+            >
+                {companyDetailLoading ? (
+                    <div className="space-y-5">
+                        <InlineSkeleton className="h-7 w-32" />
+                        <div className="space-y-3">{Array.from({ length: companyDetailSkeletonRows }, (_, index) => <div key={index} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3"><InlineSkeleton className="h-4 w-full" /></div>)}</div>
+                    </div>
+                ) : companyDetail ? (
+                    <div className="space-y-5">
+                        <p className="text-sm text-[var(--color-text-muted)]">{companyDetail.primaryDomain || '--'}</p>
+                        <DetailBlock title="Fields" rows={[
+                            ['ID', companyDetail.id],
+                            ['Tenant ID', companyDetail.tenantId],
+                            ['Primary Domain', companyDetail.primaryDomain || '--'],
+                            ['Additional Domains', (companyDetail.additionalDomains || []).join(', ') || '--'],
+                            ['Thread Count', String(companyDetail.threadCount || 0)],
+                            ['Contact Count', String(companyDetail.contactCount || 0)],
+                        ]} />
+                        <JsonBlock title="Custom Fields" value={companyDetail.customFields || {}} />
+                    </div>
+                ) : (
+                    <EmptyState icon={Building2} title="Company not found" description="The selected company could not be loaded." />
+                )}
+            </Modal>
+
+            <Modal
+                isOpen={Boolean(deleteConfirm)}
+                onClose={() => !deleteSubmitting && setDeleteConfirm(null)}
+                title={deleteConfirm?.entity === 'contact' ? 'Delete Contact(s)' : 'Delete Company(s)'}
+                size="sm"
+            >
+                <div className="space-y-4">
+                    <p className="text-sm text-[var(--color-text-primary)]">
+                        {deleteConfirm && deleteConfirm.ids.length === 1
+                            ? `Are you sure you want to delete this ${deleteConfirm.entity}?`
+                            : `Are you sure you want to delete these ${deleteConfirm?.ids.length || 0} ${deleteConfirm?.entity === 'contact' ? 'contacts' : 'companies'}?`}
+                    </p>
+                    {deleteConfirm && (
+                        <div className="max-h-36 overflow-y-auto rounded-lg border border-[var(--color-card-border)] bg-[var(--color-background)]/25 px-3 py-2 text-xs text-[var(--color-text-muted)]">
+                            {deleteConfirm.names.slice(0, 8).map((name, index) => (
+                                <div key={`${name}-${index}`} className="truncate">{name}</div>
+                            ))}
+                            {deleteConfirm.names.length > 8 && <div>+{deleteConfirm.names.length - 8} more</div>}
+                        </div>
+                    )}
+                    <div className="flex justify-end gap-2">
+                        <button type="button" onClick={() => setDeleteConfirm(null)} disabled={deleteSubmitting} className="rounded-lg px-4 py-2 text-sm text-[var(--color-text-primary)]">Cancel</button>
+                        <button type="button" onClick={() => void confirmDelete()} disabled={deleteSubmitting} className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-60">
+                            {deleteSubmitting ? 'Deleting...' : 'Delete'}
+                        </button>
+                    </div>
+                </div>
+            </Modal>
 
             <Modal isOpen={contactModalOpen} onClose={() => setContactModalOpen(false)} title={editingContactId ? 'Update Contact' : 'Create Contact'} size="lg">
                 <div className="space-y-4">
@@ -651,6 +1048,69 @@ const JsonBlock: React.FC<{ title: string; value: unknown }> = ({ title, value }
     <div>
         <h3 className="mb-3 text-sm font-semibold text-[var(--color-text-primary)]">{title}</h3>
         <pre className="overflow-x-auto rounded-xl border border-[var(--color-card-border)] bg-[var(--color-background)]/20 p-3 text-xs text-[var(--color-text-primary)]">{JSON.stringify(value, null, 2)}</pre>
+    </div>
+);
+
+const LinkedThreadsBlock: React.FC<{ title: string; threads: Array<any> }> = ({ title, threads }) => (
+    <div>
+        <h3 className="mb-3 text-sm font-semibold text-[var(--color-text-primary)]">{title}</h3>
+        {threads.length === 0 ? (
+            <p className="text-sm text-[var(--color-text-muted)]">No linked threads</p>
+        ) : (
+            <div className="space-y-2">
+                {threads.map((thread) => (
+                    <div key={thread.id} className="rounded-xl border border-[var(--color-card-border)] px-3 py-3">
+                        <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                                <p className="truncate text-sm font-medium text-[var(--color-text-primary)]">{thread.subject || '(No subject)'}</p>
+                                <p className="mt-0.5 text-xs text-[var(--color-text-muted)]">Thread ID: {thread.id}</p>
+                            </div>
+                            <div className="text-right text-xs text-[var(--color-text-muted)]">
+                                <div>{thread.messagesInThread ?? 0} msgs</div>
+                                <div>{thread.internalNotes ?? 0} notes</div>
+                            </div>
+                        </div>
+                        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                            <span className="rounded-full border border-[var(--color-card-border)] px-2 py-0.5 text-[var(--color-text-muted)]">Status: {thread.status || '--'}</span>
+                            <span className="rounded-full border border-[var(--color-card-border)] px-2 py-0.5 text-[var(--color-text-muted)]">Priority: {thread.priority || '--'}</span>
+                            <span className="rounded-full border border-[var(--color-card-border)] px-2 py-0.5 text-[var(--color-text-muted)]">Mailbox: {thread.mailboxId || '--'}</span>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        )}
+    </div>
+);
+
+const PaginationBar: React.FC<{
+    page: number;
+    total: number;
+    limit: number;
+    totalPages: number;
+    onPageChange: (nextPage: number) => void;
+}> = ({ page, total, limit, totalPages, onPageChange }) => (
+    <div className="flex items-center justify-between border-t border-[var(--color-card-border)] px-4 py-3">
+        <p className="text-xs text-[var(--color-text-muted)]">
+            {total === 0 ? 'Page 1 of 1' : `Page ${page} of ${totalPages}`}
+        </p>
+        <div className="flex items-center gap-2">
+            <button
+                type="button"
+                onClick={() => onPageChange(Math.max(1, page - 1))}
+                disabled={page <= 1}
+                className="rounded-lg border border-[var(--color-card-border)] px-2 py-1 text-sm text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+                <ChevronLeft className="h-4 w-4" />
+            </button>
+            <button
+                type="button"
+                onClick={() => onPageChange(Math.min(totalPages, page + 1))}
+                disabled={page >= totalPages}
+                className="rounded-lg border border-[var(--color-card-border)] px-2 py-1 text-sm text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+                <ChevronRight className="h-4 w-4" />
+            </button>
+        </div>
     </div>
 );
 

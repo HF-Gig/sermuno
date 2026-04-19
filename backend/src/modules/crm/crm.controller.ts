@@ -6,6 +6,7 @@ import {
   Delete,
   Body,
   Param,
+  Query,
   UseGuards,
   HttpCode,
   HttpStatus,
@@ -33,8 +34,16 @@ export class CrmController {
 
   @Get('contacts')
   @RequirePermission('contacts:view')
-  listContacts(@CurrentUser() user: JwtUser) {
-    return this.crm.listContacts(user);
+  listContacts(
+    @CurrentUser() user: JwtUser,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.crm.listContacts(
+      user,
+      page ? Number.parseInt(page, 10) : undefined,
+      limit ? Number.parseInt(limit, 10) : undefined,
+    );
   }
 
   @Post('contacts')
@@ -89,8 +98,16 @@ export class CrmController {
 
   @Get('companies')
   @RequirePermission('contacts:view')
-  listCompanies(@CurrentUser() user: JwtUser) {
-    return this.crm.listCompanies(user);
+  listCompanies(
+    @CurrentUser() user: JwtUser,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.crm.listCompanies(
+      user,
+      page ? Number.parseInt(page, 10) : undefined,
+      limit ? Number.parseInt(limit, 10) : undefined,
+    );
   }
 
   @Post('companies')

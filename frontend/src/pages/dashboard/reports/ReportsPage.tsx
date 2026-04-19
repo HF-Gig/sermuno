@@ -17,6 +17,8 @@ type VolumePoint = {
     label?: string;
     bucket?: string;
     messages?: number;
+    inbound?: number;
+    outbound?: number;
 };
 
 type RankedItem = {
@@ -67,6 +69,9 @@ const ReportsPage: React.FC = () => {
     const weekDayLabels = useMemo(() => getWeekDayLabels(i18n.language || 'en'), [i18n.language]);
     const [data, setData] = useState<AnalyticsState | null>(null);
     const [loading, setLoading] = useState(true);
+    const [animateCharts, setAnimateCharts] = useState(false);
+    const [activeVolumeTooltip, setActiveVolumeTooltip] = useState<number | null>(null);
+    const [activeHourTooltip, setActiveHourTooltip] = useState<number | null>(null);
     const [error, setError] = useState('');
 
     const load = useCallback(async (background = false) => {
@@ -117,23 +122,31 @@ const ReportsPage: React.FC = () => {
 
     const volumeSeries = useMemo(() => {
         const rows = (data?.volume || []).slice(-7);
-        const max = Math.max(...rows.map((item) => Number(item.messages || 0)), 1);
-        return rows.map((item, index) => {
-            const total = Number(item.messages || 0);
-            const inboundRatio = 0.44 + ((index % 3) * 0.06);
-            const outbound = Math.round(total * inboundRatio);
-            const inbound = Math.max(0, total - outbound);
-            const barHeight = Math.max(96, (total / max) * 170);
+        const paddedRows = Array.from({ length: 7 }, (_, index) => rows[index] || null);
+        const max = Math.max(
+            ...rows.map((item) => {
+                const inbound = Number(item.inbound || 0);
+                const outbound = Number(item.outbound || 0);
+                const total = inbound + outbound;
+                return total > 0 ? total : Number(item.messages || 0);
+            }),
+            1,
+        );
+        return paddedRows.map((item, index) => {
+            const inboundValue = Number(item?.inbound || 0);
+            const outboundValue = Number(item?.outbound || 0);
+            const total = inboundValue + outboundValue > 0 ? inboundValue + outboundValue : Number(item?.messages || 0);
             return {
-                label: formatVolumeLabel(item.bucket || item.label),
+                label: item ? formatVolumeLabel(item.bucket || item.label) : weekDayLabels[index],
+                inbound: inboundValue,
+                outbound: outboundValue,
                 total,
-                inbound,
-                outbound,
-                inboundHeight: total > 0 ? `${Math.max(24, (inbound / total) * barHeight)}px` : '0px',
-                outboundHeight: total > 0 ? `${Math.max(24, (outbound / total) * barHeight)}px` : '0px',
+                fillRatio: total / max,
+                inboundRatio: total > 0 ? inboundValue / total : 0,
+                outboundRatio: total > 0 ? outboundValue / total : 0,
             };
         });
-    }, [data]);
+    }, [data, weekDayLabels]);
 
     const busiestHours = useMemo(() => {
         const totals = Array.from({ length: 24 }, (_, hour) => ({
@@ -141,11 +154,20 @@ const ReportsPage: React.FC = () => {
             total: (data?.busyHours || []).reduce((sum, row) => sum + (row.hours.find((entry) => entry.hour === hour)?.count || 0), 0),
         }));
         const max = Math.max(...totals.map((entry) => entry.total), 1);
-        return totals.filter((entry) => entry.hour <= 22).map((entry) => ({
+        return totals.map((entry) => ({
             ...entry,
-            height: `${Math.max(6, (entry.total / max) * 142)}px`,
+            ratio: entry.total / max,
         }));
     }, [data]);
+
+    useEffect(() => {
+        if (loading || !data) {
+            setAnimateCharts(false);
+            return;
+        }
+        const timer = window.setTimeout(() => setAnimateCharts(true), 40);
+        return () => window.clearTimeout(timer);
+    }, [loading, data]);
 
     const totalMessages = useMemo(() => (data?.volume || []).reduce((sum, item) => sum + Number(item.messages || 0), 0), [data]);
 
@@ -190,13 +212,6 @@ const ReportsPage: React.FC = () => {
         maxRows: 8,
         viewportOffset: 420,
     });
-    const busyHourBars = useAdaptiveRows({
-        rowHeight: 12,
-        minRows: 18,
-        maxRows: 30,
-        viewportOffset: 480,
-    });
-
     const senderRows = loading
         ? Array.from({ length: leaderboardRows }, (_, index) => ({ email: `sender-${index}@example.com`, count: 0 }))
         : (data?.topSenders || []).slice(0, 5);
@@ -210,11 +225,11 @@ const ReportsPage: React.FC = () => {
         : (data?.teamPerformance || []).slice(0, 5);
 
     const displayVolumeSeries = loading
-        ? weekDayLabels.map((label, index) => ({ label, total: 0, inboundHeight: `${110 + (index % 3) * 12}px`, outboundHeight: `${56 + (index % 2) * 14}px` }))
+        ? weekDayLabels.map((label) => ({ label, inbound: 0, outbound: 0, total: 0, fillRatio: 0, inboundRatio: 0, outboundRatio: 0 }))
         : volumeSeries;
 
     const displayBusiestHours = loading
-        ? Array.from({ length: busyHourBars }, (_, hour) => ({ hour, height: `${8 + ((hour + 3) % 8) * 18}px` }))
+        ? Array.from({ length: 24 }, (_, hour) => ({ hour, total: 0, ratio: 0 }))
         : busiestHours;
 
     return (
@@ -236,7 +251,7 @@ const ReportsPage: React.FC = () => {
                 ))}
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[minmax(0,1.9fr)_370px]">
+            <div className="grid gap-4 xl:grid-cols-[minmax(0,1.9fr)_420px]">
                 <section className="rounded-2xl border border-[var(--color-card-border)] bg-white p-5 shadow-[var(--shadow-sm)]">
                     <div>
                         <h2 className="text-2xl font-semibold text-[var(--color-text-primary)]">{t('analytics_volume_title', 'Email Volume (Last 7 Days)')}</h2>
@@ -245,11 +260,36 @@ const ReportsPage: React.FC = () => {
 
                     <div className="mt-5 rounded-2xl border border-[var(--color-card-border)] bg-[#fbfcfd] p-5">
                         <div className="flex h-[230px] items-end justify-between gap-3">
-                            {displayVolumeSeries.map((item) => (
-                                <div key={`${item.label}-${item.total}`} className="flex min-w-0 flex-1 flex-col items-center gap-3">
-                                    <div className="flex w-full max-w-[92px] flex-col justify-end overflow-hidden rounded-lg border border-[#2b4e46] bg-white">
-                                        <div className="w-full bg-[#8fb596]" style={{ height: item.outboundHeight }} />
-                                        <div className="w-full bg-[#193f39]" style={{ height: item.inboundHeight }} />
+                            {displayVolumeSeries.map((item, index) => (
+                                <div key={`${item.label}-${item.total}`} className="relative flex min-w-0 flex-1 flex-col items-center gap-3">
+                                    {activeVolumeTooltip === index && (
+                                        <div className="pointer-events-none absolute -top-16 z-10 min-w-[140px] rounded-md border border-[#2b4e46] bg-white px-3 py-2 text-xs text-[#143f37] shadow-md">
+                                            <div className="font-semibold">{item.label}</div>
+                                            <div>Inbound: {Number(item.inbound || 0).toLocaleString()}</div>
+                                            <div>Outbound: {Number(item.outbound || 0).toLocaleString()}</div>
+                                            <div>Total: {Number(item.total || 0).toLocaleString()}</div>
+                                        </div>
+                                    )}
+                                    <div
+                                        className="relative h-[170px] w-full max-w-[92px] overflow-hidden rounded-lg border border-[#2b4e46] bg-white"
+                                        onMouseEnter={() => setActiveVolumeTooltip(index)}
+                                        onMouseLeave={() => setActiveVolumeTooltip((current) => (current === index ? null : current))}
+                                        onFocus={() => setActiveVolumeTooltip(index)}
+                                        onBlur={() => setActiveVolumeTooltip((current) => (current === index ? null : current))}
+                                        onClick={() => setActiveVolumeTooltip((current) => (current === index ? null : index))}
+                                        tabIndex={0}
+                                        role="button"
+                                        aria-label={`${item.label}: inbound ${item.inbound}, outbound ${item.outbound}, total ${item.total}`}
+                                    >
+                                        <div
+                                            className="absolute inset-x-0 bottom-0 transition-[height] duration-700 ease-out"
+                                            style={{ height: `${Math.max(0, Math.min(1, animateCharts ? item.fillRatio : 0)) * 100}%` }}
+                                        >
+                                            <div className="flex h-full flex-col justify-end">
+                                                <div className="w-full bg-[#8fb596]" style={{ height: `${Math.max(0, item.outboundRatio) * 100}%` }} />
+                                                <div className="w-full bg-[#193f39]" style={{ height: `${Math.max(0, item.inboundRatio) * 100}%` }} />
+                                            </div>
+                                        </div>
                                     </div>
                                     <div className="text-sm font-medium text-[var(--color-text-primary)]">{item.label}</div>
                                 </div>
@@ -274,12 +314,10 @@ const ReportsPage: React.FC = () => {
                     <div className="mt-5 space-y-5">
                         {senderRows.map((sender) => {
                             const email = sender.email || '--';
-                            const initial = email.charAt(0).toUpperCase() || '?';
                             return (
-                                <div key={email} className="grid grid-cols-[18px_minmax(0,1fr)_auto] items-center gap-4 text-lg text-[var(--color-text-primary)]">
-                                    <div className="text-sm font-semibold uppercase text-[var(--color-text-primary)]">{initial}</div>
-                                    <div className="truncate">{loading ? <InlineSkeleton className="h-5 w-44" /> : email}</div>
-                                    <div className="font-semibold">{loading ? <InlineSkeleton className="h-5 w-10" /> : Number(sender.count || 0).toLocaleString()}</div>
+                                <div key={email} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-4 text-lg text-[var(--color-text-primary)]">
+                                    <div className="min-w-0 break-all pr-2 text-[15px] leading-6">{loading ? <InlineSkeleton className="h-5 w-44" /> : email}</div>
+                                    <div className="justify-self-end whitespace-nowrap font-semibold">{loading ? <InlineSkeleton className="h-5 w-10" /> : Number(sender.count || 0).toLocaleString()}</div>
                                 </div>
                             );
                         })}
@@ -296,9 +334,26 @@ const ReportsPage: React.FC = () => {
                 <div className="mt-5 rounded-2xl border border-[var(--color-card-border)] bg-[#fbfcfd] p-5 overflow-x-auto">
                     <div className="min-w-[920px]">
                         <div className="flex h-[200px] items-end gap-2">
-                            {displayBusiestHours.map((entry) => (
-                                <div key={entry.hour} className="flex flex-1 flex-col items-center justify-end gap-3">
-                                    <div className="w-full rounded-md bg-[#2d5f55]" style={{ height: entry.height }} />
+                            {displayBusiestHours.map((entry, index) => (
+                                <div key={entry.hour} className="relative flex flex-1 flex-col items-center justify-end gap-3">
+                                    {activeHourTooltip === index && (
+                                        <div className="pointer-events-none absolute -top-12 z-10 rounded-md border border-[#2d5f55] bg-white px-3 py-2 text-xs text-[#1f4f47] shadow-md">
+                                            <div className="font-semibold">{String(entry.hour).padStart(2, '0')}:00</div>
+                                            <div>{Number(entry.total || 0).toLocaleString()} messages</div>
+                                        </div>
+                                    )}
+                                    <div
+                                        className="w-full rounded-md bg-[#2d5f55] transition-[height] duration-700 ease-out"
+                                        style={{ height: `${Math.max(0, Math.min(1, animateCharts ? entry.ratio : 0)) * 142}px` }}
+                                        onMouseEnter={() => setActiveHourTooltip(index)}
+                                        onMouseLeave={() => setActiveHourTooltip((current) => (current === index ? null : current))}
+                                        onFocus={() => setActiveHourTooltip(index)}
+                                        onBlur={() => setActiveHourTooltip((current) => (current === index ? null : current))}
+                                        onClick={() => setActiveHourTooltip((current) => (current === index ? null : index))}
+                                        tabIndex={0}
+                                        role="button"
+                                        aria-label={`${String(entry.hour).padStart(2, '0')}:00 ${Number(entry.total || 0).toLocaleString()} messages`}
+                                    />
                                     <div className="text-xs font-medium text-[var(--color-text-primary)]">{String(entry.hour).padStart(2, '0')}</div>
                                 </div>
                             ))}

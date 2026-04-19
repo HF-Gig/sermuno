@@ -7,13 +7,14 @@ interface ModalProps {
     title: string;
     children: React.ReactNode;
     footer?: React.ReactNode;
-    size?: 'sm' | 'md' | 'lg';
+    size?: 'sm' | 'md' | 'lg' | 'xl';
 }
 
 const sizeClasses = {
     sm: 'max-w-md',
     md: 'max-w-lg',
     lg: 'max-w-2xl',
+    xl: 'max-w-4xl',
 };
 
 const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, footer, size = 'md' }) => {
@@ -51,7 +52,7 @@ const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, footer,
                 </div>
 
                 {/* Body */}
-                <div className="px-5 py-4 max-h-[70vh] overflow-y-auto">
+                <div className="px-5 py-4 max-h-[78vh] overflow-y-auto no-scrollbar">
                     {children}
                 </div>
 

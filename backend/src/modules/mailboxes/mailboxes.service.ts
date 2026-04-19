@@ -300,11 +300,76 @@ export class MailboxesService {
       where: { id, organizationId: user.organizationId, deletedAt: null },
     });
     if (!mailbox) throw new NotFoundException('Mailbox not found');
-    // Soft-delete cascades: remove all mailboxAccess rows before marking deleted
-    await this.prisma.mailboxAccess.deleteMany({ where: { mailboxId: id } });
-    await this.prisma.mailbox.update({
-      where: { id },
-      data: { deletedAt: new Date() },
+    const deletedAt = new Date();
+    const cleanupSummary = await this.prisma.$transaction(async (tx) => {
+      const [threadRows, messageRows] = await Promise.all([
+        tx.thread.findMany({
+          where: { mailboxId: id },
+          select: { id: true },
+        }),
+        tx.message.findMany({
+          where: { mailboxId: id },
+          select: { id: true },
+        }),
+      ]);
+
+      const threadIds = threadRows.map((row) => row.id);
+      const messageIds = messageRows.map((row) => row.id);
+
+      const [
+        deletedScheduledMessages,
+        deletedAttachments,
+        deletedMessages,
+        deletedThreadNotes,
+        deletedThreadTags,
+        deletedThreads,
+        deletedFolders,
+        deletedAccessRows,
+      ] = await Promise.all([
+        tx.scheduledMessage.deleteMany({
+          where: {
+            OR: [
+              { mailboxId: id },
+              ...(threadIds.length > 0 ? [{ threadId: { in: threadIds } }] : []),
+            ],
+          },
+        }),
+        messageIds.length > 0
+          ? tx.attachment.deleteMany({
+              where: { messageId: { in: messageIds } },
+            })
+          : Promise.resolve({ count: 0 }),
+        tx.message.deleteMany({ where: { mailboxId: id } }),
+        threadIds.length > 0
+          ? tx.threadNote.deleteMany({
+              where: { threadId: { in: threadIds } },
+            })
+          : Promise.resolve({ count: 0 }),
+        threadIds.length > 0
+          ? tx.threadTag.deleteMany({
+              where: { threadId: { in: threadIds } },
+            })
+          : Promise.resolve({ count: 0 }),
+        tx.thread.deleteMany({ where: { mailboxId: id } }),
+        tx.mailboxFolder.deleteMany({ where: { mailboxId: id } }),
+        tx.mailboxAccess.deleteMany({ where: { mailboxId: id } }),
+      ]);
+
+      await tx.mailbox.update({
+        where: { id },
+        data: { deletedAt },
+      });
+
+      return {
+        threads: deletedThreads.count,
+        messages: deletedMessages.count,
+        attachments: deletedAttachments.count,
+        scheduledMessages: deletedScheduledMessages.count,
+        threadNotes: deletedThreadNotes.count,
+        threadTags: deletedThreadTags.count,
+        folders: deletedFolders.count,
+        accessRows: deletedAccessRows.count,
+      };
     });
 
     await this.logAuditSafe({
@@ -319,12 +384,28 @@ export class MailboxesService {
         provider: mailbox.provider,
         deletedAt: mailbox.deletedAt,
       },
-      newValue: { deletedAt: new Date().toISOString() },
+      newValue: {
+        deletedAt: deletedAt.toISOString(),
+        cleanupSummary,
+      },
       ipAddress: meta.ipAddress,
       userAgent: meta.userAgent,
     });
 
-    return { message: 'Mailbox deleted' };
+    this.eventsGateway?.emitToOrganization(user.organizationId, 'mailbox:deleted', {
+      mailboxId: id,
+      organizationId: user.organizationId,
+      deletedAt: deletedAt.toISOString(),
+      cleanupSummary,
+    });
+    this.eventsGateway?.emitToOrganization(user.organizationId, 'mailbox:synced', {
+      mailboxId: id,
+      organizationId: user.organizationId,
+      syncStatus: 'deleted',
+      deletedAt: deletedAt.toISOString(),
+    });
+
+    return { message: 'Mailbox deleted', cleanupSummary };
   }
 
   async revokeOauth(id: string, user: JwtUser) {

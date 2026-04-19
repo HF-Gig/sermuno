@@ -28,23 +28,31 @@ export class CrmService {
     private readonly notifications: NotificationsService,
   ) {}
 
-  async listContacts(user: JwtUser) {
+  async listContacts(user: JwtUser, page?: number, limit?: number) {
     const mailboxIds = await this.getAccessibleMailboxIds(user);
-    const contacts = await this.prisma.contact.findMany({
-      where: {
-        organizationId: user.organizationId,
-        deletedAt: null,
-        ...(mailboxIds
-          ? {
-              threads: {
-                some: {
-                  mailboxId: { in: mailboxIds },
-                },
+    const where = {
+      organizationId: user.organizationId,
+      deletedAt: null,
+      ...(mailboxIds
+        ? {
+            threads: {
+              some: {
+                mailboxId: { in: mailboxIds },
               },
-            }
-          : {}),
-      },
+            },
+          }
+        : {}),
+    };
+    const pagination = this.parsePagination(page, limit);
+    const contacts = await this.prisma.contact.findMany({
+      where,
       orderBy: [{ updatedAt: 'desc' }],
+      ...(pagination
+        ? {
+            skip: pagination.skip,
+            take: pagination.limit,
+          }
+        : {}),
       include: {
         threads: {
           where: mailboxIds ? { mailboxId: { in: mailboxIds } } : undefined,
@@ -60,8 +68,17 @@ export class CrmService {
         },
       },
     });
-
-    return contacts.map((contact) => this.mapContactList(contact));
+    const items = contacts.map((contact) => this.mapContactList(contact));
+    if (!pagination) {
+      return items;
+    }
+    const total = await this.prisma.contact.count({ where });
+    return {
+      items,
+      total,
+      page: pagination.page,
+      limit: pagination.limit,
+    };
   }
 
   async createContact(dto: CreateContactDto, user: JwtUser) {
@@ -430,17 +447,24 @@ export class CrmService {
     };
   }
 
-  async listCompanies(user: JwtUser) {
+  async listCompanies(user: JwtUser, page?: number, limit?: number) {
+    const where = { organizationId: user.organizationId, deletedAt: null };
+    const pagination = this.parsePagination(page, limit);
     const companies = await this.prisma.company.findMany({
-      where: { organizationId: user.organizationId, deletedAt: null },
+      where,
       orderBy: [{ updatedAt: 'desc' }],
+      ...(pagination
+        ? {
+            skip: pagination.skip,
+            take: pagination.limit,
+          }
+        : {}),
       include: {
         threads: { select: { id: true } },
         contacts: { select: { id: true } },
       },
     });
-
-    return companies.map((company) => ({
+    const items = companies.map((company) => ({
       id: company.id,
       tenantId: company.organizationId,
       name: company.name,
@@ -452,6 +476,16 @@ export class CrmService {
       createdAt: company.createdAt,
       updatedAt: company.updatedAt,
     }));
+    if (!pagination) {
+      return items;
+    }
+    const total = await this.prisma.company.count({ where });
+    return {
+      items,
+      total,
+      page: pagination.page,
+      limit: pagination.limit,
+    };
   }
 
   async createCompany(dto: CreateCompanyDto, user: JwtUser) {
@@ -711,6 +745,21 @@ export class CrmService {
   private companyNameFromDomain(domain: string) {
     const root = domain.split('.')[0] || domain;
     return root.charAt(0).toUpperCase() + root.slice(1);
+  }
+
+  private parsePagination(page?: number, limit?: number) {
+    if (page === undefined && limit === undefined) {
+      return null;
+    }
+    const parsedPage = Number.isFinite(page) ? Math.max(Number(page), 1) : 1;
+    const parsedLimit = Number.isFinite(limit)
+      ? Math.min(Math.max(Number(limit), 1), 200)
+      : 25;
+    return {
+      page: parsedPage,
+      limit: parsedLimit,
+      skip: (parsedPage - 1) * parsedLimit,
+    };
   }
 
   private async getAccessibleMailboxIds(

@@ -92,14 +92,23 @@ export class AnalyticsService {
     const mailboxFilter = this.buildMailboxFilterSql('t', mailboxIds);
 
     const rows = await this.prisma.$queryRaw<
-      { bucket: Date; messages: bigint }[]
+      {
+        bucket: Date;
+        messages: bigint;
+        inbound: bigint;
+        outbound: bigint;
+      }[]
     >(Prisma.sql`
       SELECT
         date_trunc(${bucket}, m."createdAt") AS bucket,
+        COUNT(*) FILTER (WHERE m.direction = 'INBOUND') AS inbound,
+        COUNT(*) FILTER (WHERE m.direction = 'OUTBOUND') AS outbound,
         COUNT(*) AS messages
       FROM messages m
       JOIN threads t ON t.id = m."threadId"
+      JOIN mailboxes mb ON mb.id = t."mailboxId"
       WHERE t."organizationId" = ${user.organizationId}
+        AND mb."deletedAt" IS NULL
         AND m."createdAt" >= ${from}
         AND m."createdAt" <= ${to}
         ${mailboxFilter}
@@ -111,6 +120,8 @@ export class AnalyticsService {
       bucket: row.bucket,
       label: row.bucket.toISOString(),
       messages: Number(row.messages),
+      inbound: Number(row.inbound),
+      outbound: Number(row.outbound),
     }));
   }
 
@@ -132,7 +143,9 @@ export class AnalyticsService {
       SELECT m."fromEmail" AS email, COUNT(*) AS count
       FROM messages m
       JOIN threads t ON t.id = m."threadId"
+      JOIN mailboxes mb ON mb.id = t."mailboxId"
       WHERE t."organizationId" = ${user.organizationId}
+        AND mb."deletedAt" IS NULL
         AND m.direction = 'INBOUND'
         AND m."createdAt" >= ${from}
         AND m."createdAt" <= ${to}
@@ -163,7 +176,9 @@ export class AnalyticsService {
       SELECT split_part(m."fromEmail", '@', 2) AS domain, COUNT(*) AS count
       FROM messages m
       JOIN threads t ON t.id = m."threadId"
+      JOIN mailboxes mb ON mb.id = t."mailboxId"
       WHERE t."organizationId" = ${user.organizationId}
+        AND mb."deletedAt" IS NULL
         AND m.direction = 'INBOUND'
         AND m."fromEmail" LIKE '%@%'
         AND m."createdAt" >= ${from}
@@ -205,7 +220,9 @@ export class AnalyticsService {
         COUNT(*) AS count
       FROM messages m
       JOIN threads t ON t.id = m."threadId"
+      JOIN mailboxes mb ON mb.id = t."mailboxId"
       WHERE t."organizationId" = ${user.organizationId}
+        AND mb."deletedAt" IS NULL
         AND m."createdAt" >= ${from}
         AND m."createdAt" <= ${to}
         ${mailboxFilter}
@@ -321,6 +338,7 @@ export class AnalyticsService {
   ) {
     return {
       organizationId: orgId,
+      mailbox: { deletedAt: null },
       ...(mailboxIds ? { mailboxId: { in: mailboxIds } } : {}),
       ...(range.from || range.to
         ? {
@@ -358,6 +376,10 @@ export class AnalyticsService {
 
     const accesses = await this.prisma.mailboxAccess.findMany({
       where: {
+        mailbox: {
+          organizationId: user.organizationId,
+          deletedAt: null,
+        },
         OR: [
           { userId: user.sub, canRead: true },
           ...(teamIds.length

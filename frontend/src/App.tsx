@@ -25,6 +25,8 @@ import SuccessPage from './pages/billing/SuccessPage';
 
 import CalendarPage from './pages/dashboard/calendar/CalendarPage';
 import ContactsPage from './pages/dashboard/contacts/ContactsPage';
+import ContactDetailPage from './pages/dashboard/contacts/ContactDetailPage';
+import CompanyDetailPage from './pages/dashboard/contacts/CompanyDetailPage';
 import ReportsPage from './pages/dashboard/reports/ReportsPage';
 import RulesPage from './pages/dashboard/rules/RulesPage';
 import SLAPage from './pages/dashboard/sla/SLAPage';
@@ -69,6 +71,8 @@ function App() {
                     <Route path="/inbox" element={<InboxPage />} />
                     <Route path="/calendar" element={<RequirePermission permission="calendar:view"><CalendarPage /></RequirePermission>} />
                     <Route path="/contacts" element={<RequirePermission permission="contacts:view"><ContactsPage /></RequirePermission>} />
+                    <Route path="/contacts/:contactId" element={<RequirePermission permission="contacts:view"><ContactDetailPage /></RequirePermission>} />
+                    <Route path="/companies/:companyId" element={<RequirePermission permission="contacts:view"><CompanyDetailPage /></RequirePermission>} />
                     <Route path="/reports" element={<RequirePermission permission="organization:view"><ReportsPage /></RequirePermission>} />
                     <Route path="/analytics" element={<RequirePermission permission="organization:view"><ReportsPage /></RequirePermission>} />
                     <Route path="/billing/plans" element={<RequirePermission permission="organization:manage"><PlansPage /></RequirePermission>} />
