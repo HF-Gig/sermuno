@@ -10,14 +10,26 @@ import type {
   CreateSignatureDto,
   UpdateSignatureDto,
   AssignSignatureDto,
+  CreateSignaturePlaceholderDto,
+  UpdateSignaturePlaceholderDto,
 } from './dto/signature.dto';
 import { Prisma } from '@prisma/client';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { extname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
-const SUPPORTED_SIGNATURE_VARIABLES = [
-  '{{user_name}}',
-  '{{user_title}}',
-  '{{user_phone}}',
-];
+const BUILT_IN_SIGNATURE_VARIABLES = [
+  { token: '{{user_name}}', label: 'User Name', defaultValue: '' },
+  { token: '{{user_title}}', label: 'User Title', defaultValue: '' },
+  { token: '{{user_phone}}', label: 'User Phone', defaultValue: '' },
+] as const;
+
+type SignaturePlaceholder = {
+  token: string;
+  label: string;
+  defaultValue: string;
+  builtIn?: boolean;
+};
 
 @Injectable()
 export class SignaturesService {
@@ -225,6 +237,10 @@ export class SignaturesService {
       where: { id: user.sub },
       select: { fullName: true, preferences: true },
     });
+    const customPlaceholders = await this.getCustomPlaceholders(user);
+    const customPlaceholderMap = Object.fromEntries(
+      customPlaceholders.map((entry) => [entry.token, entry.defaultValue || '']),
+    );
 
     const signatures = await this.prisma.signature.findMany({
       where: {
@@ -257,14 +273,123 @@ export class SignaturesService {
         bodyHtml: this.renderSignatureHtml(
           signature.bodyHtml || signature.contentHtml,
           userRecord,
+          customPlaceholderMap,
         ),
         contentHtml: this.renderSignatureHtml(
           signature.contentHtml || signature.bodyHtml,
           userRecord,
+          customPlaceholderMap,
         ),
       }));
 
     return rendered;
+  }
+
+  async listPlaceholders(user: JwtUser) {
+    const custom = await this.getCustomPlaceholders(user);
+    return [
+      ...BUILT_IN_SIGNATURE_VARIABLES.map((entry) => ({
+        ...entry,
+        builtIn: true,
+      })),
+      ...custom.map((entry) => ({ ...entry, builtIn: false })),
+    ];
+  }
+
+  async createPlaceholder(dto: CreateSignaturePlaceholderDto, user: JwtUser) {
+    const token = this.normalizePlaceholderToken(dto.token);
+    this.assertCustomPlaceholderToken(token);
+    const placeholders = await this.getCustomPlaceholders(user);
+    const duplicate = placeholders.some(
+      (entry) => entry.token.toLowerCase() === token.toLowerCase(),
+    );
+    if (duplicate) {
+      throw new BadRequestException('Placeholder already exists');
+    }
+
+    const next = [
+      ...placeholders,
+      {
+        token,
+        label: String(dto.label || token).trim(),
+        defaultValue: String(dto.defaultValue || ''),
+      },
+    ];
+    await this.saveCustomPlaceholders(user, next);
+    return { token, label: String(dto.label || token).trim(), defaultValue: String(dto.defaultValue || ''), builtIn: false };
+  }
+
+  async updatePlaceholder(
+    rawToken: string,
+    dto: UpdateSignaturePlaceholderDto,
+    user: JwtUser,
+  ) {
+    const token = this.normalizePlaceholderToken(rawToken);
+    this.assertCustomPlaceholderToken(token);
+    const placeholders = await this.getCustomPlaceholders(user);
+    const index = placeholders.findIndex(
+      (entry) => entry.token.toLowerCase() === token.toLowerCase(),
+    );
+    if (index < 0) {
+      throw new NotFoundException('Placeholder not found');
+    }
+    const current = placeholders[index];
+    placeholders[index] = {
+      token: current.token,
+      label: dto.label !== undefined ? String(dto.label).trim() : current.label,
+      defaultValue:
+        dto.defaultValue !== undefined
+          ? String(dto.defaultValue)
+          : current.defaultValue,
+    };
+    await this.saveCustomPlaceholders(user, placeholders);
+    return { ...placeholders[index], builtIn: false };
+  }
+
+  async removePlaceholder(rawToken: string, user: JwtUser) {
+    const token = this.normalizePlaceholderToken(rawToken);
+    this.assertCustomPlaceholderToken(token);
+    const placeholders = await this.getCustomPlaceholders(user);
+    const next = placeholders.filter(
+      (entry) => entry.token.toLowerCase() !== token.toLowerCase(),
+    );
+    if (next.length === placeholders.length) {
+      throw new NotFoundException('Placeholder not found');
+    }
+    await this.saveCustomPlaceholders(user, next);
+    return { ok: true };
+  }
+
+  async uploadSignatureImage(file: Express.Multer.File | undefined, user: JwtUser) {
+    if (!file) {
+      throw new BadRequestException('No image uploaded');
+    }
+    if (!String(file.mimetype || '').startsWith('image/')) {
+      throw new BadRequestException('Only image uploads are allowed');
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      throw new BadRequestException('Image size must be 5MB or less');
+    }
+
+    const extension = extname(file.originalname || '') || '.png';
+    const filename = `${randomUUID()}${extension}`;
+    const directory = join(
+      process.cwd(),
+      'uploads',
+      'signatures',
+      user.organizationId,
+    );
+    await mkdir(directory, { recursive: true });
+    const fullPath = join(directory, filename);
+    await writeFile(fullPath, file.buffer);
+    const relativeUrl = `/uploads/signatures/${user.organizationId}/${filename}`;
+
+    return {
+      url: relativeUrl,
+      filename: file.originalname,
+      contentType: file.mimetype,
+      sizeBytes: file.size,
+    };
   }
 
   private assertCanMutate(
@@ -292,10 +417,9 @@ export class SignaturesService {
       return variables as Prisma.InputJsonValue;
     }
 
-    const supported = SUPPORTED_SIGNATURE_VARIABLES.filter((token) =>
-      String(html || '').includes(token),
+    const mapped = Object.fromEntries(
+      this.extractVariableTokens(html).map((token) => [token, token]),
     );
-    const mapped = Object.fromEntries(supported.map((token) => [token, token]));
     return mapped as Prisma.InputJsonValue;
   }
 
@@ -305,6 +429,7 @@ export class SignaturesService {
       fullName: string;
       preferences: Prisma.JsonValue | null;
     } | null,
+    customPlaceholderMap: Record<string, string> = {},
   ) {
     const preferences =
       userRecord?.preferences &&
@@ -320,12 +445,120 @@ export class SignaturesService {
       '{{user_phone}}': String(
         preferences.user_phone || preferences.phone || '',
       ),
+      ...customPlaceholderMap,
     };
 
     return Object.entries(replacements).reduce(
       (acc, [token, value]) => acc.replaceAll(token, value),
       String(html || ''),
     );
+  }
+
+  private extractVariableTokens(html: string | null | undefined) {
+    const input = String(html || '');
+    const matches = input.match(/\{\{\s*[a-zA-Z0-9_]+\s*\}\}/g) || [];
+    return Array.from(
+      new Set(matches.map((entry) => this.normalizePlaceholderToken(entry))),
+    );
+  }
+
+  private normalizePlaceholderToken(input: string) {
+    const trimmed = String(input || '').trim();
+    const raw = trimmed
+      .replace(/^\{\{\s*/, '')
+      .replace(/\s*\}\}$/, '')
+      .trim()
+      .toLowerCase();
+    if (!raw || !/^[a-z0-9_]+$/.test(raw)) {
+      throw new BadRequestException(
+        'Placeholder token must contain only letters, numbers, or underscores',
+      );
+    }
+    return `{{${raw}}}`;
+  }
+
+  private assertCustomPlaceholderToken(token: string) {
+    const isBuiltIn = BUILT_IN_SIGNATURE_VARIABLES.some(
+      (entry) => entry.token === token,
+    );
+    if (isBuiltIn) {
+      throw new BadRequestException(
+        'Built-in placeholders cannot be modified',
+      );
+    }
+  }
+
+  private async getCustomPlaceholders(user: JwtUser): Promise<SignaturePlaceholder[]> {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: user.organizationId },
+      select: { notificationSettings: true },
+    });
+    const settings =
+      organization?.notificationSettings &&
+      typeof organization.notificationSettings === 'object' &&
+      !Array.isArray(organization.notificationSettings)
+        ? (organization.notificationSettings as Record<string, unknown>)
+        : {};
+    const rawList = Array.isArray(settings.signaturePlaceholders)
+      ? settings.signaturePlaceholders
+      : [];
+
+    return rawList
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return null;
+        const candidate = entry as Record<string, unknown>;
+        try {
+          const token = this.normalizePlaceholderToken(
+            String(candidate.token || ''),
+          );
+          if (
+            BUILT_IN_SIGNATURE_VARIABLES.some(
+              (builtIn) => builtIn.token === token,
+            )
+          ) {
+            return null;
+          }
+          return {
+            token,
+            label: String(candidate.label || token).trim(),
+            defaultValue: String(candidate.defaultValue || ''),
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter((entry): entry is SignaturePlaceholder => Boolean(entry));
+  }
+
+  private async saveCustomPlaceholders(
+    user: JwtUser,
+    placeholders: SignaturePlaceholder[],
+  ) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: user.organizationId },
+      select: { notificationSettings: true },
+    });
+    const settings =
+      organization?.notificationSettings &&
+      typeof organization.notificationSettings === 'object' &&
+      !Array.isArray(organization.notificationSettings)
+        ? {
+            ...(organization.notificationSettings as Record<string, unknown>),
+          }
+        : {};
+
+    settings.signaturePlaceholders = placeholders.map((entry) => ({
+      token: entry.token,
+      label: entry.label || entry.token,
+      defaultValue: entry.defaultValue || '',
+    }));
+
+    await this.prisma.organization.update({
+      where: { id: user.organizationId },
+      data: {
+        notificationSettings: settings as Prisma.InputJsonValue,
+      },
+    });
   }
 
   private async getUserTeamIds(userId: string) {

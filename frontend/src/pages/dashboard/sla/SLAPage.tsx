@@ -5,6 +5,7 @@ import PageHeader from '../../../components/ui/PageHeader';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import EmptyState from '../../../components/ui/EmptyState';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import api from '../../../lib/api';
 import { TablePageSkeleton } from '../../../components/skeletons/TablePageSkeleton';
 import { useAuth } from '../../../context/AuthContext';
@@ -158,6 +159,8 @@ const SLAPage: React.FC = () => {
     const [editingId, setEditingId] = useState<string | null>(null);
     const [form, setForm] = useState<PolicyFormState>(createForm());
     const [formError, setFormError] = useState('');
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
 
     const loadPolicies = async () => {
         setLoading(true);
@@ -239,11 +242,15 @@ const SLAPage: React.FC = () => {
     };
 
     const deletePolicy = async (id: string) => {
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/sla-policies/${id}`);
             setPolicies((prev) => prev.filter((policy) => policy.id !== id));
+            setDeleteConfirm(null);
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to delete SLA policy.');
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
 
@@ -305,7 +312,7 @@ const SLAPage: React.FC = () => {
                                     </div>
                                     <div className="flex items-center gap-1">
                                         {canManage && <button type="button" onClick={() => openEdit(policy)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="w-4 h-4" /></button>}
-                                        {canDelete && <button type="button" onClick={() => void deletePolicy(policy.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>}
+                                        {canDelete && <button type="button" onClick={() => setDeleteConfirm({ id: policy.id, name: policy.name || 'this policy' })} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>}
                                     </div>
                                 </div>
 
@@ -433,6 +440,19 @@ const SLAPage: React.FC = () => {
                     </div>
                 </div>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title="Delete SLA Policy"
+                description={deleteConfirm ? `Are you sure you want to delete "${deleteConfirm.name}"?` : ''}
+                confirmLabel="Delete"
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (deleteConfirm) {
+                        void deletePolicy(deleteConfirm.id);
+                    }
+                }}
+            />
         </div>
     );
 };

@@ -14,6 +14,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as nodemailer from 'nodemailer';
+import { readFile } from 'node:fs/promises';
 import type { Readable } from 'stream';
 import { PrismaService } from '../../database/prisma.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
@@ -465,6 +466,10 @@ export class MessagesService {
       fallbackFrom: message.fromEmail || '',
     });
     const attachments = await this.resolveMessageAttachments(message.attachments);
+    const inlinePrepared = await this.embedSignatureImagesAsInlineAttachments(
+      message.bodyHtml || undefined,
+    );
+    const outgoingAttachments = [...attachments, ...inlinePrepared.attachments];
 
     try {
       const info = await transport.sendMail({
@@ -476,11 +481,12 @@ export class MessagesService {
         cc: cc.length > 0 ? cc : undefined,
         bcc: bcc.length > 0 ? bcc : undefined,
         subject: message.subject || '(no subject)',
-        html: message.bodyHtml || undefined,
+        html: inlinePrepared.html,
         text: message.bodyText || undefined,
         inReplyTo: message.inReplyTo || undefined,
         references: references.length > 0 ? references : undefined,
-        attachments: attachments.length > 0 ? attachments : undefined,
+        attachments:
+          outgoingAttachments.length > 0 ? outgoingAttachments : undefined,
       });
 
       const providerMessageId =
@@ -833,7 +839,15 @@ export class MessagesService {
       contentType: string | null;
       storageKey: string;
     }>,
-  ): Promise<Array<{ filename: string; contentType?: string; content: Buffer }>> {
+  ): Promise<
+    Array<{
+      filename: string;
+      contentType?: string;
+      content: Buffer;
+      cid?: string;
+      contentDisposition?: 'inline' | 'attachment';
+    }>
+  > {
     if (!Array.isArray(attachments) || attachments.length === 0) {
       return [];
     }
@@ -850,6 +864,136 @@ export class MessagesService {
     );
 
     return resolved;
+  }
+
+  private async embedSignatureImagesAsInlineAttachments(
+    html: string | undefined,
+  ): Promise<{
+    html: string | undefined;
+    attachments: Array<{
+      filename: string;
+      contentType: string;
+      content: Buffer;
+      cid: string;
+      contentDisposition: 'inline';
+    }>;
+  }> {
+    const rawHtml = String(html || '');
+    if (!rawHtml.trim()) {
+      return { html, attachments: [] };
+    }
+
+    const signatureImageBaseDir = path.resolve(
+      process.cwd(),
+      'uploads',
+      'signatures',
+    );
+    const imageRegex = /<img\b[^>]*\bsrc=(["'])(.*?)\1/gi;
+    const planned = new Map<
+      string,
+      {
+        cid: string;
+        filename: string;
+        contentType: string;
+        content: Buffer;
+      }
+    >();
+
+    let match: RegExpExecArray | null = imageRegex.exec(rawHtml);
+    while (match) {
+      const src = String(match[2] || '').trim();
+      if (!src) {
+        match = imageRegex.exec(rawHtml);
+        continue;
+      }
+
+      const localPath = this.resolveLocalSignatureImagePath(src);
+      if (!localPath) {
+        match = imageRegex.exec(rawHtml);
+        continue;
+      }
+
+      const normalizedPath = path.resolve(localPath);
+      if (
+        !normalizedPath.startsWith(signatureImageBaseDir + path.sep) &&
+        normalizedPath !== signatureImageBaseDir
+      ) {
+        match = imageRegex.exec(rawHtml);
+        continue;
+      }
+
+      if (!planned.has(src)) {
+        try {
+          const content = await readFile(normalizedPath);
+          const filename = path.basename(normalizedPath) || 'signature-image';
+          const extension = path.extname(filename).toLowerCase();
+          const contentType =
+            extension === '.jpg' || extension === '.jpeg'
+              ? 'image/jpeg'
+              : extension === '.gif'
+                ? 'image/gif'
+                : extension === '.webp'
+                  ? 'image/webp'
+                  : extension === '.svg'
+                    ? 'image/svg+xml'
+                    : 'image/png';
+          const cid = `sig-${crypto
+            .createHash('sha1')
+            .update(src)
+            .digest('hex')}@sermuno`;
+          planned.set(src, { cid, filename, contentType, content });
+        } catch {
+          // Keep original image src when local file cannot be read.
+        }
+      }
+
+      match = imageRegex.exec(rawHtml);
+    }
+
+    if (planned.size === 0) {
+      return { html, attachments: [] };
+    }
+
+    let nextHtml = rawHtml;
+    for (const [src, entry] of planned.entries()) {
+      nextHtml = nextHtml.replaceAll(`src="${src}"`, `src="cid:${entry.cid}"`);
+      nextHtml = nextHtml.replaceAll(`src='${src}'`, `src='cid:${entry.cid}'`);
+    }
+
+    return {
+      html: nextHtml,
+      attachments: Array.from(planned.values()).map((entry) => ({
+        filename: entry.filename,
+        contentType: entry.contentType,
+        content: entry.content,
+        cid: entry.cid,
+        contentDisposition: 'inline' as const,
+      })),
+    };
+  }
+
+  private resolveLocalSignatureImagePath(src: string): string | null {
+    const trimmed = String(src || '').trim();
+    if (!trimmed) return null;
+
+    let pathname = '';
+    if (trimmed.startsWith('/uploads/signatures/')) {
+      pathname = trimmed;
+    } else {
+      try {
+        const parsed = new URL(trimmed);
+        pathname = parsed.pathname;
+      } catch {
+        return null;
+      }
+    }
+
+    if (!pathname.startsWith('/uploads/signatures/')) {
+      return null;
+    }
+
+    const relative = decodeURIComponent(pathname.replace(/^\//, ''));
+    return path.resolve(process.cwd(), relative);
   }
 
   // ─── Attachments ──────────────────────────────────────────────────────────

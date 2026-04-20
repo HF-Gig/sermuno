@@ -5,6 +5,7 @@ import api from '../../../lib/api';
 import { useAuth } from '../../../context/AuthContext';
 import PageHeader from '../../../components/ui/PageHeader';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import { canManageUsers, normalizeRole } from '../../../lib/rbac';
 import { useAdaptiveRows } from '../../../hooks/useAdaptiveCount';
 
@@ -38,6 +39,12 @@ const UsersPage = () => {
     const [searchTerm, setSearchTerm] = useState('');
     const [activeTab, setActiveTab] = useState<ActiveTab>('users');
     const [showInviteModal, setShowInviteModal] = useState(false);
+    const [deleteConfirm, setDeleteConfirm] = useState<{
+        type: 'user' | 'invite';
+        id: string;
+        label: string;
+    } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
     const [message, setMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
     const [formData, setFormData] = useState({ email: '', fullName: '', role: 'USER' });
 
@@ -86,21 +93,34 @@ const UsersPage = () => {
     };
 
     const handleDeleteUser = async (userId: string) => {
-        if (!window.confirm(t('confirm_delete_user'))) return;
-        try { await api.delete(`/users/${userId}`); setMessage({ text: t('user_removed_successfully'), type: 'success' }); fetchUsers(); setTimeout(() => setMessage(null), 5000); }
-        catch (e) { console.error('Failed to delete user:', e); setMessage({ text: t('failed_to_remove_user'), type: 'error' }); }
+        setDeleteSubmitting(true);
+        try {
+            await api.delete(`/users/${userId}`);
+            setMessage({ text: t('user_removed_successfully'), type: 'success' });
+            setDeleteConfirm(null);
+            fetchUsers();
+            setTimeout(() => setMessage(null), 5000);
+        } catch (e) {
+            console.error('Failed to delete user:', e);
+            setMessage({ text: t('failed_to_remove_user'), type: 'error' });
+        } finally {
+            setDeleteSubmitting(false);
+        }
     };
 
     const handleRevokeInvite = async (inviteId: string) => {
-        if (!window.confirm('Are you sure you want to revoke this invite?')) return;
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/invites/${inviteId}`);
             setMessage({ text: 'Invite revoked successfully.', type: 'success' });
+            setDeleteConfirm(null);
             await fetchPendingInvites();
             setTimeout(() => setMessage(null), 5000);
         } catch (e) {
             console.error('Failed to revoke invite:', e);
             setMessage({ text: 'Failed to revoke invite.', type: 'error' });
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
 
@@ -261,7 +281,7 @@ const UsersPage = () => {
                                                     Resend
                                                 </button>
                                                 <button
-                                                    onClick={() => handleRevokeInvite(invite.id)}
+                                                    onClick={() => setDeleteConfirm({ type: 'invite', id: invite.id, label: invite.email })}
                                                     className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100 transition-colors"
                                                 >
                                                     <Trash2 className="w-3.5 h-3.5" />
@@ -310,7 +330,7 @@ const UsersPage = () => {
                                     </td>
                                     <td className="px-5 py-3.5 text-right">
                                         {canManage && currentUser?.id !== user.id && roleRank(user.role) < roleRank(currentRole) && (
-                                            <button onClick={() => handleDeleteUser(user.id)} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+                                            <button onClick={() => setDeleteConfirm({ type: 'user', id: user.id, label: user.fullName || user.email || user.id })} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
                                                 <Trash2 className="w-4 h-4" />
                                             </button>
                                         )}
@@ -353,6 +373,26 @@ const UsersPage = () => {
                     </div>
                 </form>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title={deleteConfirm?.type === 'invite' ? 'Revoke Invite' : 'Delete User'}
+                description={deleteConfirm
+                    ? deleteConfirm.type === 'invite'
+                        ? `Are you sure you want to revoke invite for "${deleteConfirm.label}"?`
+                        : `Are you sure you want to delete "${deleteConfirm.label}"?`
+                    : ''}
+                confirmLabel={deleteConfirm?.type === 'invite' ? 'Revoke' : 'Delete'}
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (!deleteConfirm) return;
+                    if (deleteConfirm.type === 'invite') {
+                        void handleRevokeInvite(deleteConfirm.id);
+                        return;
+                    }
+                    void handleDeleteUser(deleteConfirm.id);
+                }}
+            />
         </div>
     );
 };

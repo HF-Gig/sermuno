@@ -7,6 +7,7 @@ import PageHeader from '../../../components/ui/PageHeader';
 import EmptyState from '../../../components/ui/EmptyState';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import api from '../../../lib/api';
 import { TablePageSkeleton } from '../../../components/skeletons/TablePageSkeleton';
 import { useAuth } from '../../../context/AuthContext';
@@ -63,6 +64,8 @@ const TemplatesPage: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
     const [form, setForm] = useState<TemplateFormState>(createForm(canManage ? 'organization' : 'personal'));
     const [preview, setPreview] = useState<{ subject?: string | null; bodyHtml?: string | null } | null>(null);
     const [formError, setFormError] = useState('');
@@ -139,11 +142,15 @@ const TemplatesPage: React.FC = () => {
     };
 
     const deleteTemplate = async (id: string) => {
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/templates/${id}`);
             setTemplates((prev) => prev.filter((entry) => entry.id !== id));
+            setDeleteConfirm(null);
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to delete template.');
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
 
@@ -232,7 +239,7 @@ const TemplatesPage: React.FC = () => {
                                     <td className="px-4 py-3">
                                         <div className="flex items-center justify-end gap-1">
                                             <button type="button" onClick={() => openEdit(template)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="w-4 h-4" /></button>
-                                            {canDelete && <button type="button" onClick={() => void deleteTemplate(template.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>}
+                                            {canDelete && <button type="button" onClick={() => setDeleteConfirm({ id: template.id, name: template.name || 'this template' })} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>}
                                         </div>
                                     </td>
                                 </tr>
@@ -307,6 +314,19 @@ const TemplatesPage: React.FC = () => {
                     </div>
                 </div>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title="Delete Template"
+                description={deleteConfirm ? `Are you sure you want to delete "${deleteConfirm.name}"?` : ''}
+                confirmLabel="Delete"
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (deleteConfirm) {
+                        void deleteTemplate(deleteConfirm.id);
+                    }
+                }}
+            />
         </div>
     );
 };

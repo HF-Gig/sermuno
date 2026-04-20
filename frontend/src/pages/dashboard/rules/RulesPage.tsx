@@ -5,6 +5,7 @@ import PageHeader from '../../../components/ui/PageHeader';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import EmptyState from '../../../components/ui/EmptyState';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import api from '../../../lib/api';
 import { TablePageSkeleton } from '../../../components/skeletons/TablePageSkeleton';
 import { hasPermission } from '../../../hooks/usePermission';
@@ -241,6 +242,8 @@ const RulesPage: React.FC = () => {
     const [expandedId, setExpandedId] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
     const [form, setForm] = useState<RuleFormState>(createForm());
     const [formError, setFormError] = useState('');
     const [resources, setResources] = useState<ResourceMaps>({ users: [], teams: [], tags: [], folders: [], webhooks: [] });
@@ -356,11 +359,15 @@ const RulesPage: React.FC = () => {
     };
 
     const deleteRule = async (id: string) => {
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/rules/${id}`);
             setRules((prev) => prev.filter((entry) => entry.id !== id));
+            setDeleteConfirm(null);
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to delete rule.');
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
 
@@ -442,7 +449,7 @@ const RulesPage: React.FC = () => {
                                         <div className="flex justify-end gap-2">
                                             {canManage && <button type="button" onClick={() => void toggleActive(rule)} className="rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">{rule.isActive ? 'Deactivate' : 'Activate'}</button>}
                                             {canManage && <button type="button" onClick={() => openEdit(rule)} className="rounded-lg border border-[var(--color-card-border)] px-3 py-2 text-sm">Edit</button>}
-                                            {canDelete && <button type="button" onClick={() => void deleteRule(rule.id)} className="rounded-lg border border-red-200 px-3 py-2 text-sm text-red-600">Delete</button>}
+                                            {canDelete && <button type="button" onClick={() => setDeleteConfirm({ id: rule.id, name: rule.name || 'this rule' })} className="rounded-lg border border-red-200 px-3 py-2 text-sm text-red-600">Delete</button>}
                                         </div>
                                     </div>
                                 )}
@@ -487,7 +494,7 @@ const RulesPage: React.FC = () => {
                                                 <div className="flex justify-end gap-1">
                                                     {canManage && <button type="button" onClick={() => void toggleActive(rule)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Power className="h-4 w-4" /></button>}
                                                     {canManage && <button type="button" onClick={() => openEdit(rule)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="h-4 w-4" /></button>}
-                                                    {canDelete && <button type="button" onClick={() => void deleteRule(rule.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>}
+                                                    {canDelete && <button type="button" onClick={() => setDeleteConfirm({ id: rule.id, name: rule.name || 'this rule' })} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="h-4 w-4" /></button>}
                                                 </div>
                                             </td>
                                         </tr>
@@ -565,6 +572,19 @@ const RulesPage: React.FC = () => {
                     </div>
                 </div>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title="Delete Rule"
+                description={deleteConfirm ? `Are you sure you want to delete "${deleteConfirm.name}"?` : ''}
+                confirmLabel="Delete"
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (deleteConfirm) {
+                        void deleteRule(deleteConfirm.id);
+                    }
+                }}
+            />
         </div>
     );
 };

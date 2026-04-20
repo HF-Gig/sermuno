@@ -33,6 +33,7 @@ import { SnoozeWakeupProcessor } from './processors/snooze-wakeup.processor';
 import { NotificationDispatchProcessor } from './processors/notification-dispatch.processor';
 import { NotificationDigestProcessor } from './processors/notification-digest.processor';
 import { NotificationDigestScheduler } from './notification-digest.scheduler';
+import { EmailSyncScheduler } from './email-sync.scheduler';
 
 const QUEUE_NAMES = [
   EMAIL_SYNC_QUEUE,
@@ -83,6 +84,7 @@ const QUEUE_NAMES = [
     NotificationDispatchProcessor,
     NotificationDigestProcessor,
     NotificationDigestScheduler,
+    EmailSyncScheduler,
     FeatureFlagsService,
     AiCategorizationService,
   ],

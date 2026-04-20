@@ -89,3 +89,26 @@ export class AssignSignatureDto {
   @IsString({ each: true })
   mailboxIds?: string[];
 }
+
+export class CreateSignaturePlaceholderDto {
+  @IsString()
+  token: string;
+
+  @IsOptional()
+  @IsString()
+  label?: string;
+
+  @IsOptional()
+  @IsString()
+  defaultValue?: string;
+}
+
+export class UpdateSignaturePlaceholderDto {
+  @IsOptional()
+  @IsString()
+  label?: string;
+
+  @IsOptional()
+  @IsString()
+  defaultValue?: string;
+}

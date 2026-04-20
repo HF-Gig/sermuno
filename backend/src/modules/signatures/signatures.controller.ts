@@ -9,18 +9,23 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
 import { SignaturesService } from './signatures.service';
 import {
   CreateSignatureDto,
   UpdateSignatureDto,
   AssignSignatureDto,
+  CreateSignaturePlaceholderDto,
+  UpdateSignaturePlaceholderDto,
 } from './dto/signature.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermission } from '../../common/decorators/permissions.decorator';
+import { FileInterceptor } from '@nestjs/platform-express';
 
 @Controller('signatures')
 export class SignaturesController {
@@ -38,6 +43,52 @@ export class SignaturesController {
   @RequirePermission('signatures:view')
   findAll(@CurrentUser() user: JwtUser) {
     return this.signaturesService.findAll(user);
+  }
+
+  @Get('placeholders')
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermission('signatures:view')
+  listPlaceholders(@CurrentUser() user: JwtUser) {
+    return this.signaturesService.listPlaceholders(user);
+  }
+
+  @Post('placeholders')
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermission('signatures:create')
+  createPlaceholder(
+    @Body() dto: CreateSignaturePlaceholderDto,
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.signaturesService.createPlaceholder(dto, user);
+  }
+
+  @Patch('placeholders/:token')
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermission('signatures:create')
+  updatePlaceholder(
+    @Param('token') token: string,
+    @Body() dto: UpdateSignaturePlaceholderDto,
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.signaturesService.updatePlaceholder(token, dto, user);
+  }
+
+  @Delete('placeholders/:token')
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermission('signatures:create')
+  removePlaceholder(@Param('token') token: string, @CurrentUser() user: JwtUser) {
+    return this.signaturesService.removePlaceholder(token, user);
+  }
+
+  @Post('images/upload')
+  @UseGuards(JwtAuthGuard, PermissionsGuard)
+  @RequirePermission('signatures:create')
+  @UseInterceptors(FileInterceptor('file'))
+  uploadImage(
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.signaturesService.uploadSignatureImage(file, user);
   }
 
   @Post()

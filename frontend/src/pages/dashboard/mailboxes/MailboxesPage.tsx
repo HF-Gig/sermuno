@@ -5,6 +5,7 @@ import { Inbox, Mail, Plus, Edit2, Trash2, X } from 'lucide-react';
 import { clsx } from 'clsx';
 import PageHeader from '../../../components/ui/PageHeader';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import { useAuth } from '../../../context/AuthContext';
 import { hasPermission } from '../../../hooks/usePermission';
 import { useAdaptiveGridCount } from '../../../hooks/useAdaptiveCount';
@@ -38,6 +39,8 @@ const MailboxesPage = () => {
     const [showModal, setShowModal] = useState(false);
     const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
     const [selectedMailbox, setSelectedMailbox] = useState<Mailbox | null>(null);
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
     const [formData, setFormData] = useState({
         name: '', email: '', provider: 'SMTP',
         authorizedTeamIds: [] as string[], authorizedUserIds: [] as string[],
@@ -120,8 +123,17 @@ const MailboxesPage = () => {
     };
 
     const handleDelete = async (id: string) => {
-        if (!window.confirm(t('confirm_delete_mailbox'))) return;
-        try { await api.delete(`/mailboxes/${id}`); setMessage({ text: t('mailbox_removed_successfully'), type: 'success' }); fetchMailboxes(); } catch (e) { console.error(e); }
+        setDeleteSubmitting(true);
+        try {
+            await api.delete(`/mailboxes/${id}`);
+            setMessage({ text: t('mailbox_removed_successfully'), type: 'success' });
+            setDeleteConfirm(null);
+            fetchMailboxes();
+        } catch (e) {
+            console.error(e);
+        } finally {
+            setDeleteSubmitting(false);
+        }
     };
 
     const openEdit = (mb: Mailbox) => {
@@ -161,7 +173,7 @@ const MailboxesPage = () => {
                                 {canManage ? (
                                     <div className="flex space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                         <button onClick={() => openEdit(mb)} className="p-1.5 text-[var(--color-text-muted)] hover:text-[var(--color-primary)] hover:bg-[var(--color-background)] rounded-lg transition-colors"><Edit2 className="w-4 h-4" /></button>
-                                        <button onClick={() => handleDelete(mb.id)} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"><Trash2 className="w-4 h-4" /></button>
+                                        <button onClick={() => setDeleteConfirm({ id: mb.id, name: mb.name || mb.email || mb.id })} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"><Trash2 className="w-4 h-4" /></button>
                                     </div>
                                 ) : null}
                             </div>
@@ -243,6 +255,19 @@ const MailboxesPage = () => {
                     </div>
                 </form>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title="Delete Mailbox"
+                description={deleteConfirm ? `Are you sure you want to delete mailbox "${deleteConfirm.name}"?` : ''}
+                confirmLabel="Delete"
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (deleteConfirm) {
+                        void handleDelete(deleteConfirm.id);
+                    }
+                }}
+            />
         </div>
     );
 };

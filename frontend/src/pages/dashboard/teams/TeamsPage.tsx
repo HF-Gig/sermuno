@@ -5,6 +5,7 @@ import { Users, Plus, Edit2, Trash2, UserPlus, X, Inbox, Wand2 } from 'lucide-re
 import { clsx } from 'clsx';
 import PageHeader from '../../../components/ui/PageHeader';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import { hasPermission } from '../../../hooks/usePermission';
 import { useAuth } from '../../../context/AuthContext';
 import { useAdaptiveGridCount } from '../../../hooks/useAdaptiveCount';
@@ -37,6 +38,12 @@ const TeamsPage = () => {
     const [teamRules, setTeamRules] = useState<TeamRule[]>([]);
     const [ruleForm, setRuleForm] = useState({ name: '', trigger: 'INCOMING_EMAIL', conditions: '{\n  "match": "all"\n}', actions: '{\n  "assignTeam": true\n}' });
     const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+    const [deleteConfirm, setDeleteConfirm] = useState<{
+        type: 'team' | 'member' | 'mailbox' | 'rule';
+        id: string;
+        label: string;
+    } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
 
     useEffect(() => { fetchTeams(); }, []);
 
@@ -61,8 +68,17 @@ const TeamsPage = () => {
     };
 
     const handleDelete = async (id: string) => {
-        if (!window.confirm(t('are_you_sure_you_want_to_delete_this_team'))) return;
-        try { await api.delete(`/teams/${id}`); setMessage({ text: t('team_deleted_successfully'), type: 'success' }); fetchTeams(); } catch (e) { console.error(e); }
+        setDeleteSubmitting(true);
+        try {
+            await api.delete(`/teams/${id}`);
+            setMessage({ text: t('team_deleted_successfully'), type: 'success' });
+            setDeleteConfirm(null);
+            fetchTeams();
+        } catch (e) {
+            console.error(e);
+        } finally {
+            setDeleteSubmitting(false);
+        }
     };
 
     const openManageMembers = async (team: Team) => {
@@ -82,7 +98,18 @@ const TeamsPage = () => {
 
     const handleRemoveMember = async (userId: string) => {
         if (!selectedTeam) return;
-        try { await api.delete(`/teams/${selectedTeam.id}/members/${userId}`); setMessage({ text: t('member_removed_successfully'), type: 'success' }); openManageMembers(selectedTeam); fetchTeams(); } catch (e) { console.error(e); }
+        setDeleteSubmitting(true);
+        try {
+            await api.delete(`/teams/${selectedTeam.id}/members/${userId}`);
+            setMessage({ text: t('member_removed_successfully'), type: 'success' });
+            setDeleteConfirm(null);
+            openManageMembers(selectedTeam);
+            fetchTeams();
+        } catch (e) {
+            console.error(e);
+        } finally {
+            setDeleteSubmitting(false);
+        }
     };
 
     const handleUpdateMemberRole = async (userId: string, role: 'lead' | 'member') => {
@@ -175,12 +202,16 @@ const TeamsPage = () => {
 
     const handleDeleteRule = async (ruleId: string) => {
         if (!selectedTeam) return;
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/rules/${ruleId}`);
             setMessage({ text: 'Team rule deleted successfully', type: 'success' });
+            setDeleteConfirm(null);
             openManageRules(selectedTeam);
         } catch (e: any) {
             setMessage({ text: e.response?.data?.message || 'Failed to delete team rule', type: 'error' });
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
 
@@ -199,14 +230,20 @@ const TeamsPage = () => {
 
     const handleRemoveMailbox = async (mailboxId: string) => {
         if (!selectedTeam) return;
+        setDeleteSubmitting(true);
         try {
             const existingMailboxIds = (selectedTeam.authorizedMailboxes || selectedTeam.mailboxes || []).map(mailbox => mailbox.id);
             await syncTeamMailboxAccess(selectedTeam.id, existingMailboxIds.filter(id => id !== mailboxId));
             setMessage({ text: t('mailbox_removed_successfully'), type: 'success' });
+            setDeleteConfirm(null);
             const refreshedTeams = await fetchTeams();
             const refreshedTeam = refreshedTeams.find(team => team.id === selectedTeam.id) || selectedTeam;
             openManageMailboxes(refreshedTeam);
-        } catch (e) { console.error(e); }
+        } catch (e) {
+            console.error(e);
+        } finally {
+            setDeleteSubmitting(false);
+        }
     };
 
     const inputCls = "w-full px-3 py-2 border border-[var(--color-input-border)] rounded-lg text-sm focus:ring-2 focus:ring-[var(--color-primary)]/20 focus:outline-none bg-white transition-colors";
@@ -295,7 +332,7 @@ const TeamsPage = () => {
                                     <div className="flex space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                         <button onClick={() => { setSelectedTeam(team); setModalMode('edit'); setFormData({ name: team.name, description: team.description || '' }); setShowModal(true); }}
                                             className="p-1.5 text-[var(--color-text-muted)] hover:text-[var(--color-primary)] hover:bg-[var(--color-background)] rounded-lg transition-colors"><Edit2 className="w-4 h-4" /></button>
-                                        <button onClick={() => handleDelete(team.id)}
+                                        <button onClick={() => setDeleteConfirm({ type: 'team', id: team.id, label: team.name || team.id })}
                                             className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"><Trash2 className="w-4 h-4" /></button>
                                     </div>
                                 )}
@@ -369,7 +406,7 @@ const TeamsPage = () => {
                                     <option value="member">{t('team_member')}</option>
                                     <option value="lead">{t('team_lead')}</option>
                                 </select>
-                                <button onClick={() => handleRemoveMember(m.userId)} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 transition-colors"><Trash2 className="w-4 h-4" /></button>
+                                <button onClick={() => setDeleteConfirm({ type: 'member', id: m.userId, label: m.user.fullName || m.user.email || m.userId })} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 transition-colors"><Trash2 className="w-4 h-4" /></button>
                             </div>
                         </div>
                     ))}
@@ -393,7 +430,7 @@ const TeamsPage = () => {
                                 <div className="w-9 h-9 rounded-full bg-[var(--color-background)] text-[var(--color-primary)] flex items-center justify-center"><Inbox className="w-4 h-4" /></div>
                                 <div><div className="text-sm font-semibold text-[var(--color-text-primary)]">{m.name}</div><div className="text-xs text-[var(--color-text-muted)]">{m.email || t('no_address_configured')}</div></div>
                             </div>
-                            <button onClick={() => handleRemoveMailbox(m.id)} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 transition-colors"><Trash2 className="w-4 h-4" /></button>
+                            <button onClick={() => setDeleteConfirm({ type: 'mailbox', id: m.id, label: m.name || m.email || m.id })} className="p-1.5 text-[var(--color-text-muted)] hover:text-red-600 transition-colors"><Trash2 className="w-4 h-4" /></button>
                         </div>
                     ))}
                 </div>
@@ -418,7 +455,7 @@ const TeamsPage = () => {
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <button type="button" onClick={() => handleEditRule(rule)} className="rounded-lg border border-[var(--color-card-border)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)]">Edit</button>
-                                        <button type="button" onClick={() => handleDeleteRule(rule.id)} className="rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100">Delete</button>
+                                        <button type="button" onClick={() => setDeleteConfirm({ type: 'rule', id: rule.id, label: rule.name || rule.id })} className="rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100">Delete</button>
                                     </div>
                                 </div>
                             </div>
@@ -453,6 +490,43 @@ const TeamsPage = () => {
                     </form>
                 </div>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title={
+                    deleteConfirm?.type === 'team' ? 'Delete Team'
+                        : deleteConfirm?.type === 'member' ? 'Remove Member'
+                            : deleteConfirm?.type === 'mailbox' ? 'Remove Mailbox'
+                                : 'Delete Team Rule'
+                }
+                description={deleteConfirm
+                    ? deleteConfirm.type === 'team'
+                        ? `Are you sure you want to delete "${deleteConfirm.label}"?`
+                        : deleteConfirm.type === 'member'
+                            ? `Are you sure you want to remove "${deleteConfirm.label}" from this team?`
+                            : deleteConfirm.type === 'mailbox'
+                                ? `Are you sure you want to remove mailbox "${deleteConfirm.label}" from this team?`
+                                : `Are you sure you want to delete rule "${deleteConfirm.label}"?`
+                    : ''}
+                confirmLabel={deleteConfirm?.type === 'team' || deleteConfirm?.type === 'rule' ? 'Delete' : 'Remove'}
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (!deleteConfirm) return;
+                    if (deleteConfirm.type === 'team') {
+                        void handleDelete(deleteConfirm.id);
+                        return;
+                    }
+                    if (deleteConfirm.type === 'member') {
+                        void handleRemoveMember(deleteConfirm.id);
+                        return;
+                    }
+                    if (deleteConfirm.type === 'mailbox') {
+                        void handleRemoveMailbox(deleteConfirm.id);
+                        return;
+                    }
+                    void handleDeleteRule(deleteConfirm.id);
+                }}
+            />
         </div>
     );
 };

@@ -28,6 +28,11 @@ export interface EmailSyncJobData {
   organizationId: string;
   /** When true, use mini-chunks of 100 messages with 50ms delay (ENABLE_STREAMING_SYNC) */
   streamingMode?: boolean;
+  /**
+   * Optional canonical folder type hints for targeted sync runs.
+   * When omitted, the processor syncs all canonical folders.
+   */
+  folderTypeHints?: Array<'inbox' | 'sent' | 'drafts' | 'spam' | 'trash' | 'archive'>;
 }
 
 const STREAM_CHUNK_SIZE = 100;
@@ -474,6 +479,7 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         streamingMode ?? false,
         providerSyncPolicy,
+        job.data.folderTypeHints,
       );
       this.adaptiveThrottle.recordSuccess(
         adaptiveBucketKey,
@@ -1442,6 +1448,24 @@ export class EmailSyncProcessor extends WorkerHost {
       type: 'new_message',
     });
 
+    this.eventsGateway?.emitToOrganization(organizationId, 'message:new', {
+      id: createdMessage.id,
+      threadId: thread.id,
+      mailboxId,
+      direction,
+      subject,
+      createdAt: receivedAt.toISOString(),
+    });
+
+    this.eventsGateway?.emitToOrganization(organizationId, 'new_message', {
+      id: createdMessage.id,
+      threadId: thread.id,
+      mailboxId,
+      direction,
+      subject,
+      createdAt: receivedAt.toISOString(),
+    });
+
     if (this.crmService && thread.contactId) {
       await this.crmService.emitContactActivity({
         organizationId,
@@ -1534,6 +1558,7 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     streamingMode: boolean,
     providerSyncPolicy: EmailSyncProviderPolicy,
+    folderTypeHints?: EmailSyncJobData['folderTypeHints'],
   ): Promise<void> {
     const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
     // List all IMAP folders
@@ -1565,17 +1590,27 @@ export class EmailSyncProcessor extends WorkerHost {
       await this.upsertMailboxFolderMetadata(mailboxId, folder.path, folder.type);
     }
 
+    const targetedFolderTypes =
+      Array.isArray(folderTypeHints) && folderTypeHints.length > 0
+        ? new Set(folderTypeHints)
+        : null;
+
     const foldersToSync: Array<{ path: string; type: string }> = [];
     const seenPaths = new Set<string>();
     for (const folder of discoveredFolders) {
       if (!SYNC_FOLDER_TYPES.has(folder.type)) continue;
+      if (targetedFolderTypes && !targetedFolderTypes.has(folder.type as any)) {
+        continue;
+      }
       if (seenPaths.has(folder.path)) continue;
       seenPaths.add(folder.path);
       foldersToSync.push({ path: folder.path, type: folder.type });
     }
 
     // Make sure INBOX is always present even if not returned by list()
-    if (!foldersToSync.find((f) => f.path === 'INBOX')) {
+    const shouldEnsureInbox =
+      !targetedFolderTypes || targetedFolderTypes.has('inbox');
+    if (shouldEnsureInbox && !foldersToSync.find((f) => f.path === 'INBOX')) {
       await this.upsertMailboxFolderMetadata(mailboxId, 'INBOX', 'inbox');
       foldersToSync.unshift({ path: 'INBOX', type: 'inbox' });
     }

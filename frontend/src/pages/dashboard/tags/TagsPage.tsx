@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import PageHeader from '../../../components/ui/PageHeader';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import EmptyState from '../../../components/ui/EmptyState';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import { Tag, Plus, Pencil, Trash2, Search } from 'lucide-react';
 import api from '../../../lib/api';
 import { TablePageSkeleton } from '../../../components/skeletons/TablePageSkeleton';
@@ -22,6 +23,8 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
     const [search, setSearch] = useState('');
     const [showForm, setShowForm] = useState(false);
     const [editId, setEditId] = useState<string | null>(null);
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; name: string } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
     const defaultScope = canManageTags ? 'organization' : 'personal';
     const [form, setForm] = useState({ name: '', color: '#3b82f6', scope: defaultScope as 'organization' | 'personal' });
 
@@ -63,12 +66,16 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
     };
 
     const handleDelete = async (id: string) => {
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/tags/${id}`);
             setTags(prev => prev.filter(t => t.id !== id));
             setError(null);
+            setDeleteConfirm(null);
         } catch (err: any) {
             setError(err?.userMessage || err?.response?.data?.error || err?.response?.data?.message || 'Failed to delete tag.');
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
     const handleEdit = (tag: any) => { setForm({ name: tag.name, color: tag.color, scope: tag.scope }); setEditId(tag.id); setShowForm(true); };
@@ -196,7 +203,7 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
                                 <td className="px-5 py-3">
                                     <div className="flex items-center gap-1">
                                         {canManageTags ? <button onClick={() => handleEdit(tag)} className="p-1.5 hover:bg-[var(--color-background)] rounded-lg text-[var(--color-text-muted)] hover:text-[var(--color-primary)]"><Pencil className="w-3.5 h-3.5" /></button> : null}
-                                        {canManageTags ? <button onClick={() => handleDelete(tag.id)} className="p-1.5 hover:bg-red-50 rounded-lg text-[var(--color-text-muted)] hover:text-red-500"><Trash2 className="w-3.5 h-3.5" /></button> : null}
+                                        {canManageTags ? <button onClick={() => setDeleteConfirm({ id: tag.id, name: tag.name || 'this tag' })} className="p-1.5 hover:bg-red-50 rounded-lg text-[var(--color-text-muted)] hover:text-red-500"><Trash2 className="w-3.5 h-3.5" /></button> : null}
                                     </div>
                                 </td>
                             </tr>
@@ -204,6 +211,19 @@ const TagsPage: React.FC<TagsPageProps> = ({ embedded = false }) => {
                     </tbody>
                 </table>
             </div>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title="Delete Tag"
+                description={deleteConfirm ? `Are you sure you want to delete "${deleteConfirm.name}"?` : ''}
+                confirmLabel="Delete"
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (deleteConfirm) {
+                        void handleDelete(deleteConfirm.id);
+                    }
+                }}
+            />
         </div>
     );
 };

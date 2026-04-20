@@ -18,6 +18,7 @@ import DeleteMailboxModal from './components/DeleteMailboxModal';
 import MailboxHealthModal from './components/MailboxHealthModal';
 import MailboxFoldersModal from './components/MailboxFoldersModal';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import api, { resolveAvatarUrl } from '../../../lib/api';
 import { SETTINGS_TAB_ACCESS, canAccess, normalizeRole } from '../../../lib/rbac';
 import StatusBadge from '../../../components/ui/StatusBadge';
@@ -496,6 +497,7 @@ const SettingsPage: React.FC = () => {
     const [pendingInvites, setPendingInvites] = useState<PendingInviteRecord[]>([]);
     const [pendingInvitesLoading, setPendingInvitesLoading] = useState(false);
     const [revokingInviteId, setRevokingInviteId] = useState<string | null>(null);
+    const [revokeInviteConfirm, setRevokeInviteConfirm] = useState<PendingInviteRecord | null>(null);
     const [editingTeam, setEditingTeam] = useState<TeamRecord | null>(null);
     const [showTeamModal, setShowTeamModal] = useState(false);
     const [showUpgradeBlocker, setShowUpgradeBlocker] = useState(false);
@@ -1335,13 +1337,12 @@ const SettingsPage: React.FC = () => {
 
     const handleRevokeInvite = async (invite: PendingInviteRecord) => {
         if (!canInviteUsers) return;
-        const shouldRevoke = window.confirm(`Revoke invite for ${invite.email}?`);
-        if (!shouldRevoke) return;
 
         try {
             setRevokingInviteId(invite.id);
             await api.delete(`/invites/${invite.id}`);
             setPendingInvites(prev => prev.filter(item => item.id !== invite.id));
+            setRevokeInviteConfirm(null);
         } catch (err) {
             console.error('Failed to revoke invite:', err);
         } finally {
@@ -2738,7 +2739,7 @@ const SettingsPage: React.FC = () => {
                                                                 <td className="px-4 py-3 text-right">
                                                                     <button
                                                                         type="button"
-                                                                        onClick={() => handleRevokeInvite(invite)}
+                                                                        onClick={() => setRevokeInviteConfirm(invite)}
                                                                         disabled={revokingInviteId === invite.id}
                                                                         className="inline-flex items-center gap-1 text-red-600 hover:underline text-xs font-medium disabled:opacity-60 disabled:no-underline"
                                                                     >
@@ -4066,6 +4067,19 @@ const SettingsPage: React.FC = () => {
                 isOpen={showFoldersModal}
                 onClose={() => { setShowFoldersModal(false); setFoldersMailbox(null); }}
                 mailbox={foldersMailbox}
+            />
+            <ConfirmDialog
+                isOpen={Boolean(revokeInviteConfirm)}
+                title="Revoke Invite"
+                description={revokeInviteConfirm ? `Are you sure you want to revoke invite for "${revokeInviteConfirm.email}"?` : ''}
+                confirmLabel="Revoke"
+                isSubmitting={Boolean(revokeInviteConfirm && revokingInviteId === revokeInviteConfirm.id)}
+                onCancel={() => setRevokeInviteConfirm(null)}
+                onConfirm={() => {
+                    if (revokeInviteConfirm) {
+                        void handleRevokeInvite(revokeInviteConfirm);
+                    }
+                }}
             />
 
             {/* Sync success toast */}

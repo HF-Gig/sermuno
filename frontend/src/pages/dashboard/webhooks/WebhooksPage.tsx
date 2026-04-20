@@ -5,6 +5,7 @@ import PageHeader from '../../../components/ui/PageHeader';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import EmptyState from '../../../components/ui/EmptyState';
 import Modal from '../../../components/ui/Modal';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import api from '../../../lib/api';
 import { TablePageSkeleton } from '../../../components/skeletons/TablePageSkeleton';
 
@@ -55,6 +56,8 @@ const WebhooksPage: React.FC = () => {
     const [error, setError] = useState<string | null>(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [editingId, setEditingId] = useState<string | null>(null);
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; label: string } | null>(null);
+    const [deleteSubmitting, setDeleteSubmitting] = useState(false);
     const [form, setForm] = useState<WebhookFormState>(createForm());
     const [formError, setFormError] = useState('');
 
@@ -134,11 +137,15 @@ const WebhooksPage: React.FC = () => {
     };
 
     const deleteWebhook = async (id: string) => {
+        setDeleteSubmitting(true);
         try {
             await api.delete(`/webhooks/${id}`);
             setWebhooks((prev) => prev.filter((entry) => entry.id !== id));
+            setDeleteConfirm(null);
         } catch (err: any) {
             setError(err?.response?.data?.message || 'Failed to delete webhook.');
+        } finally {
+            setDeleteSubmitting(false);
         }
     };
 
@@ -211,7 +218,7 @@ const WebhooksPage: React.FC = () => {
                                     <td className="px-4 py-3">
                                         <div className="flex items-center justify-end gap-1">
                                             <button type="button" onClick={() => openEdit(row)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-[var(--color-background)]"><Pencil className="w-4 h-4" /></button>
-                                            <button type="button" onClick={() => void deleteWebhook(row.id)} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
+                                            <button type="button" onClick={() => setDeleteConfirm({ id: row.id, label: row.url || 'this webhook' })} className="rounded-lg p-2 text-[var(--color-text-muted)] hover:bg-red-50 hover:text-red-600"><Trash2 className="w-4 h-4" /></button>
                                         </div>
                                     </td>
                                 </tr>
@@ -272,6 +279,19 @@ const WebhooksPage: React.FC = () => {
                     </div>
                 </div>
             </Modal>
+            <ConfirmDialog
+                isOpen={Boolean(deleteConfirm)}
+                title="Delete Webhook"
+                description={deleteConfirm ? `Are you sure you want to delete webhook "${deleteConfirm.label}"?` : ''}
+                confirmLabel="Delete"
+                isSubmitting={deleteSubmitting}
+                onCancel={() => setDeleteConfirm(null)}
+                onConfirm={() => {
+                    if (deleteConfirm) {
+                        void deleteWebhook(deleteConfirm.id);
+                    }
+                }}
+            />
         </div>
     );
 };

@@ -46,6 +46,7 @@ const NOTE_MENTION_POPOVER_MAX_HEIGHT = 256;
 const NOTE_MENTION_ROW_HEIGHT = 48;
 const NOTE_MENTION_SKELETON_MIN_ROWS = 2;
 const NOTE_MENTION_SKELETON_MAX_ROWS = 8;
+const INBOX_LIVE_REFRESH_INTERVAL_MS = 3_000;
 
 const apiStatusToUiStatus = (status?: string | null, assignedUserId?: string | null) => {
     switch (String(status || '').toUpperCase()) {
@@ -1327,6 +1328,20 @@ const InboxPage: React.FC = () => {
         }
     }, [activeMailboxId, canFetchProtectedData, expandedTags, activeTagId]);
 
+    useEffect(() => {
+        if (!canFetchProtectedData) return;
+        if (hasAttachedMailbox !== true) return;
+
+        const interval = setInterval(() => {
+            setRealtimeListVersion((prev) => prev + 1);
+            loadInboxCounts();
+        }, INBOX_LIVE_REFRESH_INTERVAL_MS);
+
+        return () => {
+            clearInterval(interval);
+        };
+    }, [canFetchProtectedData, hasAttachedMailbox, loadInboxCounts]);
+
     const resolvedRouteThreadId = useMemo(() => {
         const queryThreadId = searchParams.get('tid');
         if (queryThreadId) return queryThreadId;
@@ -2350,6 +2365,9 @@ const InboxPage: React.FC = () => {
             const eventMailboxId = data?.mailboxId || data?.mailbox?.id || null;
             if (!shouldProcessMailboxEvent(eventMailboxId, updatedThreadId)) return;
             const hasSchedulingLifecycleUpdate = typeof data?.scheduledStatus === 'string' || typeof data?.deliveryState === 'string';
+            const isInboundMessageLifecycleEvent =
+                String(data?.type || '').toLowerCase() === 'new_message' ||
+                String(data?.event || '').toLowerCase() === 'new_message';
 
             const existsOnCurrentPage = apiThreadsRef.current.some((thread) => String(thread.id) === updatedThreadId);
 
@@ -2368,7 +2386,7 @@ const InboxPage: React.FC = () => {
                 )
             );
 
-            if (!existsOnCurrentPage || currentPage > 1 || hasSchedulingLifecycleUpdate) {
+            if (!existsOnCurrentPage || currentPage > 1 || hasSchedulingLifecycleUpdate || isInboundMessageLifecycleEvent) {
                 scheduleThreadListRefresh();
             }
 
