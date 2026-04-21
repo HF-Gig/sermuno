@@ -36,7 +36,7 @@ export class CalendarService {
     private readonly videoConf: VideoConferencingService,
     private readonly calendarSync: CalendarSyncService,
     private readonly templates: CalendarTemplatesService,
-    @Inject(forwardRef(() => 'NOTIFICATIONS_SERVICE'))
+    @Inject('NOTIFICATIONS_SERVICE')
     private readonly notifications: NotificationsService | null,
     private readonly eventsGateway: EventsGateway,
     private readonly auditService: AuditService,

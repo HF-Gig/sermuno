@@ -25,7 +25,8 @@ import {
     FileText, Paperclip, Type, Reply, FileSignature,
     CheckCircle2, Archive, Trash2,
     MoreHorizontal, Users, EyeOff, Star, RefreshCw,
-    ArrowLeft, Check, Plus, X, Loader2, Columns2, ChevronLeft, ChevronRight
+    ArrowLeft, Check, Plus, X, Loader2, Columns2, ChevronLeft, ChevronRight,
+    PanelRight
 } from 'lucide-react';
 import { clsx } from 'clsx';
 
@@ -855,6 +856,8 @@ const InboxPage: React.FC = () => {
     const [isSplitMode, setIsSplitMode] = useState(true);
     const [isLg, setIsLg] = useState(() => window.innerWidth >= 1024);
     const [isXl, setIsXl] = useState(() => window.innerWidth >= 1280);
+    const [is2xl, setIs2xl] = useState(() => window.innerWidth >= 1536);
+    const [showDetails, setShowDetails] = useState(() => window.innerWidth >= 1536);
     const [mailboxDataVersion, setMailboxDataVersion] = useState(0);
     const [realtimeListVersion, setRealtimeListVersion] = useState(0);
     const [detailRefreshVersion, setDetailRefreshVersion] = useState(0);
@@ -951,26 +954,26 @@ const InboxPage: React.FC = () => {
             return;
         }
 
-        const hintedEditor = editorInstance as NoteEditorWriter | undefined;
-        const editor = hintedEditor?.root && typeof hintedEditor.getBounds === 'function'
-            ? hintedEditor
-            : noteEditorRef.current?.getEditor() as NoteEditorWriter | undefined;
+        const editor = (editorInstance || noteEditorRef.current?.getEditor()) as any;
         const wrapper = noteQuillWrapperRef.current;
         if (!editor || !wrapper || typeof editor.getBounds !== 'function') {
             setNoteMentionPopoverTop(null);
             return;
         }
+        try {
+            const bounds = editor.getBounds(activeDraft.startIndex + activeDraft.length, 0);
+            if (!bounds) {
+                setNoteMentionPopoverTop(null);
+                return;
+            }
+            const editorRect = editor.root.getBoundingClientRect();
+            const wrapperRect = wrapper.getBoundingClientRect();
+            const topWithinWrapper = editorRect.top - wrapperRect.top + bounds.top;
 
-        const bounds = editor.getBounds(activeDraft.startIndex + activeDraft.length, 0);
-        if (!bounds) {
+            setNoteMentionPopoverTop(Math.max(16, Math.round(topWithinWrapper)));
+        } catch {
             setNoteMentionPopoverTop(null);
-            return;
         }
-        const editorRect = editor.root.getBoundingClientRect();
-        const wrapperRect = wrapper.getBoundingClientRect();
-        const topWithinWrapper = editorRect.top - wrapperRect.top + bounds.top;
-
-        setNoteMentionPopoverTop(Math.max(16, Math.round(topWithinWrapper)));
     }, [noteMentionDraft, replyEditorTab]);
 
     const applyNoteMentionHighlights = useCallback(() => {
@@ -1001,7 +1004,7 @@ const InboxPage: React.FC = () => {
             return;
         }
 
-        const editor = editorInstance || noteEditorRef.current?.getEditor();
+        const editor = editorInstance || (noteEditorRef.current?.getEditor() as NoteEditorReader | undefined);
         if (!editor) return;
 
         const selection = editor.getSelection();
@@ -1042,7 +1045,7 @@ const InboxPage: React.FC = () => {
         value: string,
         _delta: unknown,
         _source: string,
-        editor: NoteEditorReader,
+        editor: any,
     ) => {
         setNoteHtml(value);
         if (replyEditorTab === 'note' && !isApplyingNoteMentionHighlightsRef.current) {
@@ -1087,16 +1090,20 @@ const InboxPage: React.FC = () => {
     useEffect(() => {
         const mqLg = window.matchMedia('(min-width: 1024px)');
         const mqXl = window.matchMedia('(min-width: 1280px)');
+        const mq2xl = window.matchMedia('(min-width: 1536px)');
         const sync = () => {
             setIsLg(mqLg.matches);
             setIsXl(mqXl.matches);
+            setIs2xl(mq2xl.matches);
         };
         sync();
         mqLg.addEventListener('change', sync);
         mqXl.addEventListener('change', sync);
+        mq2xl.addEventListener('change', sync);
         return () => {
             mqLg.removeEventListener('change', sync);
             mqXl.removeEventListener('change', sync);
+            mq2xl.removeEventListener('change', sync);
         };
     }, []);
 
@@ -2895,27 +2902,27 @@ const InboxPage: React.FC = () => {
                                 <button
                                     type="button"
                                     onClick={() => setOpenDropdown(openDropdown === 'mailbox-switcher' ? null : 'mailbox-switcher')}
-                                    className="w-full rounded-xl border border-[var(--color-card-border)] bg-white px-3 py-2 text-left text-[12px] text-[var(--color-text-primary)] shadow-sm"
+                                    className="w-full rounded-xl border border-(--color-card-border) bg-white px-3 py-2 text-left text-[12px] text-(--color-text-primary) shadow-sm"
                                 >
                                     <div className="flex items-start justify-between gap-2">
                                         <div className="min-w-0 flex items-start gap-2">
                                             <ProviderLogo provider={activeMailbox?.provider} className="h-4 w-4 shrink-0 mt-0.5" />
                                             <div className="min-w-0">
-                                                <div className="text-[12px] font-medium text-[var(--color-text-primary)] truncate whitespace-nowrap" title={getMailboxDisplayName(activeMailbox)}>
+                                                <div className="text-[12px] font-medium text-(--color-text-primary) truncate whitespace-nowrap" title={getMailboxDisplayName(activeMailbox)}>
                                                     {getMailboxDisplayName(activeMailbox)}
                                                 </div>
                                                 {getMailboxSecondaryEmail(activeMailbox) && (
-                                                    <div className="mt-0.5 text-[11px] text-[var(--color-text-muted)] truncate whitespace-nowrap" title={getMailboxSecondaryEmail(activeMailbox)}>
+                                                    <div className="mt-0.5 text-[11px] text-(--color-text-muted) truncate whitespace-nowrap" title={getMailboxSecondaryEmail(activeMailbox)}>
                                                         {getMailboxSecondaryEmail(activeMailbox)}
                                                     </div>
                                                 )}
                                             </div>
                                         </div>
-                                        <ChevronDown className={clsx('w-3 h-3 shrink-0 text-[var(--color-text-muted)] transition-transform mt-0.5', openDropdown === 'mailbox-switcher' && 'rotate-180')} />
+                                        <ChevronDown className={clsx('w-3 h-3 shrink-0 text-(--color-text-muted) transition-transform mt-0.5', openDropdown === 'mailbox-switcher' && 'rotate-180')} />
                                     </div>
                                 </button>
                                 {openDropdown === 'mailbox-switcher' && (
-                                    <div className="absolute left-3 right-3 top-full mt-1 z-50 rounded-xl border border-[var(--color-card-border)] bg-white py-1 shadow-lg">
+                                    <div className="absolute left-3 right-3 top-full mt-1 z-50 rounded-xl border border-(--color-card-border) bg-white py-1 shadow-lg">
                                         {mailboxes.map((mailbox) => {
                                             const isActive = String(mailbox.id) === String(activeMailboxId);
                                             return (
@@ -2932,8 +2939,8 @@ const InboxPage: React.FC = () => {
                                                     className={clsx(
                                                         'w-full flex items-start justify-between gap-2 px-3 py-2 text-left transition-colors',
                                                         isActive
-                                                            ? 'bg-[var(--color-background)] text-[var(--color-text-primary)]'
-                                                            : 'text-[var(--color-text-muted)] hover:bg-[var(--color-background)]/60 hover:text-[var(--color-text-primary)]'
+                                                            ? 'bg-(--color-background) text-(--color-text-primary)'
+                                                            : 'text-(--color-text-muted) hover:bg-(--color-background)/60 hover:text-(--color-text-primary)'
                                                     )}
                                                 >
                                                     <div className="min-w-0 flex items-start gap-2">
@@ -2949,8 +2956,8 @@ const InboxPage: React.FC = () => {
                                                             )}
                                                         </div>
                                                     </div>
-                                                    {mailbox.unreadCount > 0 && (
-                                                        <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-[var(--color-text-muted)] border-[var(--color-card-border)]/70">
+                                                    {(mailbox.unreadCount ?? 0) > 0 && (
+                                                        <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-(--color-text-muted) border-(--color-card-border)/70">
                                                             {mailbox.unreadCount}
                                                         </span>
                                                     )}
@@ -3012,7 +3019,7 @@ const InboxPage: React.FC = () => {
                     {/* Status */}
                     <div className="pt-3">
                         <button
-                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-[var(--color-text-muted)]/50 hover:text-[var(--color-text-primary)] transition-colors"
+                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-(--color-text-muted)/50 hover:text-(--color-text-primary) transition-colors"
                             onClick={() => setExpandedStatus(!expandedStatus)}
                         >
                             Status
@@ -3022,13 +3029,13 @@ const InboxPage: React.FC = () => {
                             <div className="px-3 pb-1.5 relative dropdown-container">
                                 <button
                                     onClick={() => setOpenDropdown(openDropdown === 'sidebar-status' ? null : 'sidebar-status')}
-                                    className="w-full text-[12px] border border-[var(--color-card-border)] rounded-lg px-2 py-1.5 bg-white text-[var(--color-text-primary)] flex items-center justify-between gap-2"
+                                    className="w-full text-[12px] border border-(--color-card-border) rounded-lg px-2 py-1.5 bg-white text-(--color-text-primary) flex items-center justify-between gap-2"
                                 >
                                     <span className="truncate capitalize">{formatSelectedStatusLabel(selectedStatus)}</span>
-                                    <ChevronDown className={clsx('w-3 h-3 shrink-0 text-[var(--color-text-muted)] transition-transform', openDropdown === 'sidebar-status' && 'rotate-180')} />
+                                    <ChevronDown className={clsx('w-3 h-3 shrink-0 text-(--color-text-muted) transition-transform', openDropdown === 'sidebar-status' && 'rotate-180')} />
                                 </button>
                                 {openDropdown === 'sidebar-status' && (
-                                    <div className="absolute left-3 right-3 top-full mt-1 z-50 rounded-xl border border-[var(--color-card-border)] bg-white py-1 shadow-lg">
+                                    <div className="absolute left-3 right-3 top-full mt-1 z-50 rounded-xl border border-(--color-card-border) bg-white py-1 shadow-lg">
                                         {statusFilterOptions.map((status) => (
                                             <button
                                                 key={status}
@@ -3036,10 +3043,10 @@ const InboxPage: React.FC = () => {
                                                     setSelectedStatus(status);
                                                     setOpenDropdown(null);
                                                 }}
-                                                className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
+                                                className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between"
                                             >
                                                 <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
-                                                {selectedStatus === status && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
+                                                {selectedStatus === status && <Check className="w-3.5 h-3.5 text-(--color-primary)" />}
                                             </button>
                                         ))}
                                     </div>
@@ -3051,7 +3058,7 @@ const InboxPage: React.FC = () => {
                     {/* More */}
                     <div className="pt-3">
                         <button
-                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-[var(--color-text-muted)]/50 hover:text-[var(--color-text-primary)] transition-colors"
+                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-(--color-text-muted)/50 hover:text-(--color-text-primary) transition-colors"
                             onClick={() => setExpandedMore(!expandedMore)}
                         >
                             Quick Filters
@@ -3081,12 +3088,12 @@ const InboxPage: React.FC = () => {
                         })}
                     </div>
 
-                    <div className="h-px bg-[var(--color-card-border)]/50 mx-3 my-2" />
+                    <div className="h-px bg-(--color-card-border)/50 mx-3 my-2" />
 
                     {/* Folders */}
                     <div className="pb-2">
                         <button
-                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-[var(--color-text-muted)]/60 hover:text-[var(--color-text-primary)] transition-colors"
+                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-(--color-text-muted)/60 hover:text-(--color-text-primary) transition-colors"
                             onClick={() => setExpandedFolders(!expandedFolders)}
                             style={{ fontFamily: 'var(--font-ui)' }}
                         >
@@ -3118,13 +3125,13 @@ const InboxPage: React.FC = () => {
                                                 <Icon className="w-4 h-4 shrink-0" />
                                                 <span className="truncate" style={{ fontFamily: 'var(--font-body)' }}>{folder.name}</span>
                                             </div>
-                                            {folder.unreadCount > 0 && (
+                                            {(folder.unreadCount ?? 0) > 0 && (
                                                 <span
                                                     className={clsx(
                                                         'ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border',
                                                         isActive
-                                                            ? 'bg-[var(--color-background)] text-[var(--color-text-primary)] border-[var(--color-card-border)]'
-                                                            : 'bg-white text-[var(--color-text-muted)] border-[var(--color-card-border)]/70'
+                                                            ? 'bg-(--color-background) text-(--color-text-primary)'
+                                                            : 'bg-white text-(--color-text-muted) border-(--color-card-border)/70'
                                                     )}
                                                     style={{ fontFamily: 'var(--font-ui)' }}
                                                 >
@@ -3140,7 +3147,7 @@ const InboxPage: React.FC = () => {
 
                     <div className="pb-2">
                         <button
-                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-[var(--color-text-muted)]/60 hover:text-[var(--color-text-primary)] transition-colors"
+                            className="w-full flex items-center justify-between px-3 mb-1 text-[9px] font-semibold uppercase tracking-wider text-(--color-text-muted)/60 hover:text-(--color-text-primary) transition-colors"
                             onClick={() => setExpandedTags(!expandedTags)}
                             style={{ fontFamily: 'var(--font-ui)' }}
                         >
@@ -3171,7 +3178,7 @@ const InboxPage: React.FC = () => {
                                                 <span className="truncate">{tagObj.name}</span>
                                             </div>
                                             {Number(tagCounts[tagObj.id] || 0) > 0 && (
-                                                <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-[var(--color-text-muted)] border-[var(--color-card-border)]/70">
+                                                <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-(--color-text-muted) border-(--color-card-border)/70">
                                                     {Number(tagCounts[tagObj.id] || 0)}
                                                 </span>
                                             )}
@@ -3179,7 +3186,7 @@ const InboxPage: React.FC = () => {
                                     );
                                 })}
                                 {personalTags.length > 0 && (
-                                    <p className="px-3 pt-2 pb-0.5 text-[10px] uppercase tracking-wider text-[var(--color-text-muted)]/70">Personal</p>
+                                    <p className="px-3 pt-2 pb-0.5 text-[10px] uppercase tracking-wider text-(--color-text-muted)/70">Personal</p>
                                 )}
                                 {personalTags.map((tagObj: any) => {
                                     const isActive = activeSidebarItem.kind === 'tag' && activeSidebarItem.id === tagObj.id;
@@ -3203,7 +3210,7 @@ const InboxPage: React.FC = () => {
                                                 <span className="truncate">{tagObj.name}</span>
                                             </div>
                                             {Number(tagCounts[tagObj.id] || 0) > 0 && (
-                                                <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-[var(--color-text-muted)] border-[var(--color-card-border)]/70">
+                                                <span className="ml-2 min-w-5 px-1.5 py-0.5 rounded-full text-[10px] leading-none border bg-white text-(--color-text-muted) border-(--color-card-border)/70">
                                                     {Number(tagCounts[tagObj.id] || 0)}
                                                 </span>
                                             )}
@@ -3216,24 +3223,24 @@ const InboxPage: React.FC = () => {
 
                 </nav>
                 {/* Pagination Controls */}
-                <div className="flex items-center justify-between gap-3 px-4 py-3 bg-[var(--color-background)] shrink-0">
+                <div className="flex items-center justify-between gap-3 px-4 py-3 bg-(--color-background) shrink-0">
                     <div className="flex-1 flex items-center justify-start">
                         <div className="inline-grid grid-cols-[28px_auto_28px] items-center gap-1">
                             <button
                                 onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
                                 disabled={currentPage === 1}
-                                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)]/70 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background)/70 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                                 aria-label="Previous page"
                             >
                                 <ChevronLeft className="w-3.5 h-3.5" />
                             </button>
-                            <span className="px-0.5 text-center text-sm font-semibold text-[var(--color-text-primary)]">
+                            <span className="px-0.5 text-center text-sm font-semibold text-(--color-text-primary)">
                                 {currentPage}/{Math.max(1, totalPages)}
                             </span>
                             <button
                                 onClick={() => setCurrentPage(prev => Math.min(Math.max(1, totalPages), prev + 1))}
                                 disabled={currentPage >= Math.max(1, totalPages)}
-                                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)]/70 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                                className="inline-flex h-7 w-7 items-center justify-center rounded-md text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background)/70 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                                 aria-label="Next page"
                             >
                                 <ChevronRight className="w-3.5 h-3.5" />
@@ -3245,7 +3252,7 @@ const InboxPage: React.FC = () => {
                         <button
                             type="button"
                             onClick={() => setIsSplitMode(prev => !prev)}
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-[var(--color-card-border)] bg-white text-[var(--color-text-primary)] hover:bg-[var(--color-background)] transition-colors"
+                            className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-(--color-card-border) bg-white text-(--color-text-primary) hover:bg-(--color-background) transition-colors"
                             aria-label={splitPanelLabel}
                             title={splitPanelLabel}
                         >
@@ -3260,7 +3267,7 @@ const InboxPage: React.FC = () => {
             {/* ── Main Content ── */}
             {showInitialInboxSkeleton ? (
                 <div className="flex-1 flex overflow-hidden bg-white">
-                    <div className="hidden md:flex w-[24rem] max-w-[38vw] shrink-0 border-r border-[var(--color-card-border)]">
+                    <div className="hidden md:flex w-[24rem] max-w-[38vw] shrink-0 border-r border-(--color-card-border)">
                         <InboxThreadListSkeleton />
                     </div>
                     <div className="flex-1 flex overflow-hidden bg-white">
@@ -3268,15 +3275,15 @@ const InboxPage: React.FC = () => {
                     </div>
                 </div>
             ) : hasAttachedMailbox === false ? (
-                <div className="flex-1 flex items-center justify-center bg-[var(--color-background)]/20 px-6">
+                <div className="flex-1 flex items-center justify-center bg-(--color-background)/20 px-6">
                     <div className="max-w-md text-center">
-                        <InboxIcon className="w-10 h-10 opacity-20 mx-auto mb-3 text-[var(--color-text-muted)]" />
-                        <p className="text-sm font-semibold text-[var(--color-text-primary)]">No mailbox attached</p>
-                        <p className="text-xs text-[var(--color-text-muted)] mt-1">Attach a mailbox to start viewing and replying to threads.</p>
+                        <InboxIcon className="w-10 h-10 opacity-20 mx-auto mb-3 text-(--color-text-muted)" />
+                        <p className="text-sm font-semibold text-(--color-text-primary)">No mailbox attached</p>
+                        <p className="text-xs text-(--color-text-muted) mt-1">Attach a mailbox to start viewing and replying to threads.</p>
                         <button
                             type="button"
                             onClick={() => navigate('/settings/organization?tab=mailboxes')}
-                            className="mt-4 px-3.5 py-2 bg-white border border-[var(--color-card-border)] rounded-lg text-[13px] font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-background)] transition-colors shadow-sm"
+                            className="mt-4 px-3.5 py-2 bg-white border border-(--color-card-border) rounded-lg text-[13px] font-medium text-(--color-text-primary) hover:bg-(--color-background) transition-colors shadow-sm"
                         >
                             Go to Mailboxes
                         </button>
@@ -3286,40 +3293,40 @@ const InboxPage: React.FC = () => {
                 /* Thread Detail View */
                 <div className="flex-1 flex overflow-hidden">
                     {isSplitMode && (
-                        <div className={`${(!isLg && !actualOpenThread) ? 'flex' : 'hidden xl:flex'} w-full xl:w-[25rem] xl:max-w-[34vw] shrink-0 flex-col border-r border-[var(--color-card-border)] bg-white text-[var(--color-text-primary)]`}>
+                        <div className={`${(!isLg && !actualOpenThread) ? 'flex' : 'hidden xl:flex'} w-full xl:w-[25rem] xl:max-w-[34vw] shrink-0 flex-col border-r border-(--color-card-border) bg-white text-(--color-text-primary)`}>
                             {/* Search Row */}
-                            <div className="px-4 py-3 border-b border-[var(--color-card-border)]">
+                            <div className="px-4 py-3 border-b border-(--color-card-border)">
                                 <div className="relative">
-                                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)]" />
+                                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-(--color-text-muted)" />
                                     <input
                                         type="text"
                                         placeholder="Search threads..."
                                         value={searchTerm}
                                         onChange={e => setSearchTerm(e.target.value)}
-                                        className="w-full pl-8 pr-3 py-1.5 text-[13px] border border-[var(--color-card-border)] rounded-lg focus:ring-2 focus:ring-[var(--color-primary)]/20 focus:outline-none"
+                                        className="w-full pl-8 pr-3 py-1.5 text-[13px] border border-(--color-card-border) rounded-lg focus:ring-2 focus:ring-(--color-primary)/20 focus:outline-none"
                                     />
                                 </div>
                             </div>
 
                             {/* Filters Row */}
-                            <div className="px-3 py-2.5 border-b border-[var(--color-card-border)] flex items-center gap-2 flex-wrap">
+                            <div className="px-3 py-2.5 border-b border-(--color-card-border) flex items-center gap-2 flex-wrap">
                                 {/* All Tags */}
                                 <div className="relative dropdown-container">
                                     <button
                                         onClick={() => setOpenDropdown(openDropdown === 'split-tags' ? null : 'split-tags')}
                                         className={clsx(
-                                            "relative appearance-none pl-7 pr-7 py-1 text-[11px] font-medium border border-[var(--color-card-border)] rounded-lg bg-white shadow-sm cursor-pointer transition-colors flex items-center h-[28px]",
+                                            "relative appearance-none pl-7 pr-7 py-1 text-[11px] font-medium border border-(--color-card-border) rounded-lg bg-white shadow-sm cursor-pointer transition-colors flex items-center h-[28px]",
                                             openDropdown === 'split-tags'
-                                                ? "bg-[var(--color-background)] text-[var(--color-text-primary)]"
-                                                : "hover:bg-[var(--color-background)] text-[var(--color-text-primary)]"
+                                                ? "bg-(--color-background) text-(--color-text-primary)"
+                                                : "hover:bg-(--color-background) text-(--color-text-primary)"
                                         )}
                                     >
-                                        <Tag className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)] pointer-events-none" />
+                                        <Tag className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-(--color-text-muted) pointer-events-none" />
                                         <span className="truncate max-w-[80px]">{activeTagName ?? 'All Tags'}</span>
-                                        <ChevronDown className={clsx("w-3 h-3 absolute right-1.5 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)] transition-transform pointer-events-none", openDropdown === 'split-tags' && "rotate-180")} />
+                                        <ChevronDown className={clsx("w-3 h-3 absolute right-1.5 top-1/2 -translate-y-1/2 text-(--color-text-muted) transition-transform pointer-events-none", openDropdown === 'split-tags' && "rotate-180")} />
                                     </button>
                                     {openDropdown === 'split-tags' && (
-                                        <div className="absolute left-0 top-full mt-1 w-48 bg-white border border-[var(--color-card-border)] rounded-xl shadow-lg z-50 py-1 origin-top-left animate-in fade-in slide-in-from-top-2 duration-150">
+                                        <div className="absolute left-0 top-full mt-1 w-48 bg-white border border-(--color-card-border) rounded-xl shadow-lg z-50 py-1 origin-top-left animate-in fade-in slide-in-from-top-2 duration-150">
                                             <button
                                                 onClick={() => {
                                                     setActiveTagId(null);
@@ -3331,12 +3338,12 @@ const InboxPage: React.FC = () => {
                                                     }
                                                     setOpenDropdown(null);
                                                 }}
-                                                className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between font-medium text-[var(--color-text-primary)]"
+                                                className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between font-medium text-(--color-text-primary)"
                                             >
                                                 All Tags
-                                                {!activeTagId && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
+                                                {!activeTagId && <Check className="w-3.5 h-3.5 text-(--color-primary)" />}
                                             </button>
-                                            <div className="h-px bg-[var(--color-card-border)]/50 mx-2 my-1" />
+                                            <div className="h-px bg-(--color-card-border)/50 mx-2 my-1" />
                                             {apiTags.map((tagObj: any) => (
                                                 <button
                                                     key={tagObj.id}
@@ -3353,13 +3360,13 @@ const InboxPage: React.FC = () => {
                                                         );
                                                         setOpenDropdown(null);
                                                     }}
-                                                    className="w-full text-left px-3 py-2 text-sm text-[var(--color-text-primary)] hover:bg-[var(--color-background)] flex justify-between items-center"
+                                                    className="w-full text-left px-3 py-2 text-sm text-(--color-text-primary) hover:bg-(--color-background) flex justify-between items-center"
                                                 >
                                                     <div className="flex items-center gap-2">
                                                         <span className="w-2 h-2 rounded-full" style={{ backgroundColor: tagObj.color || 'var(--color-primary)' }}></span>
                                                         {tagObj.name}
                                                     </div>
-                                                    {activeTagId === tagObj.id && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
+                                                    {activeTagId === tagObj.id && <Check className="w-3.5 h-3.5 text-(--color-primary)" />}
                                                 </button>
                                             ))}
                                         </div>
@@ -3371,17 +3378,17 @@ const InboxPage: React.FC = () => {
                                     <button
                                         onClick={() => setOpenDropdown(openDropdown === 'split-status' ? null : 'split-status')}
                                         className={clsx(
-                                            'relative appearance-none pl-3 pr-7 py-1 text-[11px] font-medium border border-[var(--color-card-border)] rounded-lg bg-white shadow-sm cursor-pointer transition-colors flex items-center h-[28px]',
+                                            'relative appearance-none pl-3 pr-7 py-1 text-[11px] font-medium border border-(--color-card-border) rounded-lg bg-white shadow-sm cursor-pointer transition-colors flex items-center h-[28px]',
                                             openDropdown === 'split-status'
-                                                ? 'bg-[var(--color-background)] text-[var(--color-text-primary)]'
-                                                : 'hover:bg-[var(--color-background)] text-[var(--color-text-primary)]'
+                                                ? 'bg-(--color-background) text-(--color-text-primary)'
+                                                : 'hover:bg-(--color-background) text-(--color-text-primary)'
                                         )}
                                     >
                                         <span className="truncate">Status: {formatSelectedStatusLabel(selectedStatus)}</span>
-                                        <ChevronDown className={clsx('w-3 h-3 absolute right-1.5 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)] transition-transform pointer-events-none', openDropdown === 'split-status' && 'rotate-180')} />
+                                        <ChevronDown className={clsx('w-3 h-3 absolute right-1.5 top-1/2 -translate-y-1/2 text-(--color-text-muted) transition-transform pointer-events-none', openDropdown === 'split-status' && 'rotate-180')} />
                                     </button>
                                     {openDropdown === 'split-status' && (
-                                        <div className="absolute left-0 top-full mt-1 w-40 bg-white border border-[var(--color-card-border)] rounded-xl shadow-lg z-50 py-1 origin-top animate-in fade-in slide-in-from-top-2 duration-150">
+                                        <div className="absolute left-0 top-full mt-1 w-40 bg-white border border-(--color-card-border) rounded-xl shadow-lg z-50 py-1 origin-top animate-in fade-in slide-in-from-top-2 duration-150">
                                             {statusFilterOptions.map(status => (
                                                 <button
                                                     key={status}
@@ -3389,10 +3396,10 @@ const InboxPage: React.FC = () => {
                                                         setSelectedStatus(status);
                                                         setOpenDropdown(null);
                                                     }}
-                                                    className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
+                                                    className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between"
                                                 >
                                                     <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
-                                                    {selectedStatus === status && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
+                                                    {selectedStatus === status && <Check className="w-3.5 h-3.5 text-(--color-primary)" />}
                                                 </button>
                                             ))}
                                         </div>
@@ -3402,7 +3409,7 @@ const InboxPage: React.FC = () => {
                                 <div className="ml-auto">
                                     <button
                                         onClick={() => setIsComposeOpen(true)}
-                                        className="flex items-center gap-1 px-2.5 py-1 bg-[var(--color-cta-primary)] text-white text-[11px] font-medium rounded-lg hover:bg-[var(--color-cta-secondary)] transition-colors shadow-sm h-[28px]"
+                                        className="flex items-center gap-1 px-2.5 py-1 bg-(--color-cta-primary) text-white text-[11px] font-medium rounded-lg hover:bg-(--color-cta-secondary) transition-colors shadow-sm h-[28px]"
                                     >
                                         <Plus className="w-3 h-3" />
                                         Compose
@@ -3420,12 +3427,12 @@ const InboxPage: React.FC = () => {
                                             className={clsx(
                                                 'w-full text-left rounded-xl border p-3 transition-colors',
                                                 isCurrentThread
-                                                    ? 'border-[var(--color-primary)]/40 bg-[var(--color-background)]'
-                                                    : 'border-[var(--color-card-border)] bg-white hover:border-[var(--color-primary)]/30 hover:bg-[var(--color-background)]/40'
+                                                    ? 'border-(--color-primary)/40 bg-(--color-background)'
+                                                    : 'border-(--color-card-border) bg-white hover:border-(--color-primary)/30 hover:bg-(--color-background)/40'
                                             )}
                                         >
                                             <div className="flex items-center justify-between gap-2">
-                                                <span className="text-[12px] font-semibold text-[var(--color-text-primary)] truncate">{thread.from.split('@')[0]}</span>
+                                                <span className="text-[12px] font-semibold text-(--color-text-primary) truncate">{thread.from.split('@')[0]}</span>
                                                 <div className="flex items-center gap-1.5 shrink-0">
                                                     <span
                                                         role="button"
@@ -3442,18 +3449,18 @@ const InboxPage: React.FC = () => {
                                                                 handleToggleStar(thread.id).catch(console.error);
                                                             }
                                                         }}
-                                                        className="p-1 rounded-md hover:bg-[var(--color-background)] text-[var(--color-text-muted)]"
+                                                        className="p-1 rounded-md hover:bg-(--color-background) text-(--color-text-muted)"
                                                         title={thread.starred ? 'Unstar thread' : 'Star thread'}
                                                     >
                                                         <Star className={clsx('w-3.5 h-3.5', thread.starred && 'fill-yellow-400 text-yellow-500')} />
                                                     </span>
-                                                    <span className="text-[10px] text-[var(--color-text-muted)]">
+                                                    <span className="text-[10px] text-(--color-text-muted)">
                                                         {formatThreadListTimestamp(thread.time)}
                                                     </span>
                                                 </div>
                                             </div>
-                                            <div className="mt-1 text-[13px] font-medium text-[var(--color-text-primary)] truncate">{thread.subject}</div>
-                                            <div className="mt-1 text-[11px] text-[var(--color-text-muted)] truncate">{thread.snippet}</div>
+                                            <div className="mt-1 text-[13px] font-medium text-(--color-text-primary) truncate">{thread.subject}</div>
+                                            <div className="mt-1 text-[11px] text-(--color-text-muted) truncate">{thread.snippet}</div>
                                             <div className="mt-2 flex items-center justify-between gap-2">
                                                 <div className="flex items-center gap-2">
                                                     {thread.latestMessageIsScheduled && (
@@ -3461,14 +3468,14 @@ const InboxPage: React.FC = () => {
                                                             Scheduled
                                                         </span>
                                                     )}
-                                                    <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">{statusMap[thread.status]?.label || thread.status}</span>
+                                                    <span className="text-[10px] uppercase tracking-wide text-(--color-text-muted)">{statusMap[thread.status]?.label || thread.status}</span>
                                                     {Number(thread.noteCount || 0) > 0 && (
-                                                        <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/60">
+                                                        <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-(--color-card-border) text-(--color-text-muted) bg-(--color-background)/60">
                                                             {thread.noteCount} notes
                                                         </span>
                                                     )}
                                                 </div>
-                                                <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-primary)]/50" />
+                                                <span className="h-1.5 w-1.5 rounded-full bg-(--color-primary)/50" />
                                             </div>
                                         </button>
                                     );
@@ -3480,25 +3487,25 @@ const InboxPage: React.FC = () => {
                     {actualOpenThread ? (
                         <>
                             {/* Main Chat Column */}
-                            <div className="flex-1 flex flex-col min-w-0 border-r border-[var(--color-card-border)] bg-white">
+                            <div className="flex-1 flex flex-col min-w-0 border-r border-(--color-card-border) bg-white">
                         {/* Meta bar */}
-                        <div className="px-3 sm:px-5 py-2.5 border-b border-[var(--color-card-border)] bg-white flex flex-col gap-2 shrink-0">
+                        <div className="px-3 sm:px-5 py-2.5 border-b border-(--color-card-border) bg-white flex flex-col gap-2 shrink-0">
                             {/* Row 1: back arrow + title + status */}
                             <div className="flex items-center gap-2 min-w-0">
                                 {(!isSplitMode || !isLg) && (
                                     <button
                                         onClick={() => navigate('/inbox')}
-                                        className="p-1.5 -ml-1 rounded-lg text-[var(--color-text-muted)] hover:bg-[var(--color-background)] hover:text-[var(--color-text-primary)] transition-colors shrink-0"
+                                        className="p-1.5 -ml-1 rounded-lg text-(--color-text-muted) hover:bg-(--color-background) hover:text-(--color-text-primary) transition-colors shrink-0"
                                         title="Back to Inbox"
                                     >
                                         <ArrowLeft className="w-4 h-4" />
                                     </button>
                                 )}
                                 <div className="flex-1 min-w-0">
-                                    <h2 className="text-[15px] font-bold truncate text-[var(--color-text-primary)]">
+                                    <h2 className="text-[15px] font-bold truncate text-(--color-text-primary)">
                                         {actualOpenThread.subject || 'Urgent Shipping Availability'}
                                     </h2>
-                                    <p className="text-[11px] truncate mt-0.5 text-[var(--color-text-muted)]">
+                                    <p className="text-[11px] truncate mt-0.5 text-(--color-text-muted)">
                                         From {actualOpenThread.from} to support@sermuno.com
                                     </p>
                                     <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
@@ -3509,13 +3516,13 @@ const InboxPage: React.FC = () => {
                                                     ? 'border-red-200 text-red-700 bg-red-50'
                                                     : actualOpenThread.priority === 'normal'
                                                         ? 'border-amber-200 text-amber-700 bg-amber-50'
-                                                        : 'border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/50'
+                                                        : 'border-(--color-card-border) text-(--color-text-muted) bg-(--color-background)/50'
                                             )}>
                                                 Priority: {String(actualOpenThread.priority).toUpperCase()}
                                             </span>
                                         )}
                                         {actualOpenThread.assignedTeamName && (
-                                            <span className="px-1.5 py-0.5 rounded-md text-[10px] border border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/50">
+                                            <span className="px-1.5 py-0.5 rounded-md text-[10px] border border-(--color-card-border) text-(--color-text-muted) bg-(--color-background)/50">
                                                 Team: {actualOpenThread.assignedTeamName}
                                             </span>
                                         )}
@@ -3535,7 +3542,7 @@ const InboxPage: React.FC = () => {
                                             </span>
                                         )}
                                         {Number(actualOpenThread.noteCount || 0) > 0 && (
-                                            <span className="px-1.5 py-0.5 rounded-md text-[10px] border border-[var(--color-card-border)] text-[var(--color-text-muted)] bg-[var(--color-background)]/50">
+                                            <span className="px-1.5 py-0.5 rounded-md text-[10px] border border-(--color-card-border) text-(--color-text-muted) bg-(--color-background)/50">
                                                 Notes: {Number(actualOpenThread.noteCount || 0)}
                                             </span>
                                         )}
@@ -3545,7 +3552,7 @@ const InboxPage: React.FC = () => {
                                     <div className="relative dropdown-container">
                                         <button
                                             onClick={() => setOpenDropdown(openDropdown === 'status' ? null : 'status')}
-                                            className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium border border-[var(--color-card-border)] rounded-lg hover:bg-[var(--color-background)] transition-colors text-[var(--color-text-primary)] shadow-sm bg-white"
+                                            className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium border border-(--color-card-border) rounded-lg hover:bg-(--color-background) transition-colors text-(--color-text-primary) shadow-sm bg-white"
                                         >
                                             <Check className="w-3.5 h-3.5" />
                                             Mark as...
@@ -3553,15 +3560,15 @@ const InboxPage: React.FC = () => {
                                         </button>
 
                                         {openDropdown === 'status' && (
-                                            <div className="absolute left-0 top-full mt-1 w-48 bg-white border border-[var(--color-card-border)] rounded-xl shadow-lg z-50 py-1 origin-top-left animate-in fade-in slide-in-from-top-2 duration-150">
+                                            <div className="absolute left-0 top-full mt-1 w-48 bg-white border border-(--color-card-border) rounded-xl shadow-lg z-50 py-1 origin-top-left animate-in fade-in slide-in-from-top-2 duration-150">
                                                 {['new', 'in_progress', 'waiting', 'done', 'archived'].map(status => (
                                                     <button
                                                         key={status}
                                                         onClick={() => handleStatusChange(actualOpenThread.id, status).catch(console.error)}
-                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
+                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between"
                                                     >
                                                 <span className="capitalize">{formatSelectedStatusLabel(status)}</span>
-                                                        {actualOpenThread.status === status && <Check className="w-3 h-3 text-[var(--color-primary)]" />}
+                                                        {actualOpenThread.status === status && <Check className="w-3 h-3 text-(--color-primary)" />}
                                                     </button>
                                                 ))}
                                             </div>
@@ -3570,7 +3577,7 @@ const InboxPage: React.FC = () => {
                                     <div className="relative dropdown-container">
                                         <button
                                             onClick={() => setOpenDropdown(openDropdown === 'snooze' ? null : 'snooze')}
-                                            className="flex items-center justify-center p-1.5 border border-[var(--color-card-border)] rounded-lg hover:bg-[var(--color-background)] transition-colors text-[var(--color-text-muted)] shadow-sm bg-white"
+                                            className="flex items-center justify-center p-1.5 border border-(--color-card-border) rounded-lg hover:bg-(--color-background) transition-colors text-(--color-text-muted) shadow-sm bg-white"
                                             title="Snooze"
                                         >
                                             <Clock className="w-4 h-4" />
@@ -3579,7 +3586,7 @@ const InboxPage: React.FC = () => {
                                         {openDropdown === 'snooze' && (
                                             <div
                                                 className={clsx(
-                                                    "absolute top-full mt-1 bg-white border border-[var(--color-card-border)] rounded-xl shadow-lg z-50 py-1 origin-top-left animate-in fade-in slide-in-from-top-2 duration-150 sm:left-0 left-1/2 sm:transform-none -translate-x-1/2",
+                                                    "absolute top-full mt-1 bg-white border border-(--color-card-border) rounded-xl shadow-lg z-50 py-1 origin-top-left animate-in fade-in slide-in-from-top-2 duration-150 sm:left-0 left-1/2 sm:transform-none -translate-x-1/2",
                                                     showCustomSnoozeDatePicker ? "w-[min(18rem,calc(100vw-2rem))]" : "w-56"
                                                 )}
                                             >
@@ -3609,14 +3616,14 @@ const InboxPage: React.FC = () => {
                                                             }
                                                             handleSnooze(actualOpenThread.id, targetDate).catch(console.error);
                                                         }}
-                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between text-[var(--color-text-primary)]"
+                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between text-(--color-text-primary)"
                                                     >
                                                         {preset.label}
                                                     </button>
                                                 ))}
                                                 {showCustomSnoozeDatePicker && (
                                                     <div className="px-2 pb-2 pt-1 w-full">
-                                                        <div className="rounded-xl border border-[var(--color-card-border)] bg-[var(--color-background)]/60 p-2 max-w-full overflow-hidden">
+                                                        <div className="rounded-xl border border-(--color-card-border) bg-(--color-background)/60 p-2 max-w-full overflow-hidden">
                                                             <SaasCalendarPicker
                                                                 value={customSnoozeDate}
                                                                 onChange={setCustomSnoozeDate}
@@ -3627,7 +3634,7 @@ const InboxPage: React.FC = () => {
                                                             <button
                                                                 type="button"
                                                                 onClick={() => setShowCustomSnoozeDatePicker(false)}
-                                                                className="px-2.5 py-1 rounded-md text-[11px] font-medium border border-[var(--color-card-border)] text-[var(--color-text-primary)] hover:bg-white"
+                                                                className="px-2.5 py-1 rounded-md text-[11px] font-medium border border-(--color-card-border) text-(--color-text-primary) hover:bg-white"
                                                             >
                                                                 Cancel
                                                             </button>
@@ -3640,14 +3647,14 @@ const InboxPage: React.FC = () => {
                                                                     setCustomSnoozeDate(null);
                                                                     setShowCustomSnoozeDatePicker(false);
                                                                 }}
-                                                                className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-[var(--color-cta-primary)] text-white hover:bg-[var(--color-cta-secondary)] disabled:opacity-60"
+                                                                className="px-2.5 py-1 rounded-md text-[11px] font-medium bg-(--color-cta-primary) text-white hover:bg-(--color-cta-secondary) disabled:opacity-60"
                                                             >
                                                                 Apply
                                                             </button>
                                                         </div>
                                                     </div>
                                                 )}
-                                                <div className="h-px bg-[var(--color-card-border)] my-1"></div>
+                                                <div className="h-px bg-(--color-card-border) my-1"></div>
                                                 <button
                                                     onClick={() => handleSnooze(actualOpenThread.id, null).catch(console.error)}
                                                     className="w-full text-left px-3 py-2 text-[13px] hover:bg-orange-50 text-orange-600 transition-colors flex items-center justify-between"
@@ -3664,37 +3671,47 @@ const InboxPage: React.FC = () => {
                                             aria-label="Thread actions"
                                             data-testid="thread-actions-menu"
                                             className={clsx(
-                                        "p-1.5 border border-[var(--color-card-border)] rounded-lg hover:bg-[var(--color-background)] transition-colors text-[var(--color-text-muted)] shadow-sm bg-white",
-                                        openDropdown === 'more' && "bg-[var(--color-background)] text-[var(--color-text-primary)]"
+                                        "p-1.5 border border-(--color-card-border) rounded-lg hover:bg-(--color-background) transition-colors text-(--color-text-muted) shadow-sm bg-white",
+                                        openDropdown === 'more' && "bg-(--color-background) text-(--color-text-primary)"
                                     )}
                                             >
                                                 <MoreHorizontal className="w-4 h-4" />
                                             </button>
                                             {openDropdown === 'more' && actualOpenThread && (
-                                                <div className="absolute right-0 top-full mt-1 w-48 bg-white border border-[var(--color-card-border)] rounded-xl shadow-lg z-50 py-1">
+                                                <div className="absolute right-0 top-full mt-1 w-48 bg-white border border-(--color-card-border) rounded-xl shadow-lg z-50 py-1">
                                                     <button
                                                         onClick={() => handleToggleStar(actualOpenThread.id).catch(console.error)}
-                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
+                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between"
                                                     >
                                                         <span>{actualOpenThread.starred ? 'Remove star' : 'Star thread'}</span>
                                                         <Star className={clsx('w-3.5 h-3.5', actualOpenThread.starred && 'fill-yellow-400 text-yellow-500')} />
                                                     </button>
                                                     <button
                                                         onClick={() => handleSetThreadReadState(actualOpenThread.id, actualOpenThread.unreadCount > 0).catch(console.error)}
-                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors"
+                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors"
                                                     >
                                                         {actualOpenThread.unreadCount > 0 ? 'Mark as read' : 'Mark as unread'}
                                                     </button>
                                                     <button
                                                         onClick={() => handleToggleArchive(actualOpenThread.id, actualOpenThread.status === 'archived').catch(console.error)}
-                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors"
+                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors"
                                                     >
                                                         {actualOpenThread.status === 'archived' ? 'Unarchive thread' : 'Archive thread'}
                                                     </button>
                                                 </div>
                                             )}
                                         </div>
-                                </div>
+                                        <button
+                                            onClick={() => setShowDetails(!showDetails)}
+                                            className={clsx(
+                                                "p-1.5 border border-(--color-card-border) rounded-lg hover:bg-(--color-background) transition-colors text-(--color-text-muted) shadow-sm bg-white",
+                                                showDetails && "bg-(--color-background) text-(--color-text-primary) border-(--color-primary)/30"
+                                            )}
+                                            title={showDetails ? "Hide thread details" : "Show thread details"}
+                                        >
+                                            <PanelRight className="w-4 h-4" />
+                                        </button>
+                                    </div>
                             </div>
                         </div>
 
@@ -3718,13 +3735,13 @@ const InboxPage: React.FC = () => {
                                                 {isInternalNote && noteAvatarUrl ? (
                                                     <img src={noteAvatarUrl} alt={msg.user?.fullName || user?.fullName || 'Note author'} className="w-full h-full rounded-full object-cover" />
                                                 ) : (
-                                                    <User className="w-3 h-3 text-[var(--color-primary)]" />
+                                                    <User className="w-3 h-3 text-(--color-primary)" />
                                                 )}
                                             </div>
-                                            <span className="text-[13px] font-semibold text-[var(--color-text-primary)]">
+                                            <span className="text-[13px] font-semibold text-(--color-text-primary)">
                                                 {isInternalNote ? 'Internal Note' : (isOutbound ? 'Me' : msg.fromEmail.split('@')[0])}
                                             </span>
-                                            <span className="text-[11px] text-[var(--color-text-muted)]">
+                                            <span className="text-[11px] text-(--color-text-muted)">
                                                 {new Date(msg.createdAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                                             </span>
                                             {isScheduledPending && (
@@ -3736,7 +3753,7 @@ const InboxPage: React.FC = () => {
                                                 <button
                                                     type="button"
                                                     onClick={() => handleToggleStar(String(actualOpenThread.id)).catch(console.error)}
-                                                    className="p-1 rounded-md border border-[var(--color-card-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)]"
+                                                    className="p-1 rounded-md border border-(--color-card-border) text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background)"
                                                     title={actualOpenThread.starred ? 'Unstar thread' : 'Star thread'}
                                                 >
                                                     <Star className={clsx('w-3 h-3', actualOpenThread.starred && 'fill-yellow-400 text-yellow-500')} />
@@ -3746,7 +3763,7 @@ const InboxPage: React.FC = () => {
                                                 <button
                                                     type="button"
                                                     onClick={() => handleToggleMessageReadState(String(msg.id), isRead).catch(console.error)}
-                                                    className="px-1.5 py-0.5 text-[10px] rounded border border-[var(--color-card-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)]"
+                                                    className="px-1.5 py-0.5 text-[10px] rounded border border-(--color-card-border) text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background)"
                                                 >
                                                     {isRead ? 'Mark unread' : 'Mark read'}
                                                 </button>
@@ -3756,10 +3773,10 @@ const InboxPage: React.FC = () => {
                                             <div className={clsx(
                                                 'relative rounded-2xl p-4 text-[13px] leading-relaxed shadow-sm',
                                                 isInternalNote
-                                                    ? 'bg-[#fffbec] border border-[#fae8b7] text-[var(--color-text-primary)] rounded-tr-sm pr-10'
+                                                    ? 'bg-[#fffbec] border border-[#fae8b7] text-(--color-text-primary) rounded-tr-sm pr-10'
                                                     : isOutbound
-                                                    ? 'bg-[var(--color-primary)]/10 border border-[var(--color-primary)]/20 text-[var(--color-text-primary)] rounded-tr-sm'
-                                                    : 'bg-white border border-[var(--color-card-border)] text-[var(--color-text-primary)] rounded-tl-sm'
+                                                    ? 'bg-(--color-primary)/10 border border-(--color-primary)/20 text-(--color-text-primary) rounded-tr-sm'
+                                                    : 'bg-white border border-(--color-card-border) text-(--color-text-primary) rounded-tl-sm'
                                             )}>
                                                 {isScheduledPending && (
                                                     <p className="mb-2 text-[11px] font-medium text-amber-700">
@@ -3772,16 +3789,16 @@ const InboxPage: React.FC = () => {
                                                             onClick={() => setOpenDropdown(openDropdown === `note-menu-${msg.id}` ? null : `note-menu-${msg.id}`)}
                                                             className="p-1 rounded hover:bg-[#fae8b7] transition-colors"
                                                         >
-                                                            <MoreHorizontal className="w-4 h-4 text-[var(--color-text-muted)]" />
+                                                            <MoreHorizontal className="w-4 h-4 text-(--color-text-muted)" />
                                                         </button>
                                                         {openDropdown === `note-menu-${msg.id}` && (
-                                                            <div className="absolute right-0 bottom-full mb-1 w-32 bg-white border border-[var(--color-card-border)] rounded-lg shadow-lg z-50 py-1">
+                                                            <div className="absolute right-0 bottom-full mb-1 w-32 bg-white border border-(--color-card-border) rounded-lg shadow-lg z-50 py-1">
                                                                 <button
                                                                     onClick={() => {
                                                                         handleEditNote(msg.id, msg.bodyText);
                                                                         setOpenDropdown(null);
                                                                     }}
-                                                                    className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors"
+                                                                    className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors"
                                                                 >
                                                                     Edit
                                                                 </button>
@@ -3816,7 +3833,7 @@ const InboxPage: React.FC = () => {
                                                                 key={String(attachment?.id || `${msg.id}-${index}`)}
                                                                 type="button"
                                                                 onClick={() => handleDownloadAttachment(String(msg.id), attachment)}
-                                                                className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-md border border-[var(--color-card-border)] bg-white hover:bg-[var(--color-background)] text-[var(--color-text-muted)]"
+                                                                className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-md border border-(--color-card-border) bg-white hover:bg-(--color-background) text-(--color-text-muted)"
                                                             >
                                                                 <Paperclip className="w-3 h-3" />
                                                                 <span className="max-w-[180px] truncate">{attachment?.filename || `Attachment ${index + 1}`}</span>
@@ -3831,7 +3848,7 @@ const InboxPage: React.FC = () => {
                                 )
                             })}
                             {localMessages.length === 0 && (
-                                <div className="text-center text-[var(--color-text-muted)] py-8">
+                                <div className="text-center text-(--color-text-muted) py-8">
                                     <p className="text-sm">No messages loaded for this thread preview.</p>
                                 </div>
                             )}
@@ -3839,11 +3856,11 @@ const InboxPage: React.FC = () => {
                         </div>
 
                         {/* Reply editor */}
-                        <div className="px-4 pb-4 shrink-0 bg-[var(--color-background)]/30">
+                        <div className="px-4 pb-4 shrink-0 bg-(--color-background)/30">
                         {/* Collapsed bar */}
                         {!isReplyExpanded ? (
                             <div
-                                className="flex items-center gap-3 h-11 px-4 rounded-xl border border-[var(--color-card-border)] bg-white shadow-sm cursor-text"
+                                className="flex items-center gap-3 h-11 px-4 rounded-xl border border-(--color-card-border) bg-white shadow-sm cursor-text"
                                 onClick={() => setIsReplyExpanded(true)}
                             >
                                 {resolveAvatarUrl(user?.avatarUrl) ? (
@@ -3853,12 +3870,12 @@ const InboxPage: React.FC = () => {
                                         {user?.fullName ? user.fullName.split(' ').map((n: string) => n[0]).join('').slice(0, 2).toUpperCase() : 'ME'}
                                     </div>
                                 )}
-                                <span className="text-[13px] text-[var(--color-text-muted)]">Reply...</span>
+                                <span className="text-[13px] text-(--color-text-muted)">Reply...</span>
                             </div>
                         ) : (
-                        <div className="rounded-xl border border-[var(--color-card-border)] bg-white shadow-sm overflow-visible">
+                        <div className="rounded-xl border border-(--color-card-border) bg-white shadow-sm overflow-visible">
                             {/* Tab bar + icons */}
-                            <div className="flex items-center justify-between border-b border-[var(--color-card-border)] px-4 pt-1">
+                            <div className="flex items-center justify-between border-b border-(--color-card-border) px-4 pt-1">
                                 <div className="flex items-center">
                                     <button
                                         onClick={() => {
@@ -3867,8 +3884,8 @@ const InboxPage: React.FC = () => {
                                         className={clsx(
                                             'no-global-hover flex items-center gap-1 px-3 pb-2 pt-1 text-[13px] font-semibold border-b-2 transition-colors',
                                             replyEditorTab === 'reply'
-                                                ? 'text-[var(--color-text-primary)] border-[var(--color-primary)]'
-                                                : 'text-[var(--color-text-muted)] border-transparent hover:text-[var(--color-text-primary)]'
+                                                ? 'text-(--color-text-primary) border-(--color-primary)'
+                                                : 'text-(--color-text-muted) border-transparent hover:text-(--color-text-primary)'
                                         )}
                                     >
                                         <Reply className="w-3.5 h-3.5" />
@@ -3879,8 +3896,8 @@ const InboxPage: React.FC = () => {
                                         className={clsx(
                                             'no-global-hover px-3 pb-2 pt-1 text-[13px] font-semibold border-b-2 transition-colors',
                                             replyEditorTab === 'note'
-                                                ? 'text-[var(--color-text-primary)] border-[var(--color-primary)]'
-                                                : 'text-[var(--color-text-muted)] border-transparent hover:text-[var(--color-text-primary)]'
+                                                ? 'text-(--color-text-primary) border-(--color-primary)'
+                                                : 'text-(--color-text-muted) border-transparent hover:text-(--color-text-primary)'
                                         )}
                                     >
                                         Note
@@ -3889,7 +3906,7 @@ const InboxPage: React.FC = () => {
                                 <div className="flex items-center gap-1">
                                     <button
                                         title="Plain text"
-                                        className="no-global-hover p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)] transition-colors"
+                                        className="no-global-hover p-1.5 rounded-md text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background) transition-colors"
                                     >
                                         <Type className="w-4 h-4" />
                                     </button>
@@ -3900,8 +3917,8 @@ const InboxPage: React.FC = () => {
                                             className={clsx(
                                                 'no-global-hover p-1.5 rounded-md transition-colors',
                                                 showTemplateRow
-                                                    ? 'text-[var(--color-primary)] bg-[var(--color-primary)]/10'
-                                                    : 'text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)]'
+                                                    ? 'text-(--color-primary) bg-(--color-primary)/10'
+                                                    : 'text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background)'
                                             )}
                                         >
                                             <FileText className="w-4 h-4" />
@@ -3911,7 +3928,7 @@ const InboxPage: React.FC = () => {
                                         title="Attachment"
                                         type="button"
                                         onClick={() => replyAttachmentInputRef.current?.click()}
-                                        className="no-global-hover p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-background)] transition-colors"
+                                        className="no-global-hover p-1.5 rounded-md text-(--color-text-muted) hover:text-(--color-text-primary) hover:bg-(--color-background) transition-colors"
                                     >
                                         <Paperclip className="w-4 h-4" />
                                     </button>
@@ -3927,15 +3944,15 @@ const InboxPage: React.FC = () => {
                             </div>
 
                             {replyEditorTab === 'reply' && (
-                                <div className="flex items-center gap-2 px-4 py-2 border-b border-[var(--color-card-border)] bg-[var(--color-background)]/20">
-                                    <span className="text-[11px] font-medium text-[var(--color-text-muted)] shrink-0 flex items-center gap-1">
+                                <div className="flex items-center gap-2 px-4 py-2 border-b border-(--color-card-border) bg-(--color-background)/20">
+                                    <span className="text-[11px] font-medium text-(--color-text-muted) shrink-0 flex items-center gap-1">
                                         <FileSignature className="w-3.5 h-3.5" />
                                         Signature
                                     </span>
                                     <select
                                         value={selectedSignatureId}
                                         onChange={(event) => setSelectedSignatureId(event.target.value)}
-                                        className="flex-1 min-w-0 text-[12px] border border-[var(--color-card-border)] rounded-md px-2 py-1 bg-white text-[var(--color-text-primary)]"
+                                        className="flex-1 min-w-0 text-[12px] border border-(--color-card-border) rounded-md px-2 py-1 bg-white text-(--color-text-primary)"
                                     >
                                         <option value="">No signature</option>
                                         {availableSignatures.map((signature) => (
@@ -3947,8 +3964,8 @@ const InboxPage: React.FC = () => {
 
                             {/* Template row */}
                             {showTemplateRow && replyEditorTab === 'reply' && (
-                                <div className="flex items-center gap-2 px-4 py-2 border-b border-[var(--color-card-border)] bg-[var(--color-background)]/40">
-                                    <span className="text-[12px] text-[var(--color-text-muted)] shrink-0">Template:</span>
+                                <div className="flex items-center gap-2 px-4 py-2 border-b border-(--color-card-border) bg-(--color-background)/40">
+                                    <span className="text-[12px] text-(--color-text-muted) shrink-0">Template:</span>
                                     <select
                                         value={selectedTemplateId || ''}
                                         onChange={e => {
@@ -3957,7 +3974,7 @@ const InboxPage: React.FC = () => {
                                             const tpl = replyTemplates.find(t => t.id === id);
                                             if (tpl) setReplyHtml(tpl.bodyHtml);
                                         }}
-                                        className="flex-1 text-[12px] font-medium text-[var(--color-primary)] bg-transparent border-none outline-none cursor-pointer"
+                                        className="flex-1 text-[12px] font-medium text-(--color-primary) bg-transparent border-none outline-none cursor-pointer"
                                     >
                                         <option value="">Select a template...</option>
                                         {replyTemplates.map(t => (
@@ -3972,23 +3989,23 @@ const InboxPage: React.FC = () => {
                                 <div className="reply-quill-wrapper">
                                     {replyError && <div className="text-red-500 text-[11px] px-4 pt-2 font-medium">{replyError}</div>}
                                     {replyPendingAttachments.length > 0 && (
-                                        <div className="flex flex-wrap gap-2 border-b border-[var(--color-card-border)] px-4 py-3">
+                                        <div className="flex flex-wrap gap-2 border-b border-(--color-card-border) px-4 py-3">
                                             {replyPendingAttachments.map((attachment) => (
                                                 <div
                                                     key={attachment.id}
-                                                    className="inline-flex max-w-full items-center gap-2 rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)]/40 px-3 py-1.5 text-xs text-[var(--color-text-primary)]"
+                                                    className="inline-flex max-w-full items-center gap-2 rounded-full border border-(--color-card-border) bg-(--color-background)/40 px-3 py-1.5 text-xs text-(--color-text-primary)"
                                                 >
-                                                    <Paperclip className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                                                    <Paperclip className="h-3 w-3 shrink-0 text-(--color-text-muted)" />
                                                     <span className="max-w-[220px] truncate">{attachment.file.name}</span>
                                                     {formatSize(attachment.file.size) && (
-                                                        <span className="shrink-0 text-[var(--color-text-muted)]">
+                                                        <span className="shrink-0 text-(--color-text-muted)">
                                                             ({formatSize(attachment.file.size)})
                                                         </span>
                                                     )}
                                                     <button
                                                         type="button"
                                                         onClick={() => removeReplyPendingAttachment(attachment.id)}
-                                                        className="rounded-full p-0.5 text-[var(--color-text-muted)] transition-colors hover:bg-white hover:text-[var(--color-text-primary)]"
+                                                        className="rounded-full p-0.5 text-(--color-text-muted) transition-colors hover:bg-white hover:text-(--color-text-primary)"
                                                         aria-label={`Remove ${attachment.file.name}`}
                                                     >
                                                         <X className="h-3 w-3" />
@@ -4013,19 +4030,19 @@ const InboxPage: React.FC = () => {
                                         className="reply-editor"
                                     />
                                     {/* Send footer */}
-                                    <div className="relative flex items-center justify-between gap-2 px-4 py-2 border-t border-[var(--color-card-border)]">
+                                    <div className="relative flex items-center justify-between gap-2 px-4 py-2 border-t border-(--color-card-border)">
                                         <div className="flex items-center gap-2">
                                             <div className="relative dropdown-container">
                                                 <button
                                                     type="button"
                                                     onClick={() => setOpenDropdown(openDropdown === 'reply-after-send' ? null : 'reply-after-send')}
-                                                    className="no-global-hover inline-flex items-center gap-1.5 px-3 py-1.5 border border-[var(--color-card-border)] bg-white text-[13px] font-medium rounded-lg hover:bg-[var(--color-background)] transition-colors"
+                                                    className="no-global-hover inline-flex items-center gap-1.5 px-3 py-1.5 border border-(--color-card-border) bg-white text-[13px] font-medium rounded-lg hover:bg-(--color-background) transition-colors"
                                                 >
                                                     {replyAfterSendOptions.find((option) => option.value === replyScheduledState)?.label || 'Status'}
                                                     <ChevronDown className={clsx('w-3 h-3 opacity-60 transition-transform', openDropdown === 'reply-after-send' && 'rotate-180')} />
                                                 </button>
                                                 {openDropdown === 'reply-after-send' && (
-                                                    <div className="absolute left-0 bottom-full mb-2 w-40 rounded-xl border border-[var(--color-card-border)] bg-white py-1 shadow-lg z-40">
+                                                    <div className="absolute left-0 bottom-full mb-2 w-40 rounded-xl border border-(--color-card-border) bg-white py-1 shadow-lg z-40">
                                                         {replyAfterSendOptions.map((option) => (
                                                             <button
                                                                 key={option.value}
@@ -4034,10 +4051,10 @@ const InboxPage: React.FC = () => {
                                                                     setReplyScheduledState(option.value);
                                                                     setOpenDropdown(null);
                                                                 }}
-                                                                className="w-full text-left px-3 py-2 text-[13px] hover:bg-[var(--color-background)] transition-colors flex items-center justify-between"
+                                                                className="w-full text-left px-3 py-2 text-[13px] hover:bg-(--color-background) transition-colors flex items-center justify-between"
                                                             >
                                                                 <span>{option.label}</span>
-                                                                {replyScheduledState === option.value && <Check className="w-3.5 h-3.5 text-[var(--color-primary)]" />}
+                                                                {replyScheduledState === option.value && <Check className="w-3.5 h-3.5 text-(--color-primary)" />}
                                                             </button>
                                                         ))}
                                                     </div>
@@ -4046,14 +4063,14 @@ const InboxPage: React.FC = () => {
                                             <button
                                                 onClick={() => setIsReplyScheduleOpen((prev) => !prev)}
                                                 disabled={isReplying || !actualOpenThread}
-                                                className="no-global-hover px-3 py-1.5 border border-[var(--color-card-border)] bg-white text-[13px] font-medium rounded-lg hover:bg-[var(--color-background)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                className="no-global-hover px-3 py-1.5 border border-(--color-card-border) bg-white text-[13px] font-medium rounded-lg hover:bg-(--color-background) transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                             >
                                                 Schedule
                                             </button>
                                         </div>
                                         {isReplyScheduleOpen && (
-                                            <div className="absolute bottom-full right-4 z-40 mb-2 w-[min(22rem,calc(100vw-2rem))] rounded-xl border border-[var(--color-card-border)] bg-white p-3 shadow-lg">
-                                                <label className="mb-2 block text-xs font-medium text-[var(--color-text-primary)]">
+                                            <div className="absolute bottom-full right-4 z-40 mb-2 w-[min(22rem,calc(100vw-2rem))] rounded-xl border border-(--color-card-border) bg-white p-3 shadow-lg">
+                                                <label className="mb-2 block text-xs font-medium text-(--color-text-primary)">
                                                     Schedule reply for
                                                 </label>
                                                 <SaasCalendarPicker
@@ -4062,13 +4079,13 @@ const InboxPage: React.FC = () => {
                                                     includeTime
                                                     minDate={new Date()}
                                                 />
-                                                <label className="mb-1 mt-3 block text-xs font-medium text-[var(--color-text-primary)]">
+                                                <label className="mb-1 mt-3 block text-xs font-medium text-(--color-text-primary)">
                                                     Repeat
                                                 </label>
                                                 <select
                                                     value={replyRecurrencePreset}
                                                     onChange={(event) => setReplyRecurrencePreset(event.target.value as RecurrencePreset)}
-                                                    className="block w-full rounded-md border border-[var(--color-input-border)] bg-white px-2.5 py-2 text-xs text-[var(--color-text-primary)]"
+                                                    className="block w-full rounded-md border border-(--color-input-border) bg-white px-2.5 py-2 text-xs text-(--color-text-primary)"
                                                 >
                                                     <option value="none">Does not repeat</option>
                                                     <option value="daily">Daily</option>
@@ -4076,24 +4093,24 @@ const InboxPage: React.FC = () => {
                                                     <option value="weekly">Weekly</option>
                                                     <option value="monthly">Monthly</option>
                                                 </select>
-                                                <label className="mb-1 mt-3 block text-xs font-medium text-[var(--color-text-primary)]">
+                                                <label className="mb-1 mt-3 block text-xs font-medium text-(--color-text-primary)">
                                                     State after send
                                                 </label>
                                                 <select
                                                     value={replyScheduledState}
                                                     onChange={(event) => setReplyScheduledState(event.target.value as ScheduledStatePreset)}
-                                                    className="block w-full rounded-md border border-[var(--color-input-border)] bg-white px-2.5 py-2 text-xs text-[var(--color-text-primary)]"
+                                                    className="block w-full rounded-md border border-(--color-input-border) bg-white px-2.5 py-2 text-xs text-(--color-text-primary)"
                                                 >
                                                     {replyAfterSendOptions.map((option) => (
                                                         <option key={option.value} value={option.value}>{option.label}</option>
                                                     ))}
                                                 </select>
-                                                <p className="mt-1 text-[11px] text-[var(--color-text-muted)]">Timezone: {detectedTimezone}</p>
+                                                <p className="mt-1 text-[11px] text-(--color-text-muted)">Timezone: {detectedTimezone}</p>
                                                 <div className="mt-3 flex justify-end gap-2">
                                                     <button
                                                         type="button"
                                                         onClick={() => setIsReplyScheduleOpen(false)}
-                                                        className="px-3 py-1.5 text-xs font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)]"
+                                                        className="px-3 py-1.5 text-xs font-medium text-(--color-text-muted) hover:text-(--color-text-primary)"
                                                     >
                                                         Cancel
                                                     </button>
@@ -4106,7 +4123,7 @@ const InboxPage: React.FC = () => {
                                                             || replyHtml === ''
                                                             || replyHtml === '<p><br></p>'
                                                         }
-                                                        className="px-3 py-1.5 text-xs font-medium text-white bg-[var(--color-cta-primary)] rounded-md hover:bg-[var(--color-cta-secondary)] disabled:opacity-60"
+                                                        className="px-3 py-1.5 text-xs font-medium text-white bg-(--color-cta-primary) rounded-md hover:bg-(--color-cta-secondary) disabled:opacity-60"
                                                     >
                                                         Schedule Send
                                                     </button>
@@ -4121,7 +4138,7 @@ const InboxPage: React.FC = () => {
                                                 || !actualOpenThread
                                                 || isReplying
                                             }
-                                            className="no-global-hover px-5 py-1.5 bg-[var(--color-cta-primary)] text-white text-[13px] font-semibold rounded-lg hover:bg-[var(--color-cta-secondary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                                            className="no-global-hover px-5 py-1.5 bg-(--color-cta-primary) text-white text-[13px] font-semibold rounded-lg hover:bg-(--color-cta-secondary) transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                                         >
                                             {isReplying && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                                             Send
@@ -4149,7 +4166,7 @@ const InboxPage: React.FC = () => {
                                     {noteMentionDraft && (
                                         <div
                                             data-note-mentions-popover="true"
-                                            className="absolute inset-x-4 z-50 overflow-hidden rounded-xl border border-[var(--color-card-border)] bg-white shadow-xl"
+                                            className="absolute inset-x-4 z-50 overflow-hidden rounded-xl border border-(--color-card-border) bg-white shadow-xl"
                                             style={{
                                                 top: `${noteMentionPopoverTop ?? 64}px`,
                                                 transform: 'translateY(calc(-100% - 8px))',
@@ -4157,7 +4174,7 @@ const InboxPage: React.FC = () => {
                                         >
                                             <div className="max-h-64 overflow-y-auto py-1">
                                                 {showNoteMentionRefreshIndicator && (
-                                                    <div className="flex items-center gap-2 border-b border-[var(--color-card-border)] px-3 py-1.5 text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">
+                                                    <div className="flex items-center gap-2 border-b border-(--color-card-border) px-3 py-1.5 text-[11px] uppercase tracking-wide text-(--color-text-muted)">
                                                         <Loader2 className="h-3.5 w-3.5 animate-spin" />
                                                         Updating suggestions...
                                                     </div>
@@ -4184,11 +4201,11 @@ const InboxPage: React.FC = () => {
                                                             className={clsx(
                                                                 'flex w-full items-center gap-3 px-3 py-2 text-left transition-colors',
                                                                 index === activeNoteMentionIndex
-                                                                    ? 'bg-[var(--color-background)]'
-                                                                    : 'hover:bg-[var(--color-background)]/70',
+                                                                    ? 'bg-(--color-background)'
+                                                                    : 'hover:bg-(--color-background)/70',
                                                             )}
                                                         >
-                                                            <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full border border-[var(--color-card-border)] bg-[var(--color-background)] text-[11px] font-semibold text-[var(--color-primary)]">
+                                                            <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full border border-(--color-card-border) bg-(--color-background) text-[11px] font-semibold text-(--color-primary)">
                                                                 {mentionedUser.avatarUrl ? (
                                                                     <img
                                                                         src={resolveAvatarUrl(mentionedUser.avatarUrl)}
@@ -4283,7 +4300,8 @@ const InboxPage: React.FC = () => {
                     </div>
 
                     {/* Right Side: Thread Details Box */}
-                    <div className="w-80 shrink-0 overflow-y-auto hidden 2xl:block bg-[var(--color-background)]/20">
+                    {showDetails && (
+                        <div className="w-80 shrink-0 overflow-y-auto bg-[var(--color-background)]/20 border-l border-[var(--color-card-border)]">
                         <div className="p-5 flex flex-col gap-6">
 
                             {/* Customer Section */}
@@ -4480,6 +4498,7 @@ const InboxPage: React.FC = () => {
 
                         </div>
                     </div>
+                    )}
                         </>
                     ) : (
                         <div className={`flex-1 items-center justify-center bg-[var(--color-background)]/20 ${isLg ? 'flex' : 'hidden'}`}>

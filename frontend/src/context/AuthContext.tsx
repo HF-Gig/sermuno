@@ -2,6 +2,8 @@ import React, { createContext, useState, useEffect, useContext, ReactNode, useCa
 import { useNavigate } from 'react-router-dom';
 import i18n from '../i18n';
 import api from '../lib/api';
+import { auth } from '../lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
 import { connectSocket, disconnectSocket } from '../lib/socket';
 
 export interface User {
@@ -65,7 +67,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                 typeof error === 'object' &&
                 'response' in error &&
                 (error as { response?: { status?: number } }).response?.status;
-            if (!status || status >= 500) {
+            if (typeof status !== 'number' || status >= 500) {
                 console.error('Logout request failed:', error);
             }
         }
@@ -153,6 +155,32 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
         initAuth();
     }, [clearSession, updateUser]);
+
+    useEffect(() => {
+        if (!auth) return;
+
+        const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+            const hasLocalToken = Boolean(localStorage.getItem('accessToken'));
+
+            if (firebaseUser && !hasLocalToken) {
+                console.log('[AuthContext] Session mismatch detected. Healing session via Firebase...');
+                try {
+                    const idToken = await firebaseUser.getIdToken();
+                    const response = await api.post('/auth/firebase', { token: idToken, intent: 'login' });
+                    const { accessToken, refreshToken, user: userData } = response.data;
+                    
+                    if (accessToken && refreshToken && userData) {
+                        login({ accessToken, refreshToken }, userData);
+                        console.log('[AuthContext] Session healed successfully.');
+                    }
+                } catch (error) {
+                    console.error('[AuthContext] Failed to heal session:', error);
+                }
+            }
+        });
+
+        return () => unsubscribe();
+    }, [login]);
 
     return (
         <AuthContext.Provider value={{ user, loading, login, logout, updateUser, refreshProfile }}>

@@ -112,7 +112,7 @@ export class NotificationsService {
     private readonly dispatchQueue: Queue,
     @InjectQueue(NOTIFICATION_DIGEST_QUEUE)
     private readonly digestQueue: Queue,
-    @Inject(forwardRef(() => 'EVENTS_GATEWAY'))
+    @Inject('EVENTS_GATEWAY')
     private readonly eventsGateway: EventsGateway | null,
   ) {}
 

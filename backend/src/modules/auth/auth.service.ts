@@ -281,7 +281,7 @@ export class AuthService {
       {
         secret: this.config.get<string>('jwt.refreshSecret'),
         expiresIn: (this.config.get<string>('jwt.refreshExpiresIn') ??
-          '30d') as import('@nestjs/jwt').JwtSignOptions['expiresIn'],
+          '365d') as import('@nestjs/jwt').JwtSignOptions['expiresIn'],
       },
     );
     const decoded = this.jwtService.decode(token);

@@ -301,76 +301,61 @@ export class MailboxesService {
     });
     if (!mailbox) throw new NotFoundException('Mailbox not found');
     const deletedAt = new Date();
-    const cleanupSummary = await this.prisma.$transaction(async (tx) => {
-      const [threadRows, messageRows] = await Promise.all([
-        tx.thread.findMany({
+    const cleanupSummary = await this.prisma.$transaction(
+      async (tx) => {
+        const [
+          deletedScheduledMessages,
+          deletedAttachments,
+          deletedThreadNotes,
+          deletedThreadTags,
+        ] = await Promise.all([
+          tx.scheduledMessage.deleteMany({
+            where: {
+              OR: [{ mailboxId: id }, { thread: { mailboxId: id } }],
+            },
+          }),
+          tx.attachment.deleteMany({
+            where: { message: { mailboxId: id } },
+          }),
+          tx.threadNote.deleteMany({
+            where: { thread: { mailboxId: id } },
+          }),
+          tx.threadTag.deleteMany({
+            where: { thread: { mailboxId: id } },
+          }),
+        ]);
+
+        const deletedMessages = await tx.message.deleteMany({
           where: { mailboxId: id },
-          select: { id: true },
-        }),
-        tx.message.findMany({
-          where: { mailboxId: id },
-          select: { id: true },
-        }),
-      ]);
+        });
 
-      const threadIds = threadRows.map((row) => row.id);
-      const messageIds = messageRows.map((row) => row.id);
+        const [deletedThreads, deletedFolders, deletedAccessRows] =
+          await Promise.all([
+            tx.thread.deleteMany({ where: { mailboxId: id } }),
+            tx.mailboxFolder.deleteMany({ where: { mailboxId: id } }),
+            tx.mailboxAccess.deleteMany({ where: { mailboxId: id } }),
+          ]);
 
-      const [
-        deletedScheduledMessages,
-        deletedAttachments,
-        deletedMessages,
-        deletedThreadNotes,
-        deletedThreadTags,
-        deletedThreads,
-        deletedFolders,
-        deletedAccessRows,
-      ] = await Promise.all([
-        tx.scheduledMessage.deleteMany({
-          where: {
-            OR: [
-              { mailboxId: id },
-              ...(threadIds.length > 0 ? [{ threadId: { in: threadIds } }] : []),
-            ],
-          },
-        }),
-        messageIds.length > 0
-          ? tx.attachment.deleteMany({
-              where: { messageId: { in: messageIds } },
-            })
-          : Promise.resolve({ count: 0 }),
-        tx.message.deleteMany({ where: { mailboxId: id } }),
-        threadIds.length > 0
-          ? tx.threadNote.deleteMany({
-              where: { threadId: { in: threadIds } },
-            })
-          : Promise.resolve({ count: 0 }),
-        threadIds.length > 0
-          ? tx.threadTag.deleteMany({
-              where: { threadId: { in: threadIds } },
-            })
-          : Promise.resolve({ count: 0 }),
-        tx.thread.deleteMany({ where: { mailboxId: id } }),
-        tx.mailboxFolder.deleteMany({ where: { mailboxId: id } }),
-        tx.mailboxAccess.deleteMany({ where: { mailboxId: id } }),
-      ]);
+        await tx.mailbox.update({
+          where: { id },
+          data: { deletedAt },
+        });
 
-      await tx.mailbox.update({
-        where: { id },
-        data: { deletedAt },
-      });
-
-      return {
-        threads: deletedThreads.count,
-        messages: deletedMessages.count,
-        attachments: deletedAttachments.count,
-        scheduledMessages: deletedScheduledMessages.count,
-        threadNotes: deletedThreadNotes.count,
-        threadTags: deletedThreadTags.count,
-        folders: deletedFolders.count,
-        accessRows: deletedAccessRows.count,
-      };
-    });
+        return {
+          threads: deletedThreads.count,
+          messages: deletedMessages.count,
+          attachments: deletedAttachments.count,
+          scheduledMessages: deletedScheduledMessages.count,
+          threadNotes: deletedThreadNotes.count,
+          threadTags: deletedThreadTags.count,
+          folders: deletedFolders.count,
+          accessRows: deletedAccessRows.count,
+        };
+      },
+      {
+        timeout: 15000,
+      },
+    );
 
     await this.logAuditSafe({
       organizationId: user.organizationId,
