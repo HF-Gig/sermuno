@@ -1,5 +1,7 @@
 import React, { useEffect } from 'react';
 import { ReactLenis } from 'lenis/react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../../context/AuthContext';
 import './styles.css';
 
 import {
@@ -34,6 +36,15 @@ class ParallaxLayer {
 }
 
 const LandingPage = () => {
+    const { user, loading } = useAuth();
+    const navigate = useNavigate();
+
+    useEffect(() => {
+        if (!loading && user) {
+            navigate('/dashboard', { replace: true });
+        }
+    }, [user, loading, navigate]);
+
     useEffect(() => {
         // Universal scroll reveal - fire once, unobserve immediately.
         const revealObserver = new IntersectionObserver((entries) => {
@@ -74,6 +85,10 @@ const LandingPage = () => {
             document.body.style.overflow = '';
         };
     }, []);
+
+    if (loading || user) {
+        return <div className="min-h-screen bg-[#0f172a]" />;
+    }
 
     return (
         <ReactLenis

@@ -1,5 +1,5 @@
 import { getApp, getApps, initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, OAuthProvider, type Auth } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, OAuthProvider, setPersistence, browserLocalPersistence, type Auth } from 'firebase/auth';
 
 const firebaseConfig = {
     apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -20,6 +20,10 @@ if (hasFirebaseConfig) {
     try {
         const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
         auth = getAuth(app);
+        // Ensure persistence is set to LOCAL
+        setPersistence(auth, browserLocalPersistence).catch((err) => {
+            console.error('Failed to set Firebase persistence:', err);
+        });
         googleProvider = new GoogleAuthProvider();
         microsoftProvider = new OAuthProvider('microsoft.com');
         googleProvider.setCustomParameters({ prompt: 'select_account' });

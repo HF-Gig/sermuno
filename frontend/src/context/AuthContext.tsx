@@ -44,6 +44,7 @@ const applyAppLanguage = (locale?: string) => {
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
     const [user, setUser] = useState<User | null>(null);
     const [loading, setLoading] = useState<boolean>(true);
+    const [firebaseResolved, setFirebaseResolved] = useState<boolean>(false);
     const navigate = useNavigate();
 
     const clearSession = useCallback((redirectTo: string = '/login') => {
@@ -148,8 +149,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                     }
                 }
             } else {
-('en');
-(false);
+                applyAppLanguage('en');
+                // No local token. We wait for Firebase to resolve before setting loading = false.
             }
         };
 
@@ -157,7 +158,10 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }, [clearSession, updateUser]);
 
     useEffect(() => {
-        if (!auth) return;
+        if (!auth) {
+            setFirebaseResolved(true);
+            return;
+        }
 
         const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
             const hasLocalToken = Boolean(localStorage.getItem('accessToken'));
@@ -177,10 +181,24 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                     console.error('[AuthContext] Failed to heal session:', error);
                 }
             }
+            
+            setFirebaseResolved(true);
         });
 
         return () => unsubscribe();
     }, [login]);
+
+    // Final combined loading state
+    useEffect(() => {
+        const hasLocalToken = Boolean(localStorage.getItem('accessToken'));
+        if (hasLocalToken) {
+            // If we have a local token, we don't block for Firebase
+            setLoading(false);
+        } else if (firebaseResolved) {
+            // If we don't have a local token, we wait until Firebase has at least checked
+            setLoading(false);
+        }
+    }, [firebaseResolved]);
 
     return (
         <AuthContext.Provider value={{ user, loading, login, logout, updateUser, refreshProfile }}>
