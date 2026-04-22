@@ -196,15 +196,59 @@ export class SignaturesService {
       }),
     };
 
-    if (dto.teamId !== undefined) {
+    const requestedScope = (() => {
+      const explicit = String(dto.scope || '').trim().toLowerCase();
+      if (
+        explicit === 'organization' ||
+        explicit === 'team' ||
+        explicit === 'personal'
+      ) {
+        return explicit;
+      }
+      if (dto.teamId !== undefined) return 'team';
+      if (dto.userId !== undefined) return 'personal';
+      return current.scope === 'team' || current.scope === 'personal'
+        ? 'organization'
+        : current.scope;
+    })();
+
+    if (requestedScope === 'team') {
+      if (!dto.teamId) {
+        throw new BadRequestException('teamId is required for team scope');
+      }
+      const team = await this.prisma.team.findFirst({
+        where: {
+          id: dto.teamId,
+          organizationId: user.organizationId,
+          deletedAt: null,
+        },
+        select: { id: true },
+      });
+      if (!team) {
+        throw new BadRequestException('Invalid team assignment');
+      }
       data.scope = 'team';
       data.ownerType = 'team';
-      data.ownerId = dto.teamId || null;
-    } else if (dto.userId !== undefined) {
+      data.ownerId = team.id;
+    } else if (requestedScope === 'personal') {
+      if (!dto.userId) {
+        throw new BadRequestException('userId is required for personal scope');
+      }
+      const assignedUser = await this.prisma.user.findFirst({
+        where: {
+          id: dto.userId,
+          organizationId: user.organizationId,
+          deletedAt: null,
+        },
+        select: { id: true },
+      });
+      if (!assignedUser) {
+        throw new BadRequestException('Invalid user assignment');
+      }
       data.scope = 'personal';
       data.ownerType = 'user';
-      data.ownerId = dto.userId || null;
-    } else if (current.scope !== 'personal') {
+      data.ownerId = assignedUser.id;
+    } else {
       data.scope = 'organization';
       data.ownerType = null;
       data.ownerId = null;

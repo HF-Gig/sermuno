@@ -312,6 +312,8 @@ model Message {
   thread         Thread           @relation(fields: [threadId], references: [id])
 
   @@unique([mailboxId, folderId, imapUid], map: "uniq_messages_imap_uid")
+  @@index([mailboxId, messageId, deletedAt])
+  @@index([mailboxId, folderId, deletedAt, imapUid])
   @@map("messages")
 }
 

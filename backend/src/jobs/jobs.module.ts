@@ -88,6 +88,6 @@ const QUEUE_NAMES = [
     FeatureFlagsService,
     AiCategorizationService,
   ],
-  exports: [BullModule, BullConfigService],
+  exports: [BullModule, BullConfigService, EmailSyncProcessor],
 })
 export class JobsModule {}

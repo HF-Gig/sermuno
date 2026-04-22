@@ -7,9 +7,16 @@ interface DeleteMailboxModalProps {
     onClose: () => void;
     onConfirm: () => void;
     mailboxName: string;
+    isSubmitting?: boolean;
 }
 
-export default function DeleteMailboxModal({ isOpen, onClose, onConfirm, mailboxName }: DeleteMailboxModalProps) {
+export default function DeleteMailboxModal({
+    isOpen,
+    onClose,
+    onConfirm,
+    mailboxName,
+    isSubmitting = false,
+}: DeleteMailboxModalProps) {
     return (
         <Modal
             isOpen={isOpen}
@@ -21,6 +28,7 @@ export default function DeleteMailboxModal({ isOpen, onClose, onConfirm, mailbox
                     <button
                         type="button"
                         onClick={onClose}
+                        disabled={isSubmitting}
                         className="px-4 py-2 text-sm font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-background)] rounded-lg transition-colors"
                     >
                         Cancel
@@ -28,9 +36,10 @@ export default function DeleteMailboxModal({ isOpen, onClose, onConfirm, mailbox
                     <button
                         type="button"
                         onClick={onConfirm}
-                        className="px-4 py-2 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+                        disabled={isSubmitting}
+                        className="px-4 py-2 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors disabled:opacity-70 disabled:cursor-not-allowed"
                     >
-                        Remove Mailbox
+                        {isSubmitting ? 'Removing...' : 'Remove Mailbox'}
                     </button>
                 </>
             }

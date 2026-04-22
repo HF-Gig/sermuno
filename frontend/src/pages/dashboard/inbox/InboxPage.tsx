@@ -12,6 +12,7 @@ import { useAuth } from '../../../context/AuthContext';
 import StatusBadge from '../../../components/ui/StatusBadge';
 import ComposeDrawer from '../../../components/compose/ComposeDrawer';
 import SaasCalendarPicker from '../../../components/ui/SaasCalendarPicker';
+import ConfirmDialog from '../../../components/ui/ConfirmDialog';
 import ReactQuill from 'react-quill-new';
 import 'react-quill-new/dist/quill.snow.css';
 import { InboxThreadListSkeleton } from '../../../components/skeletons/InboxThreadListSkeleton';
@@ -48,6 +49,8 @@ const NOTE_MENTION_ROW_HEIGHT = 48;
 const NOTE_MENTION_SKELETON_MIN_ROWS = 2;
 const NOTE_MENTION_SKELETON_MAX_ROWS = 8;
 const INBOX_LIVE_REFRESH_INTERVAL_MS = 3_000;
+const LIVE_MAILBOX_FAST_REFRESH_GAP_MS = 150;
+const liveRefreshInFlightByMailbox = new Set<string>();
 
 const apiStatusToUiStatus = (status?: string | null, assignedUserId?: string | null) => {
     switch (String(status || '').toUpperCase()) {
@@ -755,6 +758,8 @@ const InboxPage: React.FC = () => {
     const [localReplies, setLocalReplies] = useState<Record<string, any[]>>({});
 
     const [openDropdown, setOpenDropdown] = useState<string | null>(null);
+    const [isThreadDeleteConfirmOpen, setIsThreadDeleteConfirmOpen] = useState(false);
+    const [isDeletingThread, setIsDeletingThread] = useState(false);
 
     const ProviderLogo = ({ provider, className = 'w-4 h-4' }: { provider?: string; className?: string }) => {
         const providerKey = getProviderKey(provider);
@@ -844,6 +849,7 @@ const InboxPage: React.FC = () => {
     const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
     const [activityLog, setActivityLog] = useState<{ id: string, text: string, time: string }[]>([]);
     const [isPageLoading, setIsPageLoading] = useState(true);
+    const [isThreadListLoading, setIsThreadListLoading] = useState(false);
     const [apiThreads, setApiThreads] = useState<any[]>([]);
     const [apiThreadMessages, setApiThreadMessages] = useState<any[]>([]);
     const [apiTags, setApiTags] = useState<any[]>([]);
@@ -1165,12 +1171,19 @@ const InboxPage: React.FC = () => {
     const autoSyncTriggeredMailboxIdRef = useRef<string | null>(null);
     const realtimeRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const sidebarRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const openThreadRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const openThreadRefreshRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const threadDetailRequestVersionRef = useRef(0);
+    const resolvedRouteThreadIdRef = useRef('');
+    const openThreadListFingerprintRef = useRef('');
+    const liveMailboxRefreshInFlightRef = useRef(false);
     const apiThreadsRef = useRef<any[]>([]);
     const starMutationVersionRef = useRef<Record<string, number>>({});
 
     useEffect(() => {
         apiThreadsRef.current = apiThreads;
     }, [apiThreads]);
+
 
     const baseThreads = useMemo(() => {
         return apiThreads;
@@ -1233,6 +1246,28 @@ const InboxPage: React.FC = () => {
         [mailboxes, activeMailboxId],
     );
     const showInitialInboxSkeleton = isPageLoading && apiThreads.length === 0 && hasAttachedMailbox !== false;
+    const listViewSignature = useMemo(
+        () => JSON.stringify({
+            kind: activeSidebarItem.kind,
+            id: activeSidebarItem.id,
+            mailboxId: activeMailboxId || '',
+            folderId: activeFolderIdForQuery || '',
+            tagId: activeTagId || '',
+            status: selectedStatus,
+            page: currentPage,
+            search: searchTerm.trim(),
+        }),
+        [
+            activeSidebarItem.kind,
+            activeSidebarItem.id,
+            activeMailboxId,
+            activeFolderIdForQuery,
+            activeTagId,
+            selectedStatus,
+            currentPage,
+            searchTerm,
+        ],
+    );
 
     const allFilterItems = useMemo(() => [...globalItems, ...quickFilters], []);
 
@@ -1254,6 +1289,12 @@ const InboxPage: React.FC = () => {
             }
             if (sidebarRefreshTimerRef.current) {
                 clearTimeout(sidebarRefreshTimerRef.current);
+            }
+            if (openThreadRefreshTimerRef.current) {
+                clearTimeout(openThreadRefreshTimerRef.current);
+            }
+            if (openThreadRefreshRetryTimerRef.current) {
+                clearTimeout(openThreadRefreshRetryTimerRef.current);
             }
         };
     }, []);
@@ -1340,7 +1381,6 @@ const InboxPage: React.FC = () => {
         if (hasAttachedMailbox !== true) return;
 
         const interval = setInterval(() => {
-            setRealtimeListVersion((prev) => prev + 1);
             loadInboxCounts();
         }, INBOX_LIVE_REFRESH_INTERVAL_MS);
 
@@ -1360,6 +1400,132 @@ const InboxPage: React.FC = () => {
         const matched = overriddenMocks.find((entry) => toThreadRouteCode(String(entry.id)) === routeThreadId);
         return matched ? String(matched.id).replace(/^t/, '') : '';
     }, [searchParams, threadId, overriddenMocks]);
+
+    useEffect(() => {
+        resolvedRouteThreadIdRef.current = resolvedRouteThreadId;
+    }, [resolvedRouteThreadId]);
+
+    const scheduleOpenThreadDetailRefresh = useCallback((options?: { immediate?: boolean; retry?: boolean }) => {
+        if (!canFetchProtectedData || !resolvedRouteThreadId) return;
+
+        const immediate = options?.immediate === true;
+        const retry = options?.retry !== false;
+
+        const bump = () => {
+            setDetailRefreshVersion((prev) => prev + 1);
+        };
+
+        if (openThreadRefreshTimerRef.current) {
+            clearTimeout(openThreadRefreshTimerRef.current);
+        }
+        if (openThreadRefreshRetryTimerRef.current) {
+            clearTimeout(openThreadRefreshRetryTimerRef.current);
+        }
+
+        if (immediate) {
+            bump();
+        } else {
+            openThreadRefreshTimerRef.current = setTimeout(() => {
+                bump();
+            }, 120);
+        }
+
+        if (retry) {
+            openThreadRefreshRetryTimerRef.current = setTimeout(() => {
+                bump();
+            }, 1400);
+        }
+    }, [canFetchProtectedData, resolvedRouteThreadId]);
+
+    const resolveRefreshFolderType = useCallback(() => {
+        const selectedFolder = mailboxFolders.find((folder) => folder.id === activeFolderId);
+        if (activeSidebarItem.kind === 'folder' && selectedFolder?.type && selectedFolder.type !== 'custom') {
+            return selectedFolder.type;
+        }
+        if (activeSidebarItem.kind === 'filter' && activeSidebarItem.id === 'mailbox-archive') {
+            return 'archive';
+        }
+        return 'inbox';
+    }, [activeFolderId, activeSidebarItem.id, activeSidebarItem.kind, mailboxFolders]);
+
+    useEffect(() => {
+        if (!canFetchProtectedData) return;
+        if (hasAttachedMailbox !== true) return;
+        if (!activeMailboxId) return;
+
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const runLiveRefreshTick = () => {
+            if (cancelled) return;
+            const mailboxKey = String(activeMailboxId || '').trim();
+            if (!mailboxKey) return;
+            if (liveRefreshInFlightByMailbox.has(mailboxKey)) return;
+            liveMailboxRefreshInFlightRef.current = true;
+            liveRefreshInFlightByMailbox.add(mailboxKey);
+            const currentFolderType = resolveRefreshFolderType();
+            void api.post(`/mailboxes/${activeMailboxId}/refresh`, {
+                currentFolderType,
+                threadId: resolvedRouteThreadId || null,
+                fastPath: true,
+            }, { timeout: 6000 })
+                .then(() => {
+                    setMailboxDataVersion((prev) => prev + 1);
+                    setRealtimeListVersion((prev) => prev + 1);
+                    if (resolvedRouteThreadId) {
+                        scheduleOpenThreadDetailRefresh({ immediate: true, retry: true });
+                    }
+                })
+                .catch((error) => {
+                    console.warn('Live mailbox refresh skipped:', error);
+                })
+                .finally(() => {
+                    liveMailboxRefreshInFlightRef.current = false;
+                    liveRefreshInFlightByMailbox.delete(mailboxKey);
+                    if (!cancelled) {
+                        timer = setTimeout(runLiveRefreshTick, LIVE_MAILBOX_FAST_REFRESH_GAP_MS);
+                    }
+                });
+        };
+
+        runLiveRefreshTick();
+        return () => {
+            cancelled = true;
+            if (timer) {
+                clearTimeout(timer);
+            }
+        };
+    }, [activeMailboxId, canFetchProtectedData, hasAttachedMailbox, resolveRefreshFolderType, resolvedRouteThreadId, scheduleOpenThreadDetailRefresh]);
+
+    useEffect(() => {
+        if (!canFetchProtectedData) return;
+        if (hasAttachedMailbox === null) return;
+        if (hasAttachedMailbox === true && !activeMailboxId) return;
+        setIsThreadListLoading(true);
+    }, [listViewSignature, canFetchProtectedData, hasAttachedMailbox, activeMailboxId]);
+
+    useEffect(() => {
+        if (!canFetchProtectedData || !resolvedRouteThreadId) {
+            openThreadListFingerprintRef.current = '';
+            return;
+        }
+
+        const openListThread = apiThreads.find((thread) => (
+            normalizeThreadApiId(String(thread.id || '')) === normalizeThreadApiId(String(resolvedRouteThreadId))
+        ));
+        if (!openListThread) return;
+
+        const nextFingerprint = [
+            normalizeThreadApiId(String(openListThread.id || '')),
+            String(openListThread.time || ''),
+            String(openListThread.unreadCount || 0),
+            String(openListThread.noteCount || 0),
+            String(openListThread.snippet || ''),
+        ].join('|');
+
+        if (openThreadListFingerprintRef.current === nextFingerprint) return;
+        openThreadListFingerprintRef.current = nextFingerprint;
+        scheduleOpenThreadDetailRefresh({ immediate: true, retry: false });
+    }, [apiThreads, canFetchProtectedData, resolvedRouteThreadId, scheduleOpenThreadDetailRefresh]);
 
     const openThread = resolvedRouteThreadId
         ? overriddenMocks.find(t => {
@@ -1512,15 +1678,19 @@ const InboxPage: React.FC = () => {
 
         const fetchData = async () => {
             if (!canFetchProtectedData) {
+                setIsThreadListLoading(false);
                 return;
             }
             if (hasAttachedMailbox === null) {
+                setIsThreadListLoading(false);
                 return;
             }
             if (hasAttachedMailbox === true && !activeMailboxId) {
+                setIsThreadListLoading(false);
                 return;
             }
             if (activeSidebarItem.kind === 'folder' && (!activeMailboxId || !activeFolderIdForQuery)) {
+                setIsThreadListLoading(false);
                 return;
             }
 
@@ -1537,6 +1707,7 @@ const InboxPage: React.FC = () => {
             } catch (e) {
                 console.error('Failed to load initial data:', e);
             } finally {
+                setIsThreadListLoading(false);
                 if (showFullPageLoader) {
                     setIsPageLoading(false);
                 }
@@ -1569,32 +1740,37 @@ const InboxPage: React.FC = () => {
                 }
 
                 setHasAttachedMailbox(true);
-
-                const unreadResponses = await Promise.allSettled(
-                    availableMailboxes.map((mailbox: any) => api.get(`/mailboxes/${mailbox.id}/unread-count`)),
-                );
-
-                const nextMailboxes: MailboxNavItem[] = availableMailboxes.map((mailbox: any, index: number) => {
-                    const unreadEntry = unreadResponses[index];
-                    const unreadCount = unreadEntry?.status === 'fulfilled'
-                        ? Number(unreadEntry.value?.data?.unreadCount || 0)
-                        : 0;
-                    return {
-                        id: mailbox.id,
-                        name: mailbox.name || '',
-                        email: mailbox.email || '',
-                        unreadCount,
-                        provider: String(mailbox.provider || '').toUpperCase(),
-                    };
-                });
-                setMailboxes(nextMailboxes);
+                const baseMailboxes: MailboxNavItem[] = availableMailboxes.map((mailbox: any) => ({
+                    id: mailbox.id,
+                    name: mailbox.name || '',
+                    email: mailbox.email || '',
+                    unreadCount: 0,
+                    provider: String(mailbox.provider || '').toUpperCase(),
+                }));
+                setMailboxes(baseMailboxes);
 
                 const mailboxId = activeMailboxId || availableMailboxes[0].id;
+                if (String(activeMailboxId || '') !== String(mailboxId)) {
+                    setActiveMailboxId(mailboxId);
+                }
                 if (lastFetchedFoldersMailboxIdRef.current === mailboxId) {
+                    void Promise.allSettled(
+                        availableMailboxes.map((mailbox: any) => api.get(`/mailboxes/${mailbox.id}/unread-count`)),
+                    ).then((unreadResponses) => {
+                        setMailboxes((prev) => prev.map((mailbox, index) => {
+                            const unreadEntry = unreadResponses[index];
+                            const unreadCount = unreadEntry?.status === 'fulfilled'
+                                ? Number(unreadEntry.value?.data?.unreadCount || 0)
+                                : 0;
+                            return {
+                                ...mailbox,
+                                unreadCount,
+                            };
+                        }));
+                    });
                     return;
                 }
                 lastFetchedFoldersMailboxIdRef.current = mailboxId;
-                setActiveMailboxId(mailboxId);
                 const folderResponse = await api.get(`/mailboxes/${mailboxId}/folders`);
                 const folders = Array.isArray(folderResponse.data) ? folderResponse.data : [];
                 const canonicalFolders = new Map<FolderNavType, { id: string; name: string; unreadCount?: number; type: FolderNavType }>();
@@ -1646,6 +1822,21 @@ const InboxPage: React.FC = () => {
                     }
                     return nextFolders[0].id;
                 });
+
+                void Promise.allSettled(
+                    availableMailboxes.map((mailbox: any) => api.get(`/mailboxes/${mailbox.id}/unread-count`)),
+                ).then((unreadResponses) => {
+                    setMailboxes((prev) => prev.map((mailbox, index) => {
+                        const unreadEntry = unreadResponses[index];
+                        const unreadCount = unreadEntry?.status === 'fulfilled'
+                            ? Number(unreadEntry.value?.data?.unreadCount || 0)
+                            : 0;
+                        return {
+                            ...mailbox,
+                            unreadCount,
+                        };
+                    }));
+                });
             } catch (error) {
                 console.error('Failed to fetch mailbox folders:', error);
             }
@@ -1653,6 +1844,54 @@ const InboxPage: React.FC = () => {
 
         fetchMailboxFolders();
     }, [activeMailboxId, canFetchProtectedData, mailboxDataVersion]);
+
+    useEffect(() => {
+        const handleMailboxDeleted = (event: Event) => {
+            const customEvent = event as CustomEvent<{ mailboxId?: string }>;
+            const removedMailboxId = String(customEvent.detail?.mailboxId || '').trim();
+            if (!removedMailboxId) return;
+
+            setMailboxes((prev) => prev.filter((mailbox) => String(mailbox.id) !== removedMailboxId));
+            setMailboxFolders((prev) => prev.filter((folder) => String((folder as any).mailboxId || activeMailboxId) !== removedMailboxId));
+
+            const openThreadMailboxId =
+                String(openThread?.mailboxId || '').trim()
+                || String(
+                    apiThreadsRef.current.find((entry) => String(entry.id) === String(resolvedRouteThreadId || ''))?.mailboxId || '',
+                ).trim();
+            const deletedMailboxIsOpen =
+                openThreadMailboxId
+                && String(openThreadMailboxId) === removedMailboxId;
+
+            if (String(activeMailboxId) === removedMailboxId || deletedMailboxIsOpen) {
+                setActiveMailboxId('');
+                setActiveFolderId('');
+                setApiThreads([]);
+                setApiThreadMessages([]);
+                setInternalNotes([]);
+                setLoadedThread(null);
+                setLocalMessages([]);
+                lastFetchedFoldersMailboxIdRef.current = null;
+                navigate('/inbox');
+            }
+
+            setMailboxDataVersion((prev) => prev + 1);
+            setRealtimeListVersion((prev) => prev + 1);
+        };
+
+        const handleMailboxDeleteRollback = () => {
+            lastFetchedFoldersMailboxIdRef.current = null;
+            setMailboxDataVersion((prev) => prev + 1);
+            setRealtimeListVersion((prev) => prev + 1);
+        };
+
+        window.addEventListener('sermuno:mailbox-deleted', handleMailboxDeleted as EventListener);
+        window.addEventListener('sermuno:mailbox-delete-rollback', handleMailboxDeleteRollback as EventListener);
+        return () => {
+            window.removeEventListener('sermuno:mailbox-deleted', handleMailboxDeleted as EventListener);
+            window.removeEventListener('sermuno:mailbox-delete-rollback', handleMailboxDeleteRollback as EventListener);
+        };
+    }, [activeMailboxId, openThread?.mailboxId, navigate, resolvedRouteThreadId]);
 
     useEffect(() => {
         if (!canFetchProtectedData) return;
@@ -1707,6 +1946,8 @@ const InboxPage: React.FC = () => {
         }
         if (resolvedRouteThreadId) {
             const fetchThreadStr = async () => {
+                const requestVersion = ++threadDetailRequestVersionRef.current;
+                const requestedThreadId = String(resolvedRouteThreadId);
                 setIsThreadLoading(true);
                 try {
                     const normalizedThreadId = resolvedRouteThreadId;
@@ -1715,6 +1956,12 @@ const InboxPage: React.FC = () => {
                         api.get(`/threads/${normalizedThreadId}/notes`),
                         api.get(`/messages`, { params: { threadId: normalizedThreadId, limit: 100 } }),
                     ]);
+                    if (
+                        requestVersion !== threadDetailRequestVersionRef.current
+                        || String(resolvedRouteThreadIdRef.current || '') !== requestedThreadId
+                    ) {
+                        return;
+                    }
                     const res = threadRes;
                     const rawMessages = messagesRes.data?.items || messagesRes.data?.messages || (Array.isArray(messagesRes.data) ? messagesRes.data : []);
                     
@@ -1791,18 +2038,38 @@ const InboxPage: React.FC = () => {
                     }
                 } catch (e) {
                     console.error('Failed to fetch thread messages:', e);
+                    if (
+                        requestVersion !== threadDetailRequestVersionRef.current
+                        || String(resolvedRouteThreadIdRef.current || '') !== requestedThreadId
+                    ) {
+                        return;
+                    }
+                    const statusCode = Number((e as any)?.response?.status || 0);
+                    if (statusCode === 404) {
+                        setApiThreadMessages([]);
+                        setInternalNotes([]);
+                        setLoadedThread(null);
+                        setLocalMessages([]);
+                        navigate('/inbox');
+                    }
                 } finally {
-                    setIsThreadLoading(false);
+                    if (
+                        requestVersion === threadDetailRequestVersionRef.current
+                        && String(resolvedRouteThreadIdRef.current || '') === requestedThreadId
+                    ) {
+                        setIsThreadLoading(false);
+                    }
                 }
             };
             fetchThreadStr();
         } else {
+            threadDetailRequestVersionRef.current += 1;
             setIsThreadLoading(false);
             setApiThreadMessages([]);
             setInternalNotes([]);
             setLoadedThread(null);
         }
-    }, [resolvedRouteThreadId, canFetchProtectedData, mailboxes, detailRefreshVersion]);
+    }, [resolvedRouteThreadId, canFetchProtectedData, mailboxes, detailRefreshVersion, navigate]);
 
     useEffect(() => {
         api.get('/templates').then(res => {
@@ -1964,6 +2231,54 @@ const InboxPage: React.FC = () => {
         const mailboxId = apiThreadsRef.current.find((entry) => String(entry.id) === threadId)?.mailboxId || activeMailboxId || null;
         refreshSidebarDataForEvent(mailboxId, threadId);
         setOpenDropdown(null);
+    };
+
+    const handleRequestDeleteThread = () => {
+        if (!actualOpenThread || isDeletingThread) return;
+        setOpenDropdown(null);
+        setIsThreadDeleteConfirmOpen(true);
+    };
+
+    const handleDeleteThread = async () => {
+        if (!actualOpenThread || isDeletingThread) return;
+        const normalizedThreadId = normalizeThreadApiId(String(actualOpenThread.id));
+        const mailboxId = actualOpenThread.mailboxId || activeMailboxId || null;
+
+        setIsDeletingThread(true);
+        try {
+            await api.delete(`/threads/${normalizedThreadId}`, {
+                timeout: 15000,
+            });
+
+            setApiThreads((prev) =>
+                prev.filter((entry) => normalizeThreadApiId(String(entry.id)) !== normalizedThreadId),
+            );
+            setApiThreadMessages([]);
+            setInternalNotes([]);
+            setLoadedThread(null);
+            setLocalMessages([]);
+            setOpenDropdown(null);
+            setIsThreadDeleteConfirmOpen(false);
+            setIsReplyExpanded(false);
+
+            setLocalReplies((prev) => {
+                const next = { ...prev };
+                delete next[normalizedThreadId];
+                return next;
+            });
+
+            refreshSidebarDataForEvent(mailboxId, normalizedThreadId);
+            navigate('/inbox');
+        } catch (error) {
+            console.error('Failed to delete thread:', error);
+            const message = typeof error === 'object' && error && 'response' in error
+                ? String((error as any)?.response?.data?.message || '')
+                : '';
+            const normalizedMessage = message.trim();
+            window.alert(normalizedMessage || 'Failed to delete thread. Please try again.');
+        } finally {
+            setIsDeletingThread(false);
+        }
     };
 
     const handleSetThreadReadState = async (threadIdValue: string, isRead: boolean) => {
@@ -2397,32 +2712,30 @@ const InboxPage: React.FC = () => {
                 scheduleThreadListRefresh();
             }
 
+            const normalizedUpdatedThreadId = normalizeThreadApiId(updatedThreadId);
+            const normalizedOpenThreadId = normalizeThreadApiId(String(resolvedRouteThreadId || ''));
+            if (normalizedOpenThreadId && normalizedUpdatedThreadId === normalizedOpenThreadId) {
+                scheduleOpenThreadDetailRefresh({ immediate: true, retry: true });
+            }
+
             refreshSidebarDataForEvent(eventMailboxId, updatedThreadId);
         };
 
         const handleNewMessage = (message: any) => {
             const eventMailboxId = message?.mailboxId || null;
             const eventThreadId = String(message?.threadId || '');
+            const normalizedEventThreadId = normalizeThreadApiId(eventThreadId);
+            const normalizedOpenThreadId = normalizeThreadApiId(String(resolvedRouteThreadId || ''));
 
-            if (message.direction === 'INBOUND' && resolvedRouteThreadId && String(message.threadId) === resolvedRouteThreadId) {
-                const mapped = {
-                    id: message.id,
-                    threadId: message.threadId,
-                    fromEmail: message.fromEmail,
-                    toEmail: (message.to || []).join(', '),
-                    to: normalizeAddressList(message.to),
-                    cc: normalizeAddressList(message.cc),
-                    bcc: normalizeAddressList(message.bcc),
-                    replyTo: normalizeAddressList(message.replyTo),
-                    subject: message.subject || '',
-                    bodyText: message.bodyText || '',
-                    bodyHtml: message.bodyHtml || '',
-                    createdAt: message.createdAt,
-                    direction: message.direction,
-                    isRead: message.isRead,
-                    attachments: message.attachments || [],
-                };
-                setApiThreadMessages(prev => [...prev, mapped]);
+            if (
+                message.direction === 'INBOUND'
+                && normalizedOpenThreadId
+                && normalizedEventThreadId === normalizedOpenThreadId
+            ) {
+                scheduleOpenThreadDetailRefresh({ immediate: true, retry: true });
+            } else if (normalizedOpenThreadId && normalizedEventThreadId === normalizedOpenThreadId) {
+                // Keep open thread detail consistent even when socket payload is partial.
+                scheduleOpenThreadDetailRefresh({ immediate: true, retry: true });
             }
 
             if (!shouldProcessMailboxEvent(eventMailboxId, eventThreadId)) return;
@@ -2487,7 +2800,7 @@ const InboxPage: React.FC = () => {
             socket.off('mailbox:synced', handleMailboxSynced);
             socket.off('thread:note_added', handleThreadNoteAdded);
         };
-    }, [activeFolderId, socket, isConnected, resolvedRouteThreadId, scheduleThreadListRefresh, currentPage, shouldProcessMailboxEvent, refreshSidebarDataForEvent, mergeNoteMentionDirectory]);
+    }, [activeFolderId, socket, isConnected, resolvedRouteThreadId, scheduleThreadListRefresh, currentPage, shouldProcessMailboxEvent, refreshSidebarDataForEvent, mergeNoteMentionDirectory, scheduleOpenThreadDetailRefresh]);
 
     // Derived open thread with overrides
     const actualOpenThread = useMemo(() => {
@@ -2825,15 +3138,36 @@ const InboxPage: React.FC = () => {
         if (isSidebarManualRefreshing || !canFetchProtectedData) return;
         setIsSidebarManualRefreshing(true);
         try {
-            await loadInboxCounts();
+            const currentFolderType = resolveRefreshFolderType();
+
+            const refreshStartedAt = performance.now();
+            if (activeMailboxId) {
+                await api.post(`/mailboxes/${activeMailboxId}/refresh`, {
+                    currentFolderType,
+                    threadId: resolvedRouteThreadId || null,
+                }, {
+                    timeout: 4500,
+                });
+            }
+
             lastFetchedFoldersMailboxIdRef.current = null;
             setMailboxDataVersion((prev) => prev + 1);
             setRealtimeListVersion((prev) => prev + 1);
-            setDetailRefreshVersion((prev) => prev + 1);
+
+            if (resolvedRouteThreadId) {
+                scheduleOpenThreadDetailRefresh({ immediate: true, retry: true });
+            } else {
+                setDetailRefreshVersion((prev) => prev + 1);
+            }
+            void loadInboxCounts();
+
+            console.info('Inbox refresh completed in', Math.round(performance.now() - refreshStartedAt), 'ms');
+        } catch (error) {
+            console.error('Failed to refresh inbox:', error);
         } finally {
             setIsSidebarManualRefreshing(false);
         }
-    }, [canFetchProtectedData, isSidebarManualRefreshing, loadInboxCounts]);
+    }, [activeMailboxId, canFetchProtectedData, isSidebarManualRefreshing, loadInboxCounts, resolvedRouteThreadId, scheduleOpenThreadDetailRefresh, resolveRefreshFolderType]);
 
     const expandAllSidebarSections = () => {
         setExpandedStatus(true);
@@ -3417,7 +3751,9 @@ const InboxPage: React.FC = () => {
                                 </div>
                             </div>
                             <div className="flex-1 overflow-y-auto no-scrollbar p-3 space-y-2.5">
-                                {threads.map((thread) => {
+                                {isThreadListLoading ? (
+                                    <InboxThreadListSkeleton />
+                                ) : threads.map((thread) => {
                                     const isCurrentThread = actualOpenThread && String(thread.id).replace('t', '') === String(actualOpenThread.id).replace('t', '');
                                     return (
                                         <button
@@ -3698,6 +4034,12 @@ const InboxPage: React.FC = () => {
                                                     >
                                                         {actualOpenThread.status === 'archived' ? 'Unarchive thread' : 'Archive thread'}
                                                     </button>
+                                                    <button
+                                                        onClick={handleRequestDeleteThread}
+                                                        className="w-full text-left px-3 py-2 text-[13px] hover:bg-red-50 text-red-600 transition-colors"
+                                                    >
+                                                        Delete thread
+                                                    </button>
                                                 </div>
                                             )}
                                         </div>
@@ -3847,11 +4189,13 @@ const InboxPage: React.FC = () => {
                                     </div>
                                 )
                             })}
-                            {localMessages.length === 0 && (
+                            {isThreadLoading && localMessages.length === 0 ? (
+                                <ThreadDetailSkeleton />
+                            ) : localMessages.length === 0 ? (
                                 <div className="text-center text-(--color-text-muted) py-8">
                                     <p className="text-sm">No messages loaded for this thread preview.</p>
                                 </div>
-                            )}
+                            ) : null}
                             <div ref={messagesEndRef} />
                         </div>
 
@@ -4510,6 +4854,11 @@ const InboxPage: React.FC = () => {
                     )}
                 </div>
             ) : resolvedRouteThreadId && !actualOpenThread ? (
+                isThreadLoading ? (
+                    <div className="flex-1 flex overflow-hidden bg-white">
+                        <ThreadDetailSkeleton />
+                    </div>
+                ) : (
                 <div className="flex-1 flex flex-col items-center justify-center bg-[var(--color-background)]/20">
                     <AlertCircle className="w-12 h-12 text-[var(--color-text-muted)] opacity-30 mb-4 mx-auto" />
                     <h3 className="text-base font-semibold text-[var(--color-text-primary)] mb-1 text-center">Thread not found</h3>
@@ -4521,6 +4870,7 @@ const InboxPage: React.FC = () => {
                         Return to Inbox
                     </button>
                 </div>
+                )
             ) : (
                 /* Thread List (Table Style) */
                 <div className="flex-1 flex flex-col overflow-hidden">
@@ -4674,7 +5024,9 @@ const InboxPage: React.FC = () => {
 
                     {/* ── Mobile: Gmail / Outlook-style thread list ── */}
                     <div className="md:hidden flex-1 overflow-y-auto divide-y divide-[var(--color-card-border)]/40 bg-white">
-                        {threads.length === 0 ? (
+                        {isThreadListLoading ? (
+                            <InboxThreadListSkeleton />
+                        ) : threads.length === 0 ? (
                             <div className="flex flex-col items-center justify-center py-20 text-[var(--color-text-muted)]">
                                 <InboxIcon className="w-10 h-10 opacity-20 mb-3" />
                                 <p className="text-sm font-medium">No threads found</p>
@@ -4777,7 +5129,13 @@ const InboxPage: React.FC = () => {
                                 </tr>
                             </thead>
                             <tbody>
-                                {threads.length === 0 ? (
+                                {isThreadListLoading ? (
+                                    <tr>
+                                        <td colSpan={5} className="px-0 py-0">
+                                            <InboxThreadListSkeleton />
+                                        </td>
+                                    </tr>
+                                ) : threads.length === 0 ? (
                                     <tr>
                                         <td colSpan={5} className="text-center py-12 text-[var(--color-text-muted)]">
                                             <InboxIcon className="w-10 h-10 opacity-20 mx-auto mb-2" />
@@ -4864,6 +5222,18 @@ const InboxPage: React.FC = () => {
                 isOpen={isComposeOpen}
                 onClose={handleCloseCompose}
                 defaultMailboxId={String(actualOpenThread?.mailboxId || activeMailboxId || '') || undefined}
+            />
+            <ConfirmDialog
+                isOpen={isThreadDeleteConfirmOpen}
+                title="Delete Thread"
+                description={`Delete "${actualOpenThread?.subject || 'this thread'}" and all related messages, attachments, notes, tags, schedules, and mailbox data? This cannot be undone.`}
+                confirmLabel="Delete Thread"
+                isSubmitting={isDeletingThread}
+                onCancel={() => {
+                    if (isDeletingThread) return;
+                    setIsThreadDeleteConfirmOpen(false);
+                }}
+                onConfirm={handleDeleteThread}
             />
         </div >
     );

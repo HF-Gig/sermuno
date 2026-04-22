@@ -124,13 +124,22 @@ const MailboxesPage = () => {
 
     const handleDelete = async (id: string) => {
         setDeleteSubmitting(true);
+        const previousMailboxes = mailboxes;
+        setMailboxes((prev) => prev.filter((mailbox) => mailbox.id !== id));
+        window.dispatchEvent(new CustomEvent('sermuno:mailbox-deleted', {
+            detail: { mailboxId: id },
+        }));
         try {
             await api.delete(`/mailboxes/${id}`);
             setMessage({ text: t('mailbox_removed_successfully'), type: 'success' });
             setDeleteConfirm(null);
-            fetchMailboxes();
         } catch (e) {
             console.error(e);
+            setMailboxes(previousMailboxes);
+            window.dispatchEvent(new CustomEvent('sermuno:mailbox-delete-rollback', {
+                detail: { mailboxId: id },
+            }));
+            setMessage({ text: 'Failed to remove mailbox', type: 'error' });
         } finally {
             setDeleteSubmitting(false);
         }

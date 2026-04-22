@@ -24,7 +24,10 @@ import type {
   TestConnectionDto,
 } from './dto/mailbox.dto';
 import { EMAIL_SYNC_QUEUE } from '../../jobs/queues/email-sync.queue';
-import type { EmailSyncJobData } from '../../jobs/processors/email-sync.processor';
+import {
+  EmailSyncProcessor,
+  type EmailSyncJobData,
+} from '../../jobs/processors/email-sync.processor';
 import { Prisma, ReadStateMode } from '@prisma/client';
 import { EventsGateway } from '../websockets/events.gateway';
 import { AuditService } from '../audit/audit.service';
@@ -45,6 +48,7 @@ export class MailboxesService {
     private readonly featureFlags: FeatureFlagsService,
     @InjectQueue(EMAIL_SYNC_QUEUE)
     private readonly emailSyncQueue: Queue<EmailSyncJobData>,
+    private readonly emailSyncProcessor: EmailSyncProcessor,
     @Optional() private readonly eventsGateway: EventsGateway | null,
     private readonly auditService: AuditService,
   ) {}
@@ -647,6 +651,113 @@ export class MailboxesService {
     );
 
     return { message: 'Sync job enqueued', mailboxId: id };
+  }
+
+  async refreshInbox(
+    id: string,
+    body: {
+      currentFolderType?: string;
+      threadId?: string | null;
+      fastPath?: boolean;
+    },
+    user: JwtUser,
+  ) {
+    if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
+      throw new ServiceUnavailableException(
+        'IMAP sync is temporarily disabled by an emergency kill switch',
+      );
+    }
+
+    const mailbox = await this.prisma.mailbox.findFirst({
+      where: { id, organizationId: user.organizationId, deletedAt: null },
+      select: { id: true, provider: true },
+    });
+    if (!mailbox) throw new NotFoundException('Mailbox not found');
+
+    const currentFolderType = String(body?.currentFolderType || '')
+      .trim()
+      .toLowerCase();
+    const canonicalFolderTypes = [
+      'inbox',
+      'sent',
+      'drafts',
+      'spam',
+      'trash',
+      'archive',
+    ] as const;
+    const orderedFolderTypes: NonNullable<EmailSyncJobData['folderTypeHints']> = Array.from(
+      new Set(
+        [
+          'inbox',
+          canonicalFolderTypes.includes(currentFolderType as any)
+            ? currentFolderType
+            : null,
+          'sent',
+          'drafts',
+          'spam',
+          'trash',
+          'archive',
+        ].filter(Boolean) as string[],
+      ),
+    ) as NonNullable<EmailSyncJobData['folderTypeHints']>;
+    const criticalFolderTypes: NonNullable<EmailSyncJobData['folderTypeHints']> = Array.from(
+      new Set(
+        [
+          'inbox',
+          currentFolderType &&
+          currentFolderType !== 'inbox' &&
+          canonicalFolderTypes.includes(currentFolderType as any)
+            ? currentFolderType
+            : null,
+        ].filter(Boolean),
+      ),
+    ) as NonNullable<EmailSyncJobData['folderTypeHints']>;
+
+    const refreshSummary = await this.emailSyncProcessor.refreshMailboxInteractive(
+      {
+        mailboxId: id,
+        organizationId: user.organizationId,
+        folderTypeHints: criticalFolderTypes,
+        reconcileDeletions: !Boolean(body?.fastPath),
+      },
+    );
+
+    const runFastPathOnly = Boolean(body?.fastPath);
+    if (!runFastPathOnly) {
+      void this.emailSyncQueue.add(
+        'sync',
+        {
+          mailboxId: id,
+          organizationId: user.organizationId,
+          streamingMode: false,
+          folderTypeHints: orderedFolderTypes,
+        },
+        {
+          attempts: 2,
+          backoff: { type: 'exponential', delay: 1000 },
+          priority: 2,
+          removeOnComplete: 50,
+          removeOnFail: 100,
+        },
+      );
+    }
+
+    return {
+      message: 'Inbox refreshed',
+      mailboxId: id,
+      provider: mailbox.provider,
+      refreshSummary: {
+        ...refreshSummary,
+        criticalFolderTypes,
+        backgroundFolderTypes: runFastPathOnly
+          ? []
+          : orderedFolderTypes.filter(
+          (folderType) => !criticalFolderTypes.includes(folderType),
+        ),
+        fastPath: runFastPathOnly,
+      },
+      threadId: body?.threadId ? String(body.threadId) : null,
+    };
   }
 
   // ─── Mailbox Access ───────────────────────────────────────────────────────

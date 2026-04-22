@@ -8,6 +8,7 @@ import {
   Logger,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../database/prisma.service';
 import type { JwtUser } from '../../common/decorators/current-user.decorator';
@@ -33,6 +34,8 @@ import {
 } from '@prisma/client';
 import * as crypto from 'crypto';
 import * as nodemailer from 'nodemailer';
+import { ImapFlow } from 'imapflow';
+import type { Queue } from 'bullmq';
 import type { Express } from 'express';
 import { readFile } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -51,6 +54,10 @@ import {
   type AttachmentVirusScanResult,
 } from '../attachments/attachment-virus-scanner.service';
 import { AttachmentStorageService } from '../attachments/attachment-storage.service';
+import {
+  THREAD_DELETE_QUEUE,
+  type ThreadDeleteJobData,
+} from '../../jobs/queues/thread-delete.queue';
 
 const ALGORITHM = 'aes-256-gcm';
 
@@ -143,6 +150,9 @@ type MappedThreadNote = {
 
 @Injectable()
 export class ThreadsService {
+  private static readonly THREAD_DELETE_PROVIDER_TIMEOUT_MS = 60000;
+  private static readonly THREAD_DELETE_TOTAL_TIMEOUT_MS = 120000;
+
   private readonly logger = new Logger(ThreadsService.name);
 
   constructor(
@@ -157,6 +167,8 @@ export class ThreadsService {
     private readonly messagesService: MessagesService,
     private readonly attachmentScanner: AttachmentVirusScannerService,
     private readonly attachmentStorage: AttachmentStorageService,
+    @InjectQueue(THREAD_DELETE_QUEUE)
+    private readonly threadDeleteQueue: Queue<ThreadDeleteJobData>,
   ) {}
 
   private async getUserTeamIds(userId: string): Promise<string[]> {
@@ -198,9 +210,15 @@ export class ThreadsService {
     providedTeamIds?: string[],
   ): Promise<Prisma.ThreadWhereInput> {
     const teamIds = providedTeamIds ?? (await this.getUserTeamIds(user.sub));
+    const hasExplicitStatusFilter =
+      Object.prototype.hasOwnProperty.call(extra, 'status') &&
+      extra.status !== undefined;
 
     return {
       organizationId: user.organizationId,
+      ...(!hasExplicitStatusFilter && {
+        status: { not: ThreadStatus.TRASH },
+      }),
       ...extra,
       mailbox: this.buildReadableMailboxWhere(user.sub, teamIds),
     };
@@ -3079,6 +3097,511 @@ export class ThreadsService {
     });
 
     return updated;
+  }
+
+  async remove(
+    threadId: string,
+    user: JwtUser,
+    meta: RequestMeta = {},
+  ) {
+    const where = await this.buildReadableThreadWhere(user, { id: threadId });
+    const thread = await this.prisma.thread.findFirst({
+      where,
+      select: {
+        id: true,
+        mailboxId: true,
+        organizationId: true,
+        subject: true,
+        status: true,
+        _count: {
+          select: {
+            messages: true,
+          },
+        },
+      },
+    });
+
+    if (!thread) {
+      throw new NotFoundException('Thread not found');
+    }
+
+    const now = new Date();
+    await this.prisma.thread.update({
+      where: { id: thread.id },
+      data: {
+        status: ThreadStatus.TRASH,
+        archivedAt: now,
+        previousStatus: thread.status,
+      },
+    });
+
+    await this.threadDeleteQueue.add(
+      'provider-delete',
+      {
+        threadId: thread.id,
+        mailboxId: thread.mailboxId,
+        organizationId: user.organizationId,
+        requestedByUserId: user.sub,
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+      },
+      {
+        attempts: 8,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: 100,
+        removeOnFail: 200,
+        priority: 3,
+      },
+    );
+
+    void this.logAuditSafe({
+      organizationId: user.organizationId,
+      userId: user.sub,
+      action: 'DELETE',
+      entityType: 'thread',
+      entityId: thread.id,
+      previousValue: {
+        mailboxId: thread.mailboxId,
+        subject: thread.subject,
+        messageCount: thread._count.messages,
+      },
+      newValue: {
+        deleted: 'pending_provider_cleanup',
+        queued: true,
+      },
+      ipAddress: meta.ipAddress,
+      userAgent: meta.userAgent,
+    });
+
+    void this.eventsGateway.emitToMailbox(thread.mailboxId, 'thread:updated', {
+      threadId: thread.id,
+      mailboxId: thread.mailboxId,
+      type: 'deleted_pending',
+    });
+    void this.eventsGateway.emitToMailbox(
+      thread.mailboxId,
+      'thread:deleted_pending',
+      {
+        threadId: thread.id,
+        mailboxId: thread.mailboxId,
+      },
+    );
+
+    return {
+      success: true,
+      threadId: thread.id,
+      mailboxId: thread.mailboxId,
+      queued: true,
+      deletedMessages: thread._count.messages,
+    };
+  }
+
+  async processQueuedThreadDelete(job: ThreadDeleteJobData): Promise<void> {
+    const thread = await this.prisma.thread.findFirst({
+      where: {
+        id: job.threadId,
+        mailboxId: job.mailboxId,
+        organizationId: job.organizationId,
+      },
+      include: {
+        mailbox: {
+          select: {
+            id: true,
+            provider: true,
+            name: true,
+            email: true,
+            imapHost: true,
+            imapPort: true,
+            imapSecure: true,
+            imapUser: true,
+            imapPass: true,
+            oauthAccessToken: true,
+            googleAccessToken: true,
+            lastSyncError: true,
+          },
+        },
+        messages: {
+          select: {
+            id: true,
+            imapUid: true,
+            folderId: true,
+            messageId: true,
+            attachments: {
+              select: {
+                id: true,
+                storageKey: true,
+              },
+            },
+            folder: {
+              select: {
+                name: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!thread) {
+      return;
+    }
+
+    const providerDeletion = await this.withTimeout(
+      this.deleteThreadMessagesFromProvider({
+        organizationId: job.organizationId,
+        mailbox: thread.mailbox,
+        messages: thread.messages
+          .map((message) => ({
+            imapUid: message.imapUid,
+            folderName: message.folder?.name || null,
+          }))
+          .filter(
+            (entry): entry is { imapUid: number; folderName: string } =>
+              typeof entry.imapUid === 'number' &&
+              entry.imapUid > 0 &&
+              Boolean(entry.folderName),
+          ),
+      }),
+      ThreadsService.THREAD_DELETE_TOTAL_TIMEOUT_MS,
+      'Timed out while deleting thread from provider mailbox.',
+    );
+
+    await this.finalizeDeletedThreadCleanup(thread, job, providerDeletion);
+  }
+
+  private async finalizeDeletedThreadCleanup(
+    thread: {
+      id: string;
+      mailboxId: string;
+      organizationId: string;
+      subject: string;
+      messages: Array<{
+        id: string;
+        attachments: Array<{ storageKey: string | null }>;
+      }>;
+    },
+    job: ThreadDeleteJobData,
+    providerDeletion: {
+      attempted: boolean;
+      deletedCount: number;
+      movedToTrashCount: number;
+      skippedReason?: string;
+    },
+  ): Promise<void> {
+    const messageIds = thread.messages.map((message) => message.id);
+    const attachmentStorageKeys = Array.from(
+      new Set(
+        thread.messages.flatMap((message) =>
+          message.attachments
+            .map((attachment) => String(attachment.storageKey || '').trim())
+            .filter((storageKey) => storageKey.length > 0),
+        ),
+      ),
+    );
+
+    const notificationsToDelete = await this.prisma.notification.findMany({
+      where: {
+        organizationId: thread.organizationId,
+        resourceId: thread.id,
+      },
+      select: { id: true },
+    });
+    const notificationIds = notificationsToDelete.map((row) => row.id);
+
+    await this.prisma.$transaction(async (tx) => {
+      if (notificationIds.length > 0) {
+        await tx.notificationDigestItem.deleteMany({
+          where: {
+            notificationId: { in: notificationIds },
+          },
+        });
+      }
+
+      await tx.notification.deleteMany({
+        where: {
+          organizationId: thread.organizationId,
+          resourceId: thread.id,
+        },
+      });
+
+      await tx.scheduledMessage.deleteMany({
+        where: {
+          organizationId: thread.organizationId,
+          threadId: thread.id,
+        },
+      });
+
+      await tx.threadTag.deleteMany({
+        where: { threadId: thread.id },
+      });
+
+      await tx.threadNote.deleteMany({
+        where: {
+          organizationId: thread.organizationId,
+          threadId: thread.id,
+        },
+      });
+
+      if (messageIds.length > 0) {
+        await tx.attachment.deleteMany({
+          where: {
+            messageId: { in: messageIds },
+          },
+        });
+
+        await tx.auditLog.deleteMany({
+          where: {
+            organizationId: thread.organizationId,
+            OR: [
+              { entityType: 'message', entityId: { in: messageIds } },
+              { entityType: 'thread', entityId: thread.id },
+            ],
+          },
+        });
+      } else {
+        await tx.auditLog.deleteMany({
+          where: {
+            organizationId: thread.organizationId,
+            entityType: 'thread',
+            entityId: thread.id,
+          },
+        });
+      }
+
+      await tx.message.deleteMany({
+        where: {
+          threadId: thread.id,
+        },
+      });
+
+      await tx.thread.deleteMany({
+        where: { id: thread.id },
+      });
+    });
+
+    await Promise.all(
+      attachmentStorageKeys.map((storageKey) =>
+        this.attachmentStorage.delete(storageKey).catch((error) => {
+          this.logger.warn(
+            `[threads] failed to delete attachment storageKey=${storageKey} for thread=${thread.id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }),
+      ),
+    );
+
+    await this.logAuditSafe({
+      organizationId: thread.organizationId,
+      userId: job.requestedByUserId || undefined,
+      action: 'DELETE',
+      entityType: 'thread',
+      entityId: thread.id,
+      previousValue: {
+        mailboxId: thread.mailboxId,
+        subject: thread.subject,
+        messageCount: messageIds.length,
+      },
+      newValue: {
+        deleted: true,
+        providerDeletion,
+      },
+      ipAddress: job.ipAddress,
+      userAgent: job.userAgent,
+    });
+
+    void this.eventsGateway.emitToMailbox(thread.mailboxId, 'thread:updated', {
+      threadId: thread.id,
+      mailboxId: thread.mailboxId,
+      type: 'deleted',
+    });
+    void this.eventsGateway.emitToMailbox(thread.mailboxId, 'thread:deleted', {
+      threadId: thread.id,
+      mailboxId: thread.mailboxId,
+      providerDeletion,
+    });
+  }
+
+  private async deleteThreadMessagesFromProvider(input: {
+    organizationId: string;
+    mailbox: {
+      id: string;
+      provider: string;
+      name: string;
+      email: string | null;
+      imapHost: string | null;
+      imapPort: number | null;
+      imapSecure: boolean;
+      imapUser: string | null;
+      imapPass: string | null;
+      oauthAccessToken: string | null;
+      googleAccessToken: string | null;
+      lastSyncError: string | null;
+    };
+    messages: Array<{ imapUid: number; folderName: string }>;
+  }): Promise<{
+    attempted: boolean;
+    deletedCount: number;
+    movedToTrashCount: number;
+    skippedReason?: string;
+  }> {
+    if (input.messages.length === 0) {
+      return {
+        attempted: false,
+        deletedCount: 0,
+        movedToTrashCount: 0,
+        skippedReason: 'No provider-linked IMAP message UIDs on this thread',
+      };
+    }
+
+    const host = String(input.mailbox.imapHost || '').trim();
+    const port = Number(input.mailbox.imapPort || 0);
+    const authUser = String(
+      input.mailbox.imapUser || input.mailbox.email || '',
+    ).trim();
+    const decryptedImapPass = this.decryptSecretIfNeeded(input.mailbox.imapPass);
+    const oauthAccessToken =
+      this.decryptSecretIfNeeded(input.mailbox.oauthAccessToken) ||
+      this.decryptSecretIfNeeded(input.mailbox.googleAccessToken);
+
+    if (!host || !port || !authUser) {
+      throw new BadRequestException(
+        'Mailbox IMAP connection is not configured for provider-side thread deletion.',
+      );
+    }
+
+    if (!decryptedImapPass && !oauthAccessToken) {
+      throw new BadRequestException(
+        'Mailbox credentials are missing for provider-side thread deletion.',
+      );
+    }
+
+    const client = new ImapFlow({
+      host,
+      port,
+      secure: input.mailbox.imapSecure ?? true,
+      auth: oauthAccessToken
+        ? { user: authUser, accessToken: oauthAccessToken }
+        : { user: authUser, pass: decryptedImapPass as string },
+      logger: false,
+      disableAutoEnable: true,
+      connectionTimeout: ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+      greetingTimeout: ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+      socketTimeout: ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+    });
+
+    const trashFolder = await this.resolveProviderTrashFolderName(
+      input.mailbox.id,
+      input.mailbox.provider,
+    );
+    const groupedByFolder = input.messages.reduce<
+      Record<string, number[]>
+    >((acc, message) => {
+      const key = String(message.folderName || '').trim();
+      if (!key) return acc;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(message.imapUid);
+      return acc;
+    }, {});
+
+    let deletedCount = 0;
+    let movedToTrashCount = 0;
+
+    try {
+      await this.withTimeout(
+        client.connect(),
+        ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+        'Timed out while connecting to mailbox provider for thread deletion.',
+      );
+      for (const [folderName, uids] of Object.entries(groupedByFolder)) {
+        const uniqueUids = Array.from(new Set(uids.filter((uid) => uid > 0)));
+        if (uniqueUids.length === 0) continue;
+
+        const lock = await this.withTimeout(
+          client.getMailboxLock(folderName),
+          ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+          `Timed out while locking mailbox folder "${folderName}" for thread deletion.`,
+        );
+        try {
+          if (trashFolder && folderName !== trashFolder) {
+            await this.withTimeout(
+              client.messageMove(uniqueUids, trashFolder, { uid: true }),
+              ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+              `Timed out while moving thread messages to trash in folder "${folderName}".`,
+            );
+            movedToTrashCount += uniqueUids.length;
+          } else {
+            await this.withTimeout(
+              client.messageDelete(uniqueUids, { uid: true }),
+              ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+              `Timed out while deleting thread messages in folder "${folderName}".`,
+            );
+            deletedCount += uniqueUids.length;
+          }
+        } finally {
+          lock.release();
+        }
+      }
+    } catch (error) {
+      throw new BadRequestException(
+        `Failed to delete thread from provider mailbox: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      try {
+        client.close();
+      } catch {
+        // ignore close failures
+      }
+    }
+
+    return {
+      attempted: true,
+      deletedCount,
+      movedToTrashCount,
+    };
+  }
+
+  private async resolveProviderTrashFolderName(
+    mailboxId: string,
+    provider: string,
+  ): Promise<string | null> {
+    const persistedTrash = await this.prisma.mailboxFolder.findFirst({
+      where: {
+        mailboxId,
+        type: 'trash',
+      },
+      select: { name: true },
+    });
+    if (persistedTrash?.name) {
+      return persistedTrash.name;
+    }
+
+    const providerKey = String(provider || '').toUpperCase();
+    if (providerKey === 'GMAIL') return '[Gmail]/Trash';
+    if (providerKey === 'OUTLOOK') return 'Deleted Items';
+    return null;
+  }
+
+  private async withTimeout<T>(
+    operation: Promise<T>,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<T> {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error(timeoutMessage));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([operation, timeoutPromise]);
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
   }
 
   private async logAuditSafe(input: {

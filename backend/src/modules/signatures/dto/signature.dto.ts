@@ -73,6 +73,10 @@ export class UpdateSignatureDto {
 
 export class AssignSignatureDto {
   @IsOptional()
+  @IsIn(['organization', 'team', 'personal'])
+  scope?: string;
+
+  @IsOptional()
   @IsString()
   mailboxId?: string;
 

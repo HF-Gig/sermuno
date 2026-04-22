@@ -115,6 +115,17 @@ export class ThreadsController {
     return this.threadsService.update(id, dto, user, extractRequestMeta(req));
   }
 
+  // DELETE /threads/:id
+  @Delete(':id')
+  @HttpCode(HttpStatus.OK)
+  remove(
+    @Param('id') id: string,
+    @CurrentUser() user: JwtUser,
+    @Req() req: Request,
+  ) {
+    return this.threadsService.remove(id, user, extractRequestMeta(req));
+  }
+
   // PATCH /threads/:id/star
   @Patch(':id/star')
   star(

@@ -8,11 +8,14 @@ import { simpleParser } from 'mailparser';
 import { EMAIL_SYNC_QUEUE } from '../queues/email-sync.queue';
 import { PrismaService } from '../../database/prisma.service';
 import { CrmService } from '../../modules/crm/crm.service';
+import { AttachmentStorageService } from '../../modules/attachments/attachment-storage.service';
 import type { Prisma } from '@prisma/client';
+import { ThreadStatus } from '@prisma/client';
 import { EventsGateway } from '../../modules/websockets/events.gateway';
 import { FeatureFlagsService } from '../../config/feature-flags.service';
 import { RulesEngineService } from '../../modules/rules/rules-engine.service';
 import { AiCategorizationService } from '../../modules/ai-categorization/ai-categorization.service';
+import { NotificationsService } from '../../modules/notifications/notifications.service';
 import {
   resolveEmailSyncProviderPolicy,
   sharedEmailSyncRateLimiter,
@@ -34,6 +37,62 @@ export interface EmailSyncJobData {
    */
   folderTypeHints?: Array<'inbox' | 'sent' | 'drafts' | 'spam' | 'trash' | 'archive'>;
 }
+
+type SyncExecutionOptions = {
+  interactive?: boolean;
+  reconcileDeletions?: boolean;
+  runtimeCache?: SyncRuntimeCache;
+};
+
+type ThreadLookupResult = {
+  id: string;
+  contactId: string | null;
+  companyId: string | null;
+};
+
+type SyncRuntimeCache = {
+  threadByMessageId: Map<string, ThreadLookupResult>;
+  threadBySubject: Map<string, ThreadLookupResult>;
+  contactLinkByEmail: Map<string, { contactId: string | null; companyId: string | null }>;
+};
+
+type UpsertTiming = {
+  parseMs: number;
+  dedupeMs: number;
+  threadResolveMs: number;
+  createMs: number;
+  postIngestMs: number;
+};
+
+type FolderSyncTiming = {
+  path: string;
+  type: string;
+  totalMs: number;
+  lockMs: number;
+  folderLookupMs: number;
+  deletionReconcileMs: number;
+  searchMs: number;
+  fetchMs: number;
+  upsertMs: number;
+  parseMs: number;
+  dedupeMs: number;
+  threadResolveMs: number;
+  createMs: number;
+  postIngestMs: number;
+  counterRefreshMs: number;
+  newMessageCount: number;
+  reconciledDeletedMessages: number;
+};
+
+type MailboxSyncTimingSummary = {
+  mailboxLookupMs: number;
+  credentialPrepMs: number;
+  connectMs: number;
+  syncFoldersMs: number;
+  finalizeMs: number;
+  totalMs: number;
+  folderTimings: FolderSyncTiming[];
+};
 
 const STREAM_CHUNK_SIZE = 100;
 const STREAM_DELAY_MS = 50;
@@ -57,6 +116,23 @@ const CANONICAL_FOLDER_TYPES = new Set([
   'trash',
   'archive',
 ]);
+
+const FOLDER_MESSAGE_PRIORITY: Record<string, number> = {
+  inbox: 0,
+  sent: 1,
+  drafts: 2,
+  spam: 3,
+  trash: 4,
+  archive: 5,
+  custom: 6,
+  excluded: 7,
+};
+
+function normalizeRfcMessageId(value?: string | null): string | null {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  return raw.startsWith('<') && raw.endsWith('>') ? raw : `<${raw}>`;
+}
 
 /** Folders to sync (by resolved type). */
 const SYNC_FOLDER_TYPES = new Set([
@@ -232,6 +308,16 @@ class KillSwitchActivatedError extends Error {
 export class EmailSyncProcessor extends WorkerHost {
   private readonly logger = new Logger(EmailSyncProcessor.name);
   private readonly adaptiveThrottle = new EmailSyncAdaptiveThrottle();
+  private readonly interactiveImapClientTtlMs = 45_000;
+  private readonly interactiveImapClients = new Map<
+    string,
+    {
+      authHash: string;
+      client: ImapFlow;
+      expiresAt: number;
+      busy: boolean;
+    }
+  >();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -249,15 +335,81 @@ export class EmailSyncProcessor extends WorkerHost {
     @Optional()
     @Inject(AiCategorizationService)
     private readonly aiCategorizationService: AiCategorizationService | null,
+    @Optional()
+    @Inject(NotificationsService)
+    private readonly notificationsService: NotificationsService | null,
+    private readonly attachmentStorage: AttachmentStorageService,
   ) {
     super();
   }
 
   async process(job: Job<EmailSyncJobData>): Promise<void> {
-    const { mailboxId, organizationId, streamingMode } = job.data;
+    await this.runMailboxSync({
+      mailboxId: job.data.mailboxId,
+      organizationId: job.data.organizationId,
+      streamingMode: job.data.streamingMode ?? false,
+      folderTypeHints: job.data.folderTypeHints,
+      options: {
+        interactive: false,
+        reconcileDeletions: false,
+      },
+    });
+  }
+
+  async refreshMailboxInteractive(params: {
+    mailboxId: string;
+    organizationId: string;
+    folderTypeHints?: EmailSyncJobData['folderTypeHints'];
+    reconcileDeletions?: boolean;
+  }): Promise<{
+    mailboxId: string;
+    durationMs: number;
+    folderTypeHints: string[];
+    timings: MailboxSyncTimingSummary;
+  }> {
+    const startedAt = Date.now();
+    const timings = await this.runMailboxSync({
+      mailboxId: params.mailboxId,
+      organizationId: params.organizationId,
+      streamingMode: false,
+      folderTypeHints: params.folderTypeHints,
+      options: {
+        interactive: true,
+        reconcileDeletions: params.reconcileDeletions ?? true,
+      },
+    });
+
+    return {
+      mailboxId: params.mailboxId,
+      durationMs: Date.now() - startedAt,
+      folderTypeHints: Array.isArray(params.folderTypeHints)
+        ? params.folderTypeHints
+        : [],
+      timings,
+    };
+  }
+
+  private async runMailboxSync(params: {
+    mailboxId: string;
+    organizationId: string;
+    streamingMode: boolean;
+    folderTypeHints?: EmailSyncJobData['folderTypeHints'];
+    options: SyncExecutionOptions;
+  }): Promise<MailboxSyncTimingSummary> {
+    const { mailboxId, organizationId, streamingMode } = params;
     const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
+    const runStartedAt = Date.now();
+    const timings: MailboxSyncTimingSummary = {
+      mailboxLookupMs: 0,
+      credentialPrepMs: 0,
+      connectMs: 0,
+      syncFoldersMs: 0,
+      finalizeMs: 0,
+      totalMs: 0,
+      folderTimings: [],
+    };
     this.logger.log(
-      `[email-sync] mailbox=${mailboxId} org=${organizationId} streaming=${streamingMode ?? false}`,
+      `[email-sync] mailbox=${mailboxId} org=${organizationId} streaming=${streamingMode ?? false} interactive=${params.options.interactive ?? false} reconcileDeletions=${params.options.reconcileDeletions ?? false}`,
     );
     if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
       await this.markMailboxSyncSkippedByKillSwitch(
@@ -265,19 +417,25 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         'IMAP sync skipped because DISABLE_IMAP_SYNC is active',
       );
-      return;
+      timings.totalMs = Date.now() - runStartedAt;
+      return timings;
     }
-    await this.awaitAdaptiveThrottle(adaptiveBucketKey, mailboxId, 'job-start');
+    if (!params.options.interactive) {
+      await this.awaitAdaptiveThrottle(adaptiveBucketKey, mailboxId, 'job-start');
+    }
 
-    const mailbox = await this.prisma.mailbox.findFirst({
-      where: { id: mailboxId, organizationId, deletedAt: null },
+    const mailboxLookupStartedAt = Date.now();
+    const mailbox = await this.prisma.mailbox.findUnique({
+      where: { id: mailboxId },
     });
+    timings.mailboxLookupMs = Date.now() - mailboxLookupStartedAt;
 
-    if (!mailbox) {
+    if (!mailbox || mailbox.organizationId !== organizationId || mailbox.deletedAt) {
       this.logger.warn(
         `[email-sync] Mailbox ${mailboxId} not found — skipping`,
       );
-      return;
+      timings.totalMs = Date.now() - runStartedAt;
+      return timings;
     }
 
     const providerSyncPolicy = resolveEmailSyncProviderPolicy(
@@ -311,11 +469,13 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         'Missing IMAP credentials',
       );
-      return;
+      timings.totalMs = Date.now() - runStartedAt;
+      return timings;
     }
 
     let imapPass: string | null = null;
     let oauthAccessToken: string | null = null;
+    const credentialPrepStartedAt = Date.now();
 
     if (mailbox.imapPass) {
       try {
@@ -379,8 +539,10 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         'No usable auth credential',
       );
-      return;
+      timings.totalMs = Date.now() - runStartedAt;
+      return timings;
     }
+    timings.credentialPrepMs = Date.now() - credentialPrepStartedAt;
 
     const authConfig = imapPass
       ? { user: imapUser, pass: imapPass }
@@ -395,11 +557,13 @@ export class EmailSyncProcessor extends WorkerHost {
       },
     });
 
-    this.eventsGateway?.emitToOrganization(organizationId, 'mailbox:synced', {
-      mailboxId,
-      organizationId,
-      syncStatus: 'SYNCING',
-    });
+    if (!params.options.interactive) {
+      this.eventsGateway?.emitToOrganization(organizationId, 'mailbox:synced', {
+        mailboxId,
+        organizationId,
+        syncStatus: 'SYNCING',
+      });
+    }
 
     if (
       !imapPass &&
@@ -447,7 +611,8 @@ export class EmailSyncProcessor extends WorkerHost {
           },
         );
 
-        return;
+        timings.totalMs = Date.now() - runStartedAt;
+        return timings;
       }
 
       await this.markMailboxSyncFailed(
@@ -455,37 +620,52 @@ export class EmailSyncProcessor extends WorkerHost {
         organizationId,
         'Microsoft mailbox does not have mail API scope yet. Reconnect Microsoft mailbox and grant requested permissions.',
       );
-      return;
+      timings.totalMs = Date.now() - runStartedAt;
+      return timings;
     }
 
-    const client = new ImapFlow({
-      host: imapHost,
-      port: mailbox.imapPort ?? 993,
-      secure: mailbox.imapSecure,
-      auth: authConfig,
-      logger: false,
+    const interactiveClientKey = `${mailboxId}:${imapHost}:${mailbox.imapPort ?? 993}:${mailbox.imapSecure ? 'secure' : 'plain'}`;
+    const authHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify(authConfig))
+      .digest('hex');
+    const acquiredClient = await this.acquireImapClient({
+      interactive: Boolean(params.options.interactive),
+      mailboxId,
+      clientKey: interactiveClientKey,
+      authHash,
+      clientFactory: () =>
+        new ImapFlow({
+          host: imapHost,
+          port: mailbox.imapPort ?? 993,
+          secure: mailbox.imapSecure,
+          auth: authConfig,
+          logger: false,
+        }),
+      providerSyncPolicy,
+      stage: 'imap-connect',
     });
+    const client = acquiredClient.client;
+    timings.connectMs = acquiredClient.connectMs;
 
     try {
-      await this.acquireProviderRequestSlot(
-        mailboxId,
-        providerSyncPolicy,
-        'imap-connect',
-      );
-      await client.connect();
-      await this.syncAllFolders(
+      const syncFoldersStartedAt = Date.now();
+      timings.folderTimings = await this.syncAllFolders(
         client,
         mailboxId,
         organizationId,
         streamingMode ?? false,
         providerSyncPolicy,
-        job.data.folderTypeHints,
+        params.folderTypeHints,
+        params.options,
       );
+      timings.syncFoldersMs = Date.now() - syncFoldersStartedAt;
       this.adaptiveThrottle.recordSuccess(
         adaptiveBucketKey,
         this.adaptiveOptions(),
       );
 
+      const finalizeStartedAt = Date.now();
       await this.prisma.mailbox.update({
         where: { id: mailboxId },
         data: {
@@ -503,6 +683,9 @@ export class EmailSyncProcessor extends WorkerHost {
         syncStatus: 'SUCCESS',
         lastSyncAt: new Date().toISOString(),
       });
+      timings.finalizeMs = Date.now() - finalizeStartedAt;
+      timings.totalMs = Date.now() - runStartedAt;
+      return timings;
     } catch (err) {
       if (err instanceof KillSwitchActivatedError) {
         await this.markMailboxSyncSkippedByKillSwitch(
@@ -510,7 +693,8 @@ export class EmailSyncProcessor extends WorkerHost {
           organizationId,
           `IMAP sync skipped at ${err.stage} because ${err.flag} is active`,
         );
-        return;
+        timings.totalMs = Date.now() - runStartedAt;
+        return timings;
       }
 
       const errorDetails = (() => {
@@ -536,26 +720,134 @@ export class EmailSyncProcessor extends WorkerHost {
       );
 
       await this.markMailboxSyncFailed(mailboxId, organizationId, String(err));
+      timings.totalMs = Date.now() - runStartedAt;
+      acquiredClient.invalidate();
       throw err;
     } finally {
-      await client.logout().catch(() => undefined);
+      await acquiredClient.release();
     }
+  }
+
+  private async acquireImapClient(input: {
+    interactive: boolean;
+    mailboxId: string;
+    clientKey: string;
+    authHash: string;
+    clientFactory: () => ImapFlow;
+    providerSyncPolicy: EmailSyncProviderPolicy;
+    stage: string;
+  }): Promise<{
+    client: ImapFlow;
+    connectMs: number;
+    release: () => Promise<void>;
+    invalidate: () => void;
+  }> {
+    if (input.interactive) {
+      const existing = this.interactiveImapClients.get(input.clientKey);
+      const now = Date.now();
+      if (
+        existing &&
+        !existing.busy &&
+        existing.authHash === input.authHash &&
+        existing.expiresAt > now
+      ) {
+        existing.busy = true;
+        return {
+          client: existing.client,
+          connectMs: 0,
+          release: async () => {
+            const latest = this.interactiveImapClients.get(input.clientKey);
+            if (latest && latest.client === existing.client) {
+              latest.busy = false;
+              latest.expiresAt = Date.now() + this.interactiveImapClientTtlMs;
+            }
+          },
+          invalidate: () => {
+            const latest = this.interactiveImapClients.get(input.clientKey);
+            if (latest && latest.client === existing.client) {
+              this.interactiveImapClients.delete(input.clientKey);
+              void latest.client.logout().catch(() => undefined);
+            }
+          },
+        };
+      }
+
+      if (existing && (existing.authHash !== input.authHash || existing.expiresAt <= now)) {
+        this.interactiveImapClients.delete(input.clientKey);
+        void existing.client.logout().catch(() => undefined);
+      }
+    }
+
+    const client = input.clientFactory();
+    const connectStartedAt = Date.now();
+    await this.acquireProviderRequestSlot(
+      input.mailboxId,
+      input.providerSyncPolicy,
+      input.stage,
+      { interactive: input.interactive },
+    );
+    await client.connect();
+    const connectMs = Date.now() - connectStartedAt;
+
+    if (!input.interactive) {
+      return {
+        client,
+        connectMs,
+        release: async () => {
+          await client.logout().catch(() => undefined);
+        },
+        invalidate: () => {
+          void client.logout().catch(() => undefined);
+        },
+      };
+    }
+
+    this.interactiveImapClients.set(input.clientKey, {
+      authHash: input.authHash,
+      client,
+      expiresAt: Date.now() + this.interactiveImapClientTtlMs,
+      busy: true,
+    });
+
+    return {
+      client,
+      connectMs,
+      release: async () => {
+        const latest = this.interactiveImapClients.get(input.clientKey);
+        if (latest && latest.client === client) {
+          latest.busy = false;
+          latest.expiresAt = Date.now() + this.interactiveImapClientTtlMs;
+        } else {
+          await client.logout().catch(() => undefined);
+        }
+      },
+      invalidate: () => {
+        const latest = this.interactiveImapClients.get(input.clientKey);
+        if (latest && latest.client === client) {
+          this.interactiveImapClients.delete(input.clientKey);
+        }
+        void client.logout().catch(() => undefined);
+      },
+    };
   }
 
   private async acquireProviderRequestSlot(
     mailboxId: string,
     providerSyncPolicy: EmailSyncProviderPolicy,
     stage = 'provider-slot',
+    options?: SyncExecutionOptions,
   ): Promise<void> {
     if (this.featureFlags.get('DISABLE_IMAP_SYNC')) {
       throw new KillSwitchActivatedError('DISABLE_IMAP_SYNC', stage);
     }
 
-    await this.awaitAdaptiveThrottle(
-      this.adaptiveBucketKey(mailboxId),
-      mailboxId,
-      stage,
-    );
+    if (!options?.interactive) {
+      await this.awaitAdaptiveThrottle(
+        this.adaptiveBucketKey(mailboxId),
+        mailboxId,
+        stage,
+      );
+    }
     await sharedEmailSyncRateLimiter.acquire(
       providerSyncPolicy.key,
       providerSyncPolicy,
@@ -649,7 +941,11 @@ export class EmailSyncProcessor extends WorkerHost {
     mailboxId: string,
     streamingMode: boolean,
     stage: string,
+    options?: SyncExecutionOptions,
   ): Promise<void> {
+    if (options?.interactive) {
+      return;
+    }
     const adaptiveDelayMs = this.adaptiveThrottle.computeDelay(
       adaptiveBucketKey,
       this.adaptiveOptions(),
@@ -1287,9 +1583,21 @@ export class EmailSyncProcessor extends WorkerHost {
 
     const providerMessageId = String(message.id ?? message.Id ?? '').trim();
     if (!providerMessageId) return false;
+    const messageIdHeader = String(
+      message.internetMessageId ??
+        message.InternetMessageId ??
+        providerMessageId,
+    ).trim();
+    const candidateMessageIds = Array.from(
+      new Set(
+        [providerMessageId, messageIdHeader]
+          .map((value) => String(value || '').trim())
+          .filter((value) => value.length > 0),
+      ),
+    );
 
     const existing = await this.prisma.message.findFirst({
-      where: { mailboxId, messageId: providerMessageId },
+      where: { mailboxId, messageId: { in: candidateMessageIds } },
       select: { id: true },
     });
     if (existing) return false;
@@ -1331,11 +1639,6 @@ export class EmailSyncProcessor extends WorkerHost {
     const subject = String(
       message.subject ?? message.Subject ?? '(no subject)',
     );
-    const messageIdHeader = String(
-      message.internetMessageId ??
-        message.InternetMessageId ??
-        providerMessageId,
-    );
     const isDraft =
       Boolean(message.isDraft ?? message.IsDraft) || folderType === 'drafts';
     const direction: 'INBOUND' | 'OUTBOUND' =
@@ -1369,6 +1672,7 @@ export class EmailSyncProcessor extends WorkerHost {
       subject,
       messageIdHeader,
       undefined,
+      [],
       fromEmail,
       fromName,
     );
@@ -1385,7 +1689,7 @@ export class EmailSyncProcessor extends WorkerHost {
         thread: { connect: { id: thread.id } },
         mailbox: { connect: { id: mailboxId } },
         folder: { connect: { id: folderId } },
-        messageId: providerMessageId,
+        messageId: messageIdHeader || providerMessageId,
         fromEmail,
         to: toAddresses as unknown as Prisma.InputJsonValue,
         cc: ccAddresses.length
@@ -1465,6 +1769,19 @@ export class EmailSyncProcessor extends WorkerHost {
       subject,
       createdAt: receivedAt.toISOString(),
     });
+
+    if (direction === 'INBOUND') {
+      await this.dispatchInboundNewMessageNotifications({
+        organizationId,
+        mailboxId,
+        threadId: thread.id,
+        messageId: createdMessage.id,
+        fromEmail,
+        fromName,
+        subject,
+        receivedAt,
+      });
+    }
 
     if (this.crmService && thread.contactId) {
       await this.crmService.emitContactActivity({
@@ -1559,13 +1876,46 @@ export class EmailSyncProcessor extends WorkerHost {
     streamingMode: boolean,
     providerSyncPolicy: EmailSyncProviderPolicy,
     folderTypeHints?: EmailSyncJobData['folderTypeHints'],
-  ): Promise<void> {
+    options: SyncExecutionOptions = {},
+  ): Promise<FolderSyncTiming[]> {
     const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
+    const folderTimings: FolderSyncTiming[] = [];
+    const targetedFolderTypesOrdered =
+      Array.isArray(folderTypeHints) && folderTypeHints.length > 0
+        ? folderTypeHints
+        : null;
+    const targetedFolderTypes = targetedFolderTypesOrdered
+      ? new Set(targetedFolderTypesOrdered)
+      : null;
+    const inboxOnlyInteractiveRefresh =
+      options.interactive &&
+      Array.isArray(targetedFolderTypesOrdered) &&
+      targetedFolderTypesOrdered.length === 1 &&
+      targetedFolderTypesOrdered[0] === 'inbox';
+
+    if (inboxOnlyInteractiveRefresh) {
+      await this.upsertMailboxFolderMetadata(mailboxId, 'INBOX', 'inbox');
+      folderTimings.push(
+        await this.syncFolder(
+          client,
+          mailboxId,
+          organizationId,
+          'INBOX',
+          'inbox',
+          streamingMode,
+          providerSyncPolicy,
+          options,
+        ),
+      );
+      return folderTimings;
+    }
+
     // List all IMAP folders
     await this.acquireProviderRequestSlot(
       mailboxId,
       providerSyncPolicy,
       'imap-list-folders',
+      options,
     );
     const folderList = await client.list();
     this.logger.log(
@@ -1590,11 +1940,6 @@ export class EmailSyncProcessor extends WorkerHost {
       await this.upsertMailboxFolderMetadata(mailboxId, folder.path, folder.type);
     }
 
-    const targetedFolderTypes =
-      Array.isArray(folderTypeHints) && folderTypeHints.length > 0
-        ? new Set(folderTypeHints)
-        : null;
-
     const foldersToSync: Array<{ path: string; type: string }> = [];
     const seenPaths = new Set<string>();
     for (const folder of discoveredFolders) {
@@ -1615,13 +1960,27 @@ export class EmailSyncProcessor extends WorkerHost {
       foldersToSync.unshift({ path: 'INBOX', type: 'inbox' });
     }
 
+    if (targetedFolderTypesOrdered) {
+      const orderMap = new Map(
+        targetedFolderTypesOrdered.map((type, index) => [type, index]),
+      );
+      foldersToSync.sort((left, right) => {
+        const leftIndex = orderMap.get(left.type as any) ?? Number.MAX_SAFE_INTEGER;
+        const rightIndex =
+          orderMap.get(right.type as any) ?? Number.MAX_SAFE_INTEGER;
+        if (leftIndex !== rightIndex) return leftIndex - rightIndex;
+        return left.path.localeCompare(right.path);
+      });
+    }
+
     this.logger.log(
       `[email-sync] mailbox=${mailboxId} syncing folders: ${foldersToSync.map((f) => f.path).join(', ')}`,
     );
 
     for (const { path, type } of foldersToSync) {
       try {
-        await this.syncFolder(
+        folderTimings.push(
+          await this.syncFolder(
           client,
           mailboxId,
           organizationId,
@@ -1629,6 +1988,8 @@ export class EmailSyncProcessor extends WorkerHost {
           type,
           streamingMode,
           providerSyncPolicy,
+          options,
+          ),
         );
         this.adaptiveThrottle.recordSuccess(
           adaptiveBucketKey,
@@ -1648,6 +2009,8 @@ export class EmailSyncProcessor extends WorkerHost {
         );
       }
     }
+
+    return folderTimings;
   }
 
   private async syncFolder(
@@ -1658,16 +2021,56 @@ export class EmailSyncProcessor extends WorkerHost {
     folderType: string,
     streamingMode: boolean,
     providerSyncPolicy: EmailSyncProviderPolicy,
-  ): Promise<void> {
+    options: SyncExecutionOptions = {},
+  ): Promise<FolderSyncTiming> {
     const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
+    const folderStartedAt = Date.now();
+    const timing: FolderSyncTiming = {
+      path: folderPath,
+      type: folderType,
+      totalMs: 0,
+      lockMs: 0,
+      folderLookupMs: 0,
+      deletionReconcileMs: 0,
+      searchMs: 0,
+      fetchMs: 0,
+      upsertMs: 0,
+      parseMs: 0,
+      dedupeMs: 0,
+      threadResolveMs: 0,
+      createMs: 0,
+      postIngestMs: 0,
+      counterRefreshMs: 0,
+      newMessageCount: 0,
+      reconciledDeletedMessages: 0,
+    };
     let lock: { release: () => void } | null = null;
     try {
-      await this.acquireProviderRequestSlot(
-        mailboxId,
-        providerSyncPolicy,
-        `imap-lock:${folderPath}`,
-      );
-      lock = await client.getMailboxLock(folderPath);
+      const lockStartedAt = Date.now();
+      if (options.interactive) {
+        const currentlySelectedPath = String(
+          ((client as unknown as { mailbox?: { path?: string } }).mailbox?.path ||
+            ''),
+        );
+        if (currentlySelectedPath !== folderPath) {
+          await this.acquireProviderRequestSlot(
+            mailboxId,
+            providerSyncPolicy,
+            `imap-open:${folderPath}`,
+            options,
+          );
+          await client.mailboxOpen(folderPath, { readOnly: true });
+        }
+      } else {
+        await this.acquireProviderRequestSlot(
+          mailboxId,
+          providerSyncPolicy,
+          `imap-lock:${folderPath}`,
+          options,
+        );
+        lock = await client.getMailboxLock(folderPath);
+      }
+      timing.lockMs = Date.now() - lockStartedAt;
     } catch (err) {
       if (err instanceof KillSwitchActivatedError) {
         throw err;
@@ -1675,18 +2078,51 @@ export class EmailSyncProcessor extends WorkerHost {
       this.logger.warn(
         `[email-sync] mailbox=${mailboxId} could not lock folder=${folderPath}: ${String(err)}`,
       );
-      return;
+      timing.totalMs = Date.now() - folderStartedAt;
+      return timing;
     }
 
     try {
+      const folderLookupStartedAt = Date.now();
       let folder = await this.prisma.mailboxFolder.findFirst({
         where: { mailboxId, name: folderPath },
       });
 
-      const serverStatus = client.mailbox as
-        | { uidValidity?: number; uidNext?: number }
+      let serverStatus = client.mailbox as
+        | { uidValidity?: number; uidNext?: number; exists?: number }
         | false;
+      if (options.interactive) {
+        const statusStartedAt = Date.now();
+        await this.acquireProviderRequestSlot(
+          mailboxId,
+          providerSyncPolicy,
+          `imap-status:${folderPath}`,
+          options,
+        );
+        const liveStatus = await client.status(folderPath, {
+          uidNext: true,
+          uidValidity: true,
+          messages: true,
+          unseen: true,
+        });
+        serverStatus = {
+          uidValidity: Number(liveStatus.uidValidity || 0) || undefined,
+          uidNext: Number(liveStatus.uidNext || 0) || undefined,
+          exists: Number(liveStatus.messages || 0) || 0,
+        };
+        timing.folderLookupMs += Date.now() - statusStartedAt;
+      }
       const lastUidNext = folder?.uidNext ? Number(folder.uidNext) : 1;
+      const serverUidNext =
+        serverStatus && serverStatus.uidNext
+          ? Number(serverStatus.uidNext)
+          : null;
+      const hasUidDrift =
+        serverUidNext !== null &&
+        Number.isFinite(serverUidNext) &&
+        serverUidNext > 0 &&
+        lastUidNext > serverUidNext;
+      const effectiveLastUidNext = hasUidDrift ? 1 : lastUidNext;
 
       if (!folder) {
         folder = await this.prisma.mailboxFolder.create({
@@ -1712,61 +2148,236 @@ export class EmailSyncProcessor extends WorkerHost {
           data: { type: folderType },
         });
       }
+      timing.folderLookupMs = Date.now() - folderLookupStartedAt;
 
       let messageUids: number[] = [];
+      let reconciledDeletedMessages = 0;
+      let reconciledDeletedUnreadCount = 0;
 
-      try {
-        await this.acquireProviderRequestSlot(
-          mailboxId,
-          providerSyncPolicy,
-          `imap-search-incremental:${folderPath}`,
-        );
-        const incrementalSearch = await client.search(
-          { uid: `${lastUidNext}:*` },
-          { uid: true },
-        );
-        const incrementalUids = Array.isArray(incrementalSearch)
-          ? incrementalSearch
-          : [];
-        messageUids = [...incrementalUids].sort((left, right) => left - right);
-      } catch (err) {
-        if (err instanceof KillSwitchActivatedError) {
-          throw err;
-        }
-        this.logger.warn(
-          `[email-sync] mailbox=${mailboxId} folder=${folderPath} incremental fetch failed; retrying full scan`,
-        );
-        await this.acquireProviderRequestSlot(
-          mailboxId,
-          providerSyncPolicy,
-          `imap-search-full:${folderPath}`,
-        );
-        const fullScanSearch = await client.search(
-          { all: true },
-          { uid: true },
-        );
-        const fullScanUids = Array.isArray(fullScanSearch)
-          ? fullScanSearch
-          : [];
-        messageUids = [...fullScanUids].sort((left, right) => left - right);
-      }
-
-      this.logger.log(
-        `[email-sync] mailbox=${mailboxId} folder=${folderPath} fetched ${messageUids.length} new messages`,
-      );
-
-      if (messageUids.length === 0) {
-        const counters = await this.refreshMailboxFolderCounters(folder.id);
+      if (
+        !options.reconcileDeletions &&
+        serverUidNext !== null &&
+        Number.isFinite(serverUidNext) &&
+        serverUidNext > 0 &&
+        effectiveLastUidNext === serverUidNext
+      ) {
+        const counterRefreshStartedAt = Date.now();
         await this.prisma.mailboxFolder.update({
           where: { id: folder.id },
           data: {
             syncStatus: 'SUCCESS',
             lastSyncedAt: new Date(),
-            messageCount: counters.messageCount,
-            unreadCount: counters.unreadCount,
+            uidNext: BigInt(serverUidNext),
+            uidValidity:
+              serverStatus && serverStatus.uidValidity
+                ? BigInt(serverStatus.uidValidity)
+                : folder.uidValidity,
           },
         });
-        return;
+        timing.counterRefreshMs = Date.now() - counterRefreshStartedAt;
+        timing.totalMs = Date.now() - folderStartedAt;
+        return timing;
+      }
+
+      if (options.reconcileDeletions) {
+        const deletionReconcileStartedAt = Date.now();
+        const providerExists = Number(
+          (serverStatus && 'exists' in serverStatus
+            ? (serverStatus as { exists?: number }).exists
+            : 0) || 0,
+        );
+        const localMessageCount = await this.prisma.message.count({
+          where: {
+            mailboxId,
+            folderId: folder.id,
+            deletedAt: null,
+          },
+        });
+        const shouldForceFullDeleteReconcile =
+          Boolean(options.interactive) &&
+          CANONICAL_FOLDER_TYPES.has(String(folderType || '').toLowerCase());
+        const likelyHasProviderDeletes =
+          shouldForceFullDeleteReconcile || providerExists < localMessageCount;
+
+        if (likelyHasProviderDeletes) {
+          const searchStartedAt = Date.now();
+          await this.acquireProviderRequestSlot(
+            mailboxId,
+            providerSyncPolicy,
+            `imap-search-full:${folderPath}`,
+            options,
+          );
+          const fullScanSearch = await client.search(
+            { all: true },
+            { uid: true },
+          );
+          const providerUids = (Array.isArray(fullScanSearch)
+            ? fullScanSearch
+            : []
+          )
+            .filter((uid) => Number.isInteger(uid) && uid > 0)
+            .sort((left, right) => left - right);
+          const providerUidSet = new Set(providerUids);
+
+          const localMessages = await this.prisma.message.findMany({
+            where: {
+              mailboxId,
+              folderId: folder.id,
+              deletedAt: null,
+              imapUid: { not: null },
+            },
+            select: {
+              id: true,
+              threadId: true,
+              imapUid: true,
+              isRead: true,
+            },
+          });
+
+          const localUidSet = new Set(
+            localMessages
+              .map((message) => Number(message.imapUid || 0))
+              .filter((uid) => uid > 0),
+          );
+
+          const missingMessages = localMessages.filter((message) => {
+            const uid = Number(message.imapUid || 0);
+            return uid > 0 && !providerUidSet.has(uid);
+          });
+
+          if (missingMessages.length > 0) {
+            const deletionResult = await this.deleteMissingProviderMessages(
+              organizationId,
+              missingMessages.map((message) => ({
+                id: message.id,
+                threadId: message.threadId,
+              })),
+            );
+            reconciledDeletedMessages = deletionResult.deletedCount;
+            reconciledDeletedUnreadCount = missingMessages.filter(
+              (message) => !message.isRead,
+            ).length;
+          }
+
+          messageUids = providerUids.filter((uid) => !localUidSet.has(uid));
+          timing.searchMs += Date.now() - searchStartedAt;
+        } else {
+          const searchStartedAt = Date.now();
+          await this.acquireProviderRequestSlot(
+            mailboxId,
+            providerSyncPolicy,
+            `imap-search-incremental:${folderPath}`,
+            options,
+          );
+          const incrementalSearch = await client.search(
+            { uid: `${effectiveLastUidNext}:*` },
+            { uid: true },
+          );
+          const incrementalUids = Array.isArray(incrementalSearch)
+            ? incrementalSearch
+            : [];
+          messageUids = [...incrementalUids].sort((left, right) => left - right);
+          timing.searchMs += Date.now() - searchStartedAt;
+        }
+        timing.deletionReconcileMs = Date.now() - deletionReconcileStartedAt;
+      } else {
+        try {
+          if (options.interactive) {
+            const uidFetchStartedAt = Date.now();
+            await this.acquireProviderRequestSlot(
+              mailboxId,
+              providerSyncPolicy,
+              `imap-fetch-uids:${folderPath}`,
+              options,
+            );
+            const incrementalUids: number[] = [];
+            for await (const msg of client.fetch(
+              `${Math.max(effectiveLastUidNext, 1)}:*`,
+              { uid: true },
+              { uid: true },
+            )) {
+              if (Number.isInteger(msg.uid) && msg.uid > 0) {
+                incrementalUids.push(msg.uid);
+              }
+            }
+            messageUids = Array.from(new Set(incrementalUids)).sort(
+              (left, right) => left - right,
+            );
+            timing.searchMs += Date.now() - uidFetchStartedAt;
+          } else {
+            const searchStartedAt = Date.now();
+            await this.acquireProviderRequestSlot(
+              mailboxId,
+              providerSyncPolicy,
+              `imap-search-incremental:${folderPath}`,
+              options,
+            );
+            const incrementalSearch = await client.search(
+              { uid: `${effectiveLastUidNext}:*` },
+              { uid: true },
+            );
+            const incrementalUids = Array.isArray(incrementalSearch)
+              ? incrementalSearch
+              : [];
+            messageUids = [...incrementalUids].sort((left, right) => left - right);
+            timing.searchMs += Date.now() - searchStartedAt;
+          }
+        } catch (err) {
+          if (err instanceof KillSwitchActivatedError) {
+            throw err;
+          }
+          this.logger.warn(
+            `[email-sync] mailbox=${mailboxId} folder=${folderPath} incremental fetch failed; retrying full scan`,
+          );
+          const searchStartedAt = Date.now();
+          await this.acquireProviderRequestSlot(
+            mailboxId,
+            providerSyncPolicy,
+            `imap-search-full:${folderPath}`,
+            options,
+          );
+          const fullScanSearch = await client.search(
+            { all: true },
+            { uid: true },
+          );
+          const fullScanUids = Array.isArray(fullScanSearch)
+            ? fullScanSearch
+            : [];
+          messageUids = [...fullScanUids].sort((left, right) => left - right);
+          timing.searchMs += Date.now() - searchStartedAt;
+        }
+      }
+      timing.reconciledDeletedMessages = reconciledDeletedMessages;
+      timing.newMessageCount = messageUids.length;
+
+      this.logger.log(
+        `[email-sync] mailbox=${mailboxId} folder=${folderPath} fetched ${messageUids.length} new messages reconciledDeleted=${reconciledDeletedMessages}`,
+      );
+
+      if (messageUids.length === 0) {
+        const counterRefreshStartedAt = Date.now();
+        await this.prisma.mailboxFolder.update({
+          where: { id: folder.id },
+          data: {
+            syncStatus: 'SUCCESS',
+            lastSyncedAt: new Date(),
+            uidNext:
+              serverStatus && serverStatus.uidNext
+                ? BigInt(serverStatus.uidNext)
+                : folder.uidNext,
+            messageCount: Math.max(
+              0,
+              Number(folder.messageCount ?? 0) - reconciledDeletedMessages,
+            ),
+            unreadCount: Math.max(
+              0,
+              Number(folder.unreadCount ?? 0) - reconciledDeletedUnreadCount,
+            ),
+          },
+        });
+        timing.counterRefreshMs = Date.now() - counterRefreshStartedAt;
+        timing.totalMs = Date.now() - folderStartedAt;
+        return timing;
       }
 
       const fetchBatchSize = this.resolveFetchBatchSize(
@@ -1774,8 +2385,19 @@ export class EmailSyncProcessor extends WorkerHost {
         streamingMode,
       );
       const uidBatches = chunkArray(messageUids, fetchBatchSize);
+      const runtimeCache: SyncRuntimeCache = {
+        threadByMessageId: new Map<string, ThreadLookupResult>(),
+        threadBySubject: new Map<string, ThreadLookupResult>(),
+        contactLinkByEmail: new Map<
+          string,
+          { contactId: string | null; companyId: string | null }
+        >(),
+      };
+      let createdMessageCount = 0;
+      let unreadCreatedCount = 0;
 
       for (const uidBatch of uidBatches) {
+        const fetchStartedAt = Date.now();
         const fetchedMessages: Array<{
           uid: number;
           envelope: {
@@ -1793,6 +2415,7 @@ export class EmailSyncProcessor extends WorkerHost {
           mailboxId,
           providerSyncPolicy,
           `imap-fetch:${folderPath}`,
+          options,
         );
         for await (const msg of client.fetch(
           uidBatch,
@@ -1809,32 +2432,64 @@ export class EmailSyncProcessor extends WorkerHost {
             source: msg.source,
           });
         }
+        timing.fetchMs += Date.now() - fetchStartedAt;
 
         const chunks = streamingMode
           ? chunkArray(fetchedMessages, STREAM_CHUNK_SIZE)
           : [fetchedMessages];
 
         for (const chunk of chunks) {
-          for (const msg of chunk) {
-            await this.upsertMessage(
-              msg,
+          const upsertStartedAt = Date.now();
+          if (options.interactive) {
+            const batchResult = await this.upsertInteractiveBatch(
+              chunk,
               mailboxId,
               organizationId,
               folder.id,
               folderType,
+              { ...options, runtimeCache },
             );
+            timing.parseMs += batchResult.timing.parseMs;
+            timing.dedupeMs += batchResult.timing.dedupeMs;
+            timing.threadResolveMs += batchResult.timing.threadResolveMs;
+            timing.createMs += batchResult.timing.createMs;
+            timing.postIngestMs += batchResult.timing.postIngestMs;
+            createdMessageCount += batchResult.createdCount;
+            unreadCreatedCount += batchResult.unreadCreatedCount;
+          } else {
+            for (const msg of chunk) {
+              const upsertResult = await this.upsertMessage(
+                msg,
+                mailboxId,
+                organizationId,
+                folder.id,
+                folderType,
+                { ...options, runtimeCache },
+              );
+              timing.parseMs += upsertResult.timing.parseMs;
+              timing.dedupeMs += upsertResult.timing.dedupeMs;
+              timing.threadResolveMs += upsertResult.timing.threadResolveMs;
+              timing.createMs += upsertResult.timing.createMs;
+              timing.postIngestMs += upsertResult.timing.postIngestMs;
+              if (upsertResult.created) {
+                createdMessageCount += 1;
+                unreadCreatedCount += upsertResult.unreadDelta;
+              }
+            }
           }
+          timing.upsertMs += Date.now() - upsertStartedAt;
           await this.applyChunkDelay(
             adaptiveBucketKey,
             mailboxId,
             streamingMode,
             `imap-message-chunk:${folderPath}`,
+            options,
           );
         }
       }
 
       const maxUid = Math.max(...messageUids);
-      const counters = await this.refreshMailboxFolderCounters(folder.id);
+      const counterRefreshStartedAt = Date.now();
       await this.prisma.mailboxFolder.update({
         where: { id: folder.id },
         data: {
@@ -1845,16 +2500,523 @@ export class EmailSyncProcessor extends WorkerHost {
               : undefined,
           syncStatus: 'SUCCESS',
           lastSyncedAt: new Date(),
-          messageCount: counters.messageCount,
-          unreadCount: counters.unreadCount,
+          messageCount: Math.max(
+            0,
+            Number(folder.messageCount ?? 0) -
+              reconciledDeletedMessages +
+              createdMessageCount,
+          ),
+          unreadCount: Math.max(
+            0,
+            Number(folder.unreadCount ?? 0) -
+              reconciledDeletedUnreadCount +
+              unreadCreatedCount,
+          ),
         },
       });
+      timing.counterRefreshMs = Date.now() - counterRefreshStartedAt;
+      timing.totalMs = Date.now() - folderStartedAt;
+      return timing;
     } finally {
       lock?.release();
     }
   }
 
   // ─── Message upsert ───────────────────────────────────────────────────────
+
+  private async deleteMissingProviderMessages(
+    organizationId: string,
+    messages: Array<{ id: string; threadId: string }>,
+  ): Promise<{ deletedCount: number; unreadDeletedCount: number }> {
+    if (messages.length === 0) {
+      return { deletedCount: 0, unreadDeletedCount: 0 };
+    }
+
+    const messageIds = messages.map((message) => message.id);
+    const candidateThreadIds = Array.from(
+      new Set(messages.map((message) => message.threadId).filter(Boolean)),
+    );
+    const attachments = await this.prisma.attachment.findMany({
+      where: { messageId: { in: messageIds } },
+      select: { storageKey: true },
+    });
+    const attachmentStorageKeys = Array.from(
+      new Set(
+        attachments
+          .map((attachment) => String(attachment.storageKey || '').trim())
+          .filter((storageKey) => storageKey.length > 0),
+      ),
+    );
+
+    const deletedThreadIds = await this.prisma.$transaction(async (tx) => {
+      await tx.attachment.deleteMany({
+        where: { messageId: { in: messageIds } },
+      });
+      await tx.auditLog.deleteMany({
+        where: {
+          organizationId,
+          entityType: 'message',
+          entityId: { in: messageIds },
+        },
+      });
+      await tx.message.deleteMany({
+        where: { id: { in: messageIds } },
+      });
+
+      if (candidateThreadIds.length === 0) {
+        return [] as string[];
+      }
+
+      const emptyThreads = await tx.thread.findMany({
+        where: {
+          id: { in: candidateThreadIds },
+          messages: { none: {} },
+        },
+        select: { id: true },
+      });
+      const emptyThreadIds = emptyThreads.map((thread) => thread.id);
+      if (emptyThreadIds.length === 0) {
+        return [] as string[];
+      }
+
+      const notifications = await tx.notification.findMany({
+        where: {
+          organizationId,
+          resourceId: { in: emptyThreadIds },
+        },
+        select: { id: true },
+      });
+      const notificationIds = notifications.map((notification) => notification.id);
+      if (notificationIds.length > 0) {
+        await tx.notificationDigestItem.deleteMany({
+          where: { notificationId: { in: notificationIds } },
+        });
+      }
+
+      await tx.notification.deleteMany({
+        where: {
+          organizationId,
+          resourceId: { in: emptyThreadIds },
+        },
+      });
+      await tx.scheduledMessage.deleteMany({
+        where: {
+          organizationId,
+          threadId: { in: emptyThreadIds },
+        },
+      });
+      await tx.threadTag.deleteMany({
+        where: { threadId: { in: emptyThreadIds } },
+      });
+      await tx.threadNote.deleteMany({
+        where: {
+          organizationId,
+          threadId: { in: emptyThreadIds },
+        },
+      });
+      await tx.auditLog.deleteMany({
+        where: {
+          organizationId,
+          entityType: 'thread',
+          entityId: { in: emptyThreadIds },
+        },
+      });
+      await tx.thread.deleteMany({
+        where: { id: { in: emptyThreadIds } },
+      });
+
+      return emptyThreadIds;
+    });
+
+    await Promise.all(
+      attachmentStorageKeys.map((storageKey) =>
+        this.attachmentStorage.delete(storageKey).catch((error) => {
+          this.logger.warn(
+            `[email-sync] failed to delete attachment storageKey=${storageKey}: ${String(error)}`,
+          );
+        }),
+      ),
+    );
+
+    if (deletedThreadIds.length > 0) {
+      this.eventsGateway?.emitToOrganization(organizationId, 'thread:updated', {
+        threadIds: deletedThreadIds,
+        type: 'deleted',
+      });
+    }
+
+    return {
+      deletedCount: messageIds.length,
+      unreadDeletedCount: 0,
+    };
+  }
+
+  private async upsertInteractiveBatch(
+    chunk: Array<{
+      uid: number;
+      envelope: {
+        messageId?: string;
+        subject?: string;
+        from?: Array<{ address?: string; name?: string }>;
+        to?: Array<{ address?: string }>;
+        date?: Date;
+        inReplyTo?: string;
+      };
+      source?: Buffer;
+    }>,
+    mailboxId: string,
+    organizationId: string,
+    folderId: string,
+    folderType: string,
+    options: SyncExecutionOptions,
+  ): Promise<{
+    createdCount: number;
+    unreadCreatedCount: number;
+    timing: UpsertTiming;
+  }> {
+    const timing: UpsertTiming = {
+      parseMs: 0,
+      dedupeMs: 0,
+      threadResolveMs: 0,
+      createMs: 0,
+      postIngestMs: 0,
+    };
+
+    const prepared = chunk.map((msg) => {
+      const parseStartedAt = Date.now();
+      const env = msg.envelope;
+      const fromEmail = env.from?.[0]?.address ?? 'unknown@example.com';
+      const fromName = env.from?.[0]?.name ?? '';
+      const toAddresses = (env.to ?? [])
+        .map((address) => address.address ?? '')
+        .filter(Boolean);
+      const subject = env.subject ?? '(no subject)';
+      const fastContent = msg.source
+        ? this.extractFastMessageContent(msg.source)
+        : {
+            messageId: null,
+            inReplyTo: null,
+            references: [],
+            bodyText: '',
+            bodyHtml: null,
+          };
+      const rfc822MessageId =
+        fastContent.messageId ??
+        normalizeRfcMessageId(env.messageId) ??
+        `<uid-${msg.uid}@imap>`;
+      const parseMs = Date.now() - parseStartedAt;
+      const persistedMessageId =
+        normalizeRfcMessageId(rfc822MessageId) ?? `<uid-${msg.uid}@imap>`;
+      return {
+        msg,
+        fromEmail,
+        fromName,
+        toAddresses,
+        subject,
+        rfc822MessageId: persistedMessageId,
+        inReplyTo: fastContent.inReplyTo ?? env.inReplyTo ?? undefined,
+        receivedAt: env.date ?? new Date(),
+        references: fastContent.references,
+        bodyText: fastContent.bodyText,
+        bodyHtml: fastContent.bodyHtml,
+        parseMs,
+      };
+    });
+    timing.parseMs += prepared.reduce((sum, item) => sum + item.parseMs, 0);
+
+    const realMessageIds = Array.from(
+      new Set(
+        prepared
+          .map((item) => item.rfc822MessageId)
+          .filter((value) => !String(value).startsWith('<uid-')),
+      ),
+    );
+    const dedupeStartedAt = Date.now();
+    const existingByMessageId = realMessageIds.length
+      ? await this.prisma.message.findMany({
+          where: {
+            mailboxId,
+            messageId: { in: realMessageIds },
+            deletedAt: null,
+          },
+          select: {
+            id: true,
+            messageId: true,
+            folder: { select: { type: true } },
+          },
+        })
+      : [];
+    timing.dedupeMs += Date.now() - dedupeStartedAt;
+    const existingByMessageIdMap = new Map(
+      existingByMessageId
+        .filter((row) => row.messageId)
+        .map((row) => [String(row.messageId), row]),
+    );
+    const referenceCandidateIds = Array.from(
+      new Set(
+        prepared.flatMap((item) =>
+          [
+            normalizeRfcMessageId(item.inReplyTo),
+            ...item.references.map((value) => normalizeRfcMessageId(value)),
+          ].filter((value): value is string => Boolean(value)),
+        ),
+      ),
+    );
+    if (referenceCandidateIds.length > 0) {
+      const referenceLookupStartedAt = Date.now();
+      const referencedMessages = await this.prisma.message.findMany({
+        where: {
+          mailboxId,
+          messageId: { in: referenceCandidateIds },
+          deletedAt: null,
+          thread: {
+            organizationId,
+            status: { not: ThreadStatus.TRASH },
+          },
+        },
+        select: {
+          messageId: true,
+          thread: {
+            select: { id: true, contactId: true, companyId: true },
+          },
+        },
+      });
+      for (const referencedMessage of referencedMessages) {
+        if (!referencedMessage.messageId || !referencedMessage.thread) continue;
+        options.runtimeCache?.threadByMessageId.set(
+          String(referencedMessage.messageId),
+          {
+            id: referencedMessage.thread.id,
+            contactId: referencedMessage.thread.contactId ?? null,
+            companyId: referencedMessage.thread.companyId ?? null,
+          },
+        );
+      }
+      timing.threadResolveMs += Date.now() - referenceLookupStartedAt;
+    }
+
+    const messageRows: Prisma.MessageCreateManyInput[] = [];
+    const threadRows: Prisma.ThreadCreateManyInput[] = [];
+    const duplicateMoves: Array<{ id: string; imapUid: number }> = [];
+    const postIngestPayloads: Array<{
+      createdMessageId: string;
+      thread: ThreadLookupResult;
+      fromEmail: string;
+      fromName: string;
+      toAddresses: string[];
+      subject: string;
+      bodyText: string;
+      bodyHtml: string | null;
+      inReplyTo?: string;
+      receivedAt: Date;
+      direction: 'INBOUND' | 'OUTBOUND';
+      source?: Buffer;
+      rfc822MessageId: string;
+    }> = [];
+
+    for (const item of prepared) {
+      const existing = existingByMessageIdMap.get(item.rfc822MessageId);
+      if (existing) {
+        const existingPriority =
+          FOLDER_MESSAGE_PRIORITY[String(existing.folder?.type || 'custom')] ?? 99;
+        const currentPriority =
+          FOLDER_MESSAGE_PRIORITY[String(folderType || 'custom')] ?? 99;
+        const folderTypeNormalized = String(folderType || 'custom').toLowerCase();
+        const existingFolderType = String(
+          existing.folder?.type || 'custom',
+        ).toLowerCase();
+        const shouldPromoteProviderDeleteToTrash =
+          folderTypeNormalized === 'trash' && existingFolderType !== 'trash';
+        if (currentPriority < existingPriority || shouldPromoteProviderDeleteToTrash) {
+          duplicateMoves.push({ id: existing.id, imapUid: item.msg.uid });
+        }
+        continue;
+      }
+
+      let thread: ThreadLookupResult;
+      const looksLikeReplyBySubject = /^(re:|aw:|fw:|fwd:)\s*/i.test(
+        String(item.subject || '').trim(),
+      );
+      const canCreateRootThreadLocally =
+        !item.inReplyTo &&
+        item.references.length === 0 &&
+        !looksLikeReplyBySubject;
+      const normalizedIncomingSubject = String(item.subject || '')
+        .replace(/^(re:|fwd?:|aw:|fw:)\s*/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      if (canCreateRootThreadLocally) {
+        const threadId = crypto.randomUUID();
+        thread = {
+          id: threadId,
+          contactId: null,
+          companyId: null,
+        };
+        threadRows.push({
+          id: threadId,
+          organizationId,
+          mailboxId,
+          subject: item.subject,
+          status: 'OPEN',
+        });
+      } else {
+        // For replies, always resolve by RFC headers first (In-Reply-To / References).
+        // Subject cache fallback remains inside findOrCreateThread only if header linkage fails.
+        const threadResolveStartedAt = Date.now();
+        thread = await this.findOrCreateThread(
+          organizationId,
+          mailboxId,
+          item.subject,
+          item.rfc822MessageId,
+          item.inReplyTo,
+          item.references,
+          item.fromEmail,
+          item.fromName,
+          options,
+        );
+        timing.threadResolveMs += Date.now() - threadResolveStartedAt;
+      }
+      options.runtimeCache?.threadByMessageId.set(item.rfc822MessageId, thread);
+      if (normalizedIncomingSubject) {
+        options.runtimeCache?.threadBySubject.set(normalizedIncomingSubject, thread);
+      }
+
+      const createdMessageId = crypto.randomUUID();
+      const direction: 'INBOUND' | 'OUTBOUND' =
+        folderType === 'sent' ? 'OUTBOUND' : 'INBOUND';
+      const isDraft = folderType === 'drafts';
+      const snippetText = item.bodyText.trim().replace(/\s+/g, ' ');
+      const snippet =
+        snippetText.slice(0, 200) + (item.fromName ? ` — ${item.fromName}` : '') ||
+        null;
+
+      messageRows.push({
+        id: createdMessageId,
+        threadId: thread.id,
+        mailboxId,
+        folderId,
+        messageId: item.rfc822MessageId,
+        fromEmail: item.fromEmail,
+        to: item.toAddresses as unknown as Prisma.InputJsonValue,
+        subject: item.subject,
+        bodyText: item.bodyText,
+        bodyHtml: item.bodyHtml,
+        isInternalNote: false,
+        isDraft,
+        direction,
+        imapUid: item.msg.uid,
+        inReplyTo: item.inReplyTo ?? null,
+        references:
+          item.references.length > 0
+            ? (item.references as unknown as Prisma.InputJsonValue)
+            : undefined,
+        snippet,
+        createdAt: item.receivedAt,
+      });
+      postIngestPayloads.push({
+        createdMessageId,
+        thread,
+        fromEmail: item.fromEmail,
+        fromName: item.fromName,
+        toAddresses: item.toAddresses,
+        subject: item.subject,
+        bodyText: item.bodyText,
+        bodyHtml: item.bodyHtml,
+        inReplyTo: item.inReplyTo,
+        receivedAt: item.receivedAt,
+        direction,
+        source: item.msg.source,
+        rfc822MessageId: item.rfc822MessageId,
+      });
+    }
+
+    const createStartedAt = Date.now();
+    if (duplicateMoves.length > 0) {
+      const duplicateUpdateStartedAt = Date.now();
+      const valuesSql = duplicateMoves
+        .map(
+          (move) =>
+            `('${String(move.id).replace(/'/g, "''")}', ${Number(move.imapUid)})`,
+        )
+        .join(', ');
+      const markDeletedSql =
+        String(folderType || '').toLowerCase() === 'trash'
+          ? `"deletedAt" = NOW(),`
+          : `"deletedAt" = NULL,`;
+      await this.prisma.$executeRawUnsafe(`
+        UPDATE "messages" AS m
+        SET "folderId" = '${String(folderId).replace(/'/g, "''")}',
+            ${markDeletedSql}
+            "imapUid" = v.imap_uid
+        FROM (VALUES ${valuesSql}) AS v(id, imap_uid)
+        WHERE m.id = v.id
+      `);
+      timing.dedupeMs += Date.now() - duplicateUpdateStartedAt;
+    }
+    if (threadRows.length > 0) {
+      await this.prisma.thread.createMany({
+        data: threadRows,
+        skipDuplicates: true,
+      });
+    }
+    if (messageRows.length > 0) {
+      await this.prisma.message.createMany({
+        data: messageRows,
+        skipDuplicates: true,
+      });
+    }
+    timing.createMs += Date.now() - createStartedAt;
+
+    const postIngestStartedAt = Date.now();
+    for (const payload of postIngestPayloads) {
+      this.eventsGateway?.emitToOrganization(organizationId, 'thread:updated', {
+        threadId: payload.thread.id,
+        mailboxId,
+        type: 'new_message',
+      });
+
+      void this.runPostIngestWork(
+        organizationId,
+        mailboxId,
+        payload.thread,
+        payload.createdMessageId,
+        payload.fromEmail,
+        payload.fromName,
+        payload.toAddresses,
+        payload.subject,
+        payload.bodyText,
+        payload.bodyHtml,
+        payload.inReplyTo,
+        payload.receivedAt,
+        payload.direction,
+        options,
+      ).catch((error) => {
+        this.logger.warn(
+          `[email-sync] interactive post-ingest work failed message=${payload.createdMessageId}: ${String(error)}`,
+        );
+      });
+
+      if (payload.source) {
+        void this.enrichInteractiveMessageContent(
+          payload.createdMessageId,
+          payload.source,
+          payload.rfc822MessageId,
+        ).catch((error) => {
+          this.logger.warn(
+            `[email-sync] interactive message enrichment failed message=${payload.createdMessageId}: ${String(error)}`,
+          );
+        });
+      }
+    }
+    timing.postIngestMs += Date.now() - postIngestStartedAt;
+
+    return {
+      createdCount: postIngestPayloads.length,
+      unreadCreatedCount: postIngestPayloads.length,
+      timing,
+    };
+  }
 
   private async upsertMessage(
     msg: {
@@ -1873,7 +3035,15 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     folderId: string,
     folderType: string,
-  ): Promise<boolean> {
+    options: SyncExecutionOptions = {},
+  ): Promise<{ created: boolean; unreadDelta: number; timing: UpsertTiming }> {
+    const timing: UpsertTiming = {
+      parseMs: 0,
+      dedupeMs: 0,
+      threadResolveMs: 0,
+      createMs: 0,
+      postIngestMs: 0,
+    };
     const env = msg.envelope;
     const fromEmail = env.from?.[0]?.address ?? 'unknown@example.com';
     const fromName = env.from?.[0]?.name ?? '';
@@ -1881,67 +3051,155 @@ export class EmailSyncProcessor extends WorkerHost {
       .map((a) => a.address ?? '')
       .filter(Boolean);
     const subject = env.subject ?? '(no subject)';
-    const rfc822MessageId = env.messageId ?? `<uid-${msg.uid}@imap>`;
-    const inReplyTo = env.inReplyTo ?? undefined;
+    let rfc822MessageId = normalizeRfcMessageId(env.messageId) ?? `<uid-${msg.uid}@imap>`;
+    let inReplyTo = env.inReplyTo ?? undefined;
     const receivedAt = env.date ?? new Date();
+    let references: string[] = [];
 
-    // Parse MIME to extract clean body text and HTML
+    const parseStartedAt = Date.now();
     let bodyText = '';
     let bodyHtml: string | null = null;
     if (msg.source) {
-      try {
-        const parsed = await simpleParser(msg.source);
-        bodyText = parsed.text ?? '';
-        bodyHtml = parsed.html || null;
-        // Trim to storage limits
-        bodyText = bodyText.slice(0, 50000);
-        if (bodyHtml) bodyHtml = bodyHtml.slice(0, 200000);
-      } catch {
-        // Fall back to raw source, stripping obvious MIME headers
-        const raw = msg.source.toString('utf8');
-        const headerEnd = raw.indexOf('\r\n\r\n');
-        bodyText =
-          headerEnd >= 0
-            ? raw.slice(headerEnd + 4).slice(0, 50000)
-            : raw.slice(0, 50000);
+      if (options.interactive) {
+        const fastContent = this.extractFastMessageContent(msg.source);
+        bodyText = fastContent.bodyText;
+        bodyHtml = fastContent.bodyHtml;
+        rfc822MessageId = fastContent.messageId ?? rfc822MessageId;
+        inReplyTo = inReplyTo ?? fastContent.inReplyTo ?? undefined;
+        references = fastContent.references;
+      } else {
+        try {
+          const parsed = await simpleParser(msg.source);
+          bodyText = parsed.text ?? '';
+          bodyHtml = parsed.html || null;
+          rfc822MessageId =
+            normalizeRfcMessageId(parsed.messageId) ?? rfc822MessageId;
+          references = Array.isArray(parsed.references)
+            ? parsed.references.map((value) => String(value || '').trim()).filter(Boolean)
+            : String(parsed.references || '')
+                .split(/\s+/)
+                .map((value) => value.trim())
+                .filter(Boolean);
+          bodyText = bodyText.slice(0, 50000);
+          if (bodyHtml) bodyHtml = bodyHtml.slice(0, 200000);
+        } catch {
+          const fastContent = this.extractFastMessageContent(msg.source);
+          bodyText = fastContent.bodyText;
+          bodyHtml = fastContent.bodyHtml;
+          rfc822MessageId = fastContent.messageId ?? rfc822MessageId;
+          references = fastContent.references;
+        }
       }
     }
+    rfc822MessageId =
+      normalizeRfcMessageId(rfc822MessageId) ?? `<uid-${msg.uid}@imap>`;
+    timing.parseMs = Date.now() - parseStartedAt;
 
-    // Idempotent: skip if already stored (unique by mailboxId + folderId + imapUid)
+    const dedupeStartedAt = Date.now();
     const existing = await this.prisma.message.findFirst({
       where: { mailboxId, folderId, imapUid: msg.uid },
       select: { id: true },
     });
-    if (existing) return false;
+    if (existing) {
+      timing.dedupeMs = Date.now() - dedupeStartedAt;
+      return { created: false, unreadDelta: 0, timing };
+    }
+
+    const hasRealMessageId = !rfc822MessageId.startsWith('<uid-');
+    if (hasRealMessageId) {
+      const existingByMessageId = await this.prisma.message.findFirst({
+        where: {
+          mailboxId,
+          messageId: rfc822MessageId,
+          deletedAt: null,
+        },
+        select: {
+          id: true,
+          folderId: true,
+          folder: {
+            select: {
+              type: true,
+            },
+          },
+        },
+      });
+      if (existingByMessageId) {
+        const existingPriority =
+          FOLDER_MESSAGE_PRIORITY[String(existingByMessageId.folder?.type || 'custom')] ?? 99;
+        const currentPriority =
+          FOLDER_MESSAGE_PRIORITY[String(folderType || 'custom')] ?? 99;
+        const folderTypeNormalized = String(folderType || 'custom').toLowerCase();
+        const existingFolderType = String(
+          existingByMessageId.folder?.type || 'custom',
+        ).toLowerCase();
+        const shouldPromoteProviderDeleteToTrash =
+          folderTypeNormalized === 'trash' && existingFolderType !== 'trash';
+
+        if (currentPriority < existingPriority || shouldPromoteProviderDeleteToTrash) {
+          await this.prisma.message.update({
+            where: { id: existingByMessageId.id },
+            data: {
+              folder: { connect: { id: folderId } },
+              imapUid: msg.uid,
+              messageId: rfc822MessageId,
+              inReplyTo: inReplyTo ?? null,
+              references:
+                references.length > 0
+                  ? (references as unknown as Prisma.InputJsonValue)
+                  : undefined,
+              subject,
+              fromEmail,
+              to: toAddresses as unknown as Prisma.InputJsonValue,
+              bodyText,
+              bodyHtml,
+              createdAt: receivedAt,
+              deletedAt:
+                folderTypeNormalized === 'trash'
+                  ? new Date()
+                  : null,
+            },
+          });
+        }
+        timing.dedupeMs = Date.now() - dedupeStartedAt;
+        return { created: false, unreadDelta: 0, timing };
+      }
+    }
+    timing.dedupeMs = Date.now() - dedupeStartedAt;
 
     if (this.isThreadingDisabled(mailboxId, 'imap-thread-match-create')) {
-      return false;
+      return { created: false, unreadDelta: 0, timing };
     }
 
     const direction: 'INBOUND' | 'OUTBOUND' =
       folderType === 'sent' ? 'OUTBOUND' : 'INBOUND';
     const isDraft = folderType === 'drafts';
 
+    const threadResolveStartedAt = Date.now();
     const thread = await this.findOrCreateThread(
       organizationId,
       mailboxId,
       subject,
       rfc822MessageId,
       inReplyTo,
+      references,
       fromEmail,
       fromName,
+      options,
     );
+    timing.threadResolveMs = Date.now() - threadResolveStartedAt;
 
     // Build snippet from clean text (not raw MIME)
     const snippetText = bodyText.trim().replace(/\s+/g, ' ');
     const snippet =
       snippetText.slice(0, 200) + (fromName ? ` — ${fromName}` : '') || null;
 
+    const createStartedAt = Date.now();
     const createdMessage = await this.prisma.message.create({
       data: {
         thread: { connect: { id: thread.id } },
         mailbox: { connect: { id: mailboxId } },
         folder: { connect: { id: folderId } },
+        messageId: rfc822MessageId,
         fromEmail,
         to: toAddresses as unknown as Prisma.InputJsonValue,
         subject,
@@ -1952,39 +3210,16 @@ export class EmailSyncProcessor extends WorkerHost {
         direction,
         imapUid: msg.uid,
         inReplyTo: inReplyTo ?? null,
+        references:
+          references.length > 0
+            ? (references as unknown as Prisma.InputJsonValue)
+            : undefined,
         snippet,
         createdAt: receivedAt,
       },
       select: { id: true },
     });
-
-    if (direction === 'INBOUND') {
-      await this.evaluateRulesForInboundMessage({
-        organizationId,
-        threadId: thread.id,
-        fromEmail,
-        toAddresses,
-        ccAddresses: [],
-        subject,
-        bodyText,
-        bodyHtml,
-        hasAttachments: false,
-        inReplyTo,
-      });
-      await this.categorizeInboundMessage({
-        organizationId,
-        mailboxId,
-        threadId: thread.id,
-        messageId: createdMessage.id,
-        fromEmail,
-        toAddresses,
-        ccAddresses: [],
-        subject,
-        bodyText,
-        bodyHtml,
-        hasAttachments: false,
-      });
-    }
+    timing.createMs = Date.now() - createStartedAt;
 
     this.eventsGateway?.emitToOrganization(organizationId, 'thread:updated', {
       threadId: thread.id,
@@ -1992,18 +3227,51 @@ export class EmailSyncProcessor extends WorkerHost {
       type: 'new_message',
     });
 
-    if (this.crmService && thread.contactId) {
-      await this.crmService.emitContactActivity({
+    const postIngestWork = async () =>
+      this.runPostIngestWork(
         organizationId,
-        contactId: thread.contactId,
-        activity: direction === 'INBOUND' ? 'email_received' : 'email_sent',
-        threadId: thread.id,
         mailboxId,
-        messageId: createdMessage.id,
+        thread,
+        createdMessage.id,
+        fromEmail,
+        fromName,
+        toAddresses,
+        subject,
+        bodyText,
+        bodyHtml,
+        inReplyTo,
+        receivedAt,
+        direction,
+        options,
+      );
+
+    if (options.interactive) {
+      const postIngestStartedAt = Date.now();
+      void postIngestWork().catch((error) => {
+        this.logger.warn(
+          `[email-sync] interactive post-ingest work failed message=${createdMessage.id}: ${String(error)}`,
+        );
+      });
+      timing.postIngestMs = Date.now() - postIngestStartedAt;
+    } else {
+      const postIngestStartedAt = Date.now();
+      await postIngestWork();
+      timing.postIngestMs = Date.now() - postIngestStartedAt;
+    }
+
+    if (options.interactive && msg.source) {
+      void this.enrichInteractiveMessageContent(
+        createdMessage.id,
+        msg.source,
+        rfc822MessageId,
+      ).catch((error) => {
+        this.logger.warn(
+          `[email-sync] interactive message enrichment failed message=${createdMessage.id}: ${String(error)}`,
+        );
       });
     }
 
-    return true;
+    return { created: true, unreadDelta: 1, timing };
   }
 
   private async categorizeInboundMessage(input: {
@@ -2029,6 +3297,92 @@ export class EmailSyncProcessor extends WorkerHost {
         `[email-sync] AI categorization failed thread=${input.threadId}: ${String(err)}`,
       );
     }
+  }
+
+  private async dispatchInboundNewMessageNotifications(input: {
+    organizationId: string;
+    mailboxId: string;
+    threadId: string;
+    messageId: string;
+    fromEmail: string;
+    fromName: string | null;
+    subject: string;
+    receivedAt: Date;
+  }): Promise<void> {
+    if (!this.notificationsService) {
+      return;
+    }
+
+    const recipients = await this.resolveNewMessageNotificationRecipients(
+      input.organizationId,
+      input.mailboxId,
+    );
+    if (recipients.length === 0) {
+      return;
+    }
+
+    const senderLabel = input.fromName?.trim() || input.fromEmail;
+    const title = 'New incoming email';
+    const message = `${senderLabel}: ${input.subject || '(no subject)'}`;
+    const createdAtIso = Number.isNaN(input.receivedAt.getTime())
+      ? new Date().toISOString()
+      : input.receivedAt.toISOString();
+
+    await Promise.all(
+      recipients.map((recipientId) =>
+        this.notificationsService!
+          .dispatch({
+            userId: recipientId,
+            organizationId: input.organizationId,
+            type: 'new_message',
+            title,
+            message,
+            resourceId: input.threadId,
+            data: {
+              threadId: input.threadId,
+              mailboxId: input.mailboxId,
+              messageId: input.messageId,
+              fromEmail: input.fromEmail,
+              fromName: input.fromName,
+              subject: input.subject,
+              createdAt: createdAtIso,
+            },
+          })
+          .catch((error) => {
+            this.logger.warn(
+              `[email-sync] new_message notification failed mailbox=${input.mailboxId} thread=${input.threadId} recipient=${recipientId}: ${String(error)}`,
+            );
+          }),
+      ),
+    );
+  }
+
+  private async resolveNewMessageNotificationRecipients(
+    organizationId: string,
+    mailboxId: string,
+  ): Promise<string[]> {
+    const users = await this.prisma.user.findMany({
+      where: {
+        organizationId,
+        deletedAt: null,
+        isActive: true,
+        OR: [
+          { role: { in: ['ADMIN', 'MANAGER'] } },
+          { mailboxAccess: { some: { mailboxId, canRead: true } } },
+          {
+            teamMemberships: {
+              some: {
+                team: {
+                  mailboxAccess: { some: { mailboxId, canRead: true } },
+                },
+              },
+            },
+          },
+        ],
+      },
+      select: { id: true },
+    });
+    return users.map((user) => user.id);
   }
 
   private async evaluateRulesForInboundMessage(input: {
@@ -2070,41 +3424,264 @@ export class EmailSyncProcessor extends WorkerHost {
     }
   }
 
+  private async runPostIngestWork(
+    organizationId: string,
+    mailboxId: string,
+    thread: ThreadLookupResult,
+    messageId: string,
+    fromEmail: string,
+    fromName: string,
+    toAddresses: string[],
+    subject: string,
+    bodyText: string,
+    bodyHtml: string | null,
+    inReplyTo: string | undefined,
+    receivedAt: Date,
+    direction: 'INBOUND' | 'OUTBOUND',
+    options: SyncExecutionOptions,
+  ): Promise<void> {
+    let effectiveThread = thread;
+
+    if (
+      options.interactive &&
+      this.crmService &&
+      !effectiveThread.contactId &&
+      fromEmail &&
+      fromEmail !== 'unknown@example.com'
+    ) {
+      const contactLink = await this.resolveContactLink(
+        organizationId,
+        fromEmail,
+        fromName,
+        options,
+      );
+      if (contactLink.contactId || contactLink.companyId) {
+        const updatedThread = await this.prisma.thread.update({
+          where: { id: thread.id },
+          data: {
+            ...(contactLink.contactId ? { contactId: contactLink.contactId } : {}),
+            ...(contactLink.companyId ? { companyId: contactLink.companyId } : {}),
+          },
+          select: { id: true, contactId: true, companyId: true },
+        });
+        effectiveThread = {
+          id: updatedThread.id,
+          contactId: updatedThread.contactId ?? null,
+          companyId: updatedThread.companyId ?? null,
+        };
+      }
+    }
+
+    if (direction === 'INBOUND') {
+      await this.evaluateRulesForInboundMessage({
+        organizationId,
+        threadId: effectiveThread.id,
+        fromEmail,
+        toAddresses,
+        ccAddresses: [],
+        subject,
+        bodyText,
+        bodyHtml,
+        hasAttachments: false,
+        inReplyTo,
+      });
+      await this.categorizeInboundMessage({
+        organizationId,
+        mailboxId,
+        threadId: effectiveThread.id,
+        messageId,
+        fromEmail,
+        toAddresses,
+        ccAddresses: [],
+        subject,
+        bodyText,
+        bodyHtml,
+        hasAttachments: false,
+      });
+      await this.dispatchInboundNewMessageNotifications({
+        organizationId,
+        mailboxId,
+        threadId: effectiveThread.id,
+        messageId,
+        fromEmail,
+        fromName,
+        subject,
+        receivedAt,
+      });
+    }
+
+    if (this.crmService && effectiveThread.contactId) {
+      await this.crmService.emitContactActivity({
+        organizationId,
+        contactId: effectiveThread.contactId,
+        activity: direction === 'INBOUND' ? 'email_received' : 'email_sent',
+        threadId: effectiveThread.id,
+        mailboxId,
+        messageId,
+      });
+    }
+  }
+
   private async findOrCreateThread(
     organizationId: string,
     mailboxId: string,
     subject: string,
     _messageId: string,
     inReplyTo: string | undefined,
+    references: string[] = [],
     fromEmail: string,
     fromName?: string,
+    options: SyncExecutionOptions = {},
   ): Promise<{ id: string; contactId: string | null; companyId: string | null }> {
+    const normalizeSubject = (value?: string | null): string => {
+      return String(value || '')
+        .replace(/^(re:|fwd?:|aw:|fw:)\s*/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+    };
+    const runtimeCache = options.runtimeCache;
+
     if (inReplyTo) {
-      const existing = await this.prisma.thread.findFirst({
-        where: { organizationId, subject },
-        select: { id: true, contactId: true, companyId: true },
+      const normalizedInReplyTo = normalizeRfcMessageId(inReplyTo);
+      if (normalizedInReplyTo) {
+        const cachedThread = runtimeCache?.threadByMessageId.get(normalizedInReplyTo);
+        if (cachedThread) {
+          return cachedThread;
+        }
+        const matchedByMessageId = await this.prisma.message.findFirst({
+          where: {
+            mailboxId,
+            messageId: normalizedInReplyTo,
+            deletedAt: null,
+            thread: {
+              organizationId,
+              status: { not: ThreadStatus.TRASH },
+            },
+          },
+          select: {
+            thread: {
+              select: { id: true, contactId: true, companyId: true },
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (matchedByMessageId?.thread) {
+          const resolvedThread = {
+            id: matchedByMessageId.thread.id,
+            contactId: matchedByMessageId.thread.contactId ?? null,
+            companyId: matchedByMessageId.thread.companyId ?? null,
+          };
+          runtimeCache?.threadByMessageId.set(normalizedInReplyTo, resolvedThread);
+          return resolvedThread;
+        }
+      }
+    }
+
+    const normalizedReferences = Array.from(
+      new Set(
+        references
+          .map((value) => normalizeRfcMessageId(value))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    );
+    if (normalizedReferences.length > 0) {
+      for (const reference of normalizedReferences) {
+        const cachedThread = runtimeCache?.threadByMessageId.get(reference);
+        if (cachedThread) {
+          return cachedThread;
+        }
+      }
+      const matchedByReferences = await this.prisma.message.findFirst({
+        where: {
+          mailboxId,
+          messageId: { in: normalizedReferences },
+          deletedAt: null,
+          thread: {
+            organizationId,
+            status: { not: ThreadStatus.TRASH },
+          },
+        },
+        select: {
+          thread: {
+            select: { id: true, contactId: true, companyId: true },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
       });
+      if (matchedByReferences?.thread) {
+        const resolvedThread = {
+          id: matchedByReferences.thread.id,
+          contactId: matchedByReferences.thread.contactId ?? null,
+          companyId: matchedByReferences.thread.companyId ?? null,
+        };
+        normalizedReferences.forEach((reference) =>
+          runtimeCache?.threadByMessageId.set(reference, resolvedThread),
+        );
+        return resolvedThread;
+      }
+    }
+
+    if (inReplyTo || normalizedReferences.length > 0) {
+      const normalizedIncomingSubject = normalizeSubject(subject);
+      const cachedBySubject = normalizedIncomingSubject
+        ? runtimeCache?.threadBySubject.get(normalizedIncomingSubject)
+        : null;
+      if (cachedBySubject) {
+        return cachedBySubject;
+      }
+      const subjectCandidates = await this.prisma.thread.findMany({
+        where: {
+          organizationId,
+          mailboxId,
+          status: { not: ThreadStatus.TRASH },
+          ...(normalizedIncomingSubject
+            ? {
+                subject: {
+                  contains: normalizedIncomingSubject,
+                  mode: 'insensitive',
+                },
+              }
+            : {}),
+        },
+        select: { id: true, subject: true, contactId: true, companyId: true },
+        orderBy: { updatedAt: 'desc' },
+        take: 25,
+      });
+      const existing =
+        subjectCandidates.find(
+          (candidate) =>
+            normalizeSubject(candidate.subject) === normalizedIncomingSubject,
+        ) || subjectCandidates[0];
       if (existing) {
-        if (existing.contactId || !this.crmService) {
-          return {
+        if (existing.contactId || !this.crmService || options.interactive) {
+          const resolvedThread = {
             id: existing.id,
             contactId: existing.contactId ?? null,
             companyId: existing.companyId ?? null,
           };
+          if (normalizedIncomingSubject) {
+            runtimeCache?.threadBySubject.set(normalizedIncomingSubject, resolvedThread);
+          }
+          return resolvedThread;
         }
 
-        const contactLink =
-          fromEmail && fromEmail !== 'unknown@example.com'
-            ? await this.crmService
-                .autoCreateContactIfEnabled(fromEmail, fromName, organizationId)
-                .catch(() => ({ contactId: null, companyId: null }))
-            : { contactId: null, companyId: null };
+        const contactLink = await this.resolveContactLink(
+          organizationId,
+          fromEmail,
+          fromName,
+          options,
+        );
         if (!contactLink.contactId) {
-          return {
+          const resolvedThread = {
             id: existing.id,
             contactId: null,
             companyId: existing.companyId ?? null,
           };
+          if (normalizedIncomingSubject) {
+            runtimeCache?.threadBySubject.set(normalizedIncomingSubject, resolvedThread);
+          }
+          return resolvedThread;
         }
 
         const updated = await this.prisma.thread.update({
@@ -2117,23 +3694,27 @@ export class EmailSyncProcessor extends WorkerHost {
           },
           select: { id: true, contactId: true, companyId: true },
         });
-        return {
+        const resolvedThread = {
           id: updated.id,
           contactId: updated.contactId ?? null,
           companyId: updated.companyId ?? null,
         };
+        if (normalizedIncomingSubject) {
+          runtimeCache?.threadBySubject.set(normalizedIncomingSubject, resolvedThread);
+        }
+        return resolvedThread;
       }
     }
 
-    let contactLink: { contactId: string | null; companyId: string | null } = {
-      contactId: null,
-      companyId: null,
-    };
-    if (this.crmService && fromEmail && fromEmail !== 'unknown@example.com') {
-      contactLink = await this.crmService
-        .autoCreateContactIfEnabled(fromEmail, fromName, organizationId)
-        .catch(() => ({ contactId: null, companyId: null }));
-    }
+    const contactLink =
+      options.interactive || !this.crmService
+        ? { contactId: null, companyId: null }
+        : await this.resolveContactLink(
+            organizationId,
+            fromEmail,
+            fromName,
+            options,
+          );
 
     const created = await this.prisma.thread.create({
       data: {
@@ -2150,11 +3731,160 @@ export class EmailSyncProcessor extends WorkerHost {
       },
       select: { id: true, contactId: true, companyId: true },
     });
-    return {
+    const resolvedThread = {
       id: created.id,
       contactId: created.contactId ?? null,
       companyId: created.companyId ?? null,
     };
+    const normalizedCreatedSubject = normalizeSubject(subject);
+    if (normalizedCreatedSubject) {
+      runtimeCache?.threadBySubject.set(normalizedCreatedSubject, resolvedThread);
+    }
+    runtimeCache?.threadByMessageId.set(_messageId, resolvedThread);
+    if (inReplyTo) {
+      const normalizedInReplyTo = normalizeRfcMessageId(inReplyTo);
+      if (normalizedInReplyTo) {
+        runtimeCache?.threadByMessageId.set(normalizedInReplyTo, resolvedThread);
+      }
+    }
+    normalizedReferences.forEach((reference) =>
+      runtimeCache?.threadByMessageId.set(reference, resolvedThread),
+    );
+    return resolvedThread;
+  }
+
+  private async resolveContactLink(
+    organizationId: string,
+    fromEmail: string,
+    fromName: string | undefined,
+    options: SyncExecutionOptions,
+  ): Promise<{ contactId: string | null; companyId: string | null }> {
+    if (!this.crmService || !fromEmail || fromEmail === 'unknown@example.com') {
+      return { contactId: null, companyId: null };
+    }
+
+    const cacheKey = `${organizationId}:${fromEmail.toLowerCase()}`;
+    const cached = options.runtimeCache?.contactLinkByEmail.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const contactLink = await this.crmService
+      .autoCreateContactIfEnabled(fromEmail, fromName, organizationId)
+      .catch(() => ({ contactId: null, companyId: null }));
+    options.runtimeCache?.contactLinkByEmail.set(cacheKey, contactLink);
+    return contactLink;
+  }
+
+  private extractFastMessageContent(source: Buffer): {
+    messageId: string | null;
+    inReplyTo: string | null;
+    references: string[];
+    bodyText: string;
+    bodyHtml: string | null;
+  } {
+    const raw = source.toString('utf8');
+    const separatorMatch = raw.match(/\r?\n\r?\n/);
+    const separatorIndex = separatorMatch ? raw.indexOf(separatorMatch[0]) : -1;
+    const headerEndIndex =
+      separatorIndex >= 0 ? separatorIndex + separatorMatch![0].length : -1;
+    const headers = separatorIndex >= 0 ? raw.slice(0, separatorIndex) : raw;
+    const body = headerEndIndex >= 0 ? raw.slice(headerEndIndex) : raw;
+    const contentType = this.extractHeaderValue(headers, 'content-type') || '';
+    const messageId = normalizeRfcMessageId(
+      this.extractHeaderValue(headers, 'message-id'),
+    );
+    const inReplyTo = normalizeRfcMessageId(
+      this.extractHeaderValue(headers, 'in-reply-to'),
+    );
+    const referencesHeader = this.extractHeaderValue(headers, 'references');
+    const references = Array.from(
+      new Set(
+        String(referencesHeader || '')
+          .split(/\s+/)
+          .map((value) => normalizeRfcMessageId(value))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    );
+
+    const cleanedBody = body
+      .replace(/\r\n/g, '\n')
+      .replace(/^--.*$/gm, ' ')
+      .replace(/^(content-[^:]+|mime-version):.*$/gim, ' ')
+      .replace(/=\n/g, '')
+      .trim();
+    const bodyHtml =
+      /text\/html/i.test(contentType) && !/multipart\//i.test(contentType)
+        ? cleanedBody.slice(0, 200000)
+        : null;
+    const bodyText = (bodyHtml ? bodyHtml.replace(/<[^>]+>/g, ' ') : cleanedBody)
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 50000);
+
+    return {
+      messageId,
+      inReplyTo,
+      references,
+      bodyText,
+      bodyHtml,
+    };
+  }
+
+  private extractHeaderValue(headers: string, headerName: string): string | null {
+    const lines = headers.replace(/\r\n/g, '\n').split('\n');
+    const target = `${headerName.toLowerCase()}:`;
+    let current: string | null = null;
+    for (const line of lines) {
+      if (/^[ \t]/.test(line) && current !== null) {
+        current += ` ${line.trim()}`;
+        continue;
+      }
+      if (line.toLowerCase().startsWith(target)) {
+        current = line.slice(target.length).trim();
+        continue;
+      }
+      if (current !== null) {
+        break;
+      }
+    }
+    return current;
+  }
+
+  private async enrichInteractiveMessageContent(
+    messageId: string,
+    source: Buffer,
+    fallbackMessageId: string,
+  ): Promise<void> {
+    try {
+      const parsed = await simpleParser(source);
+      const normalizedFallbackMessageId =
+        normalizeRfcMessageId(fallbackMessageId) ?? fallbackMessageId;
+      const parsedMessageId =
+        normalizeRfcMessageId(parsed.messageId) ?? normalizedFallbackMessageId;
+      const parsedReferences = Array.isArray(parsed.references)
+        ? parsed.references.map((value) => String(value || '').trim()).filter(Boolean)
+        : String(parsed.references || '')
+            .split(/\s+/)
+            .map((value) => value.trim())
+            .filter(Boolean);
+      await this.prisma.message.update({
+        where: { id: messageId },
+        data: {
+          messageId: parsedMessageId,
+          bodyText: String(parsed.text || '').slice(0, 50000),
+          bodyHtml: parsed.html ? String(parsed.html).slice(0, 200000) : null,
+          references:
+            parsedReferences.length > 0
+              ? (parsedReferences as unknown as Prisma.InputJsonValue)
+              : undefined,
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `[email-sync] interactive enrichment parse failed message=${messageId}: ${String(error)}`,
+      );
+    }
   }
 
   // ─── Encryption ───────────────────────────────────────────────────────────

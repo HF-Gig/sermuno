@@ -705,6 +705,7 @@ const SettingsPage: React.FC = () => {
     const [editingMailbox, setEditingMailbox] = useState<Mailbox | null>(null);
     const [deletingMailbox, setDeletingMailbox] = useState<Mailbox | null>(null);
     const [showDeleteMailboxModal, setShowDeleteMailboxModal] = useState(false);
+    const [deletingMailboxPending, setDeletingMailboxPending] = useState(false);
     const [mailboxFormData, setMailboxFormData] = useState({
         name: '', email: '', provider: 'SMTP',
         smtpHost: '', smtpPort: '465', smtpSecure: true, smtpUser: '', smtpPass: '',
@@ -1521,13 +1522,25 @@ const SettingsPage: React.FC = () => {
 
     const confirmDeleteMailbox = async () => {
         if (!deletingMailbox) return;
+        const mailboxToDelete = deletingMailbox;
+        const previousMailboxes = mailboxes;
+        setDeletingMailboxPending(true);
         try {
-            await api.delete(`/mailboxes/${deletingMailbox.id}`);
-            setMailboxes(prev => prev.filter(m => m.id !== deletingMailbox.id));
+            setMailboxes(prev => prev.filter(m => m.id !== mailboxToDelete.id));
             setShowDeleteMailboxModal(false);
             setDeletingMailbox(null);
+            window.dispatchEvent(new CustomEvent('sermuno:mailbox-deleted', {
+                detail: { mailboxId: mailboxToDelete.id },
+            }));
+            await api.delete(`/mailboxes/${mailboxToDelete.id}`);
         } catch (err) {
             console.error('Failed to delete mailbox:', err);
+            setMailboxes(previousMailboxes);
+            window.dispatchEvent(new CustomEvent('sermuno:mailbox-delete-rollback', {
+                detail: { mailboxId: mailboxToDelete.id },
+            }));
+        } finally {
+            setDeletingMailboxPending(false);
         }
     };
 
@@ -4054,9 +4067,14 @@ const SettingsPage: React.FC = () => {
             />
             <DeleteMailboxModal
                 isOpen={showDeleteMailboxModal}
-                onClose={() => { setShowDeleteMailboxModal(false); setDeletingMailbox(null); }}
+                onClose={() => {
+                    if (deletingMailboxPending) return;
+                    setShowDeleteMailboxModal(false);
+                    setDeletingMailbox(null);
+                }}
                 mailboxName={deletingMailbox?.name || ''}
                 onConfirm={confirmDeleteMailbox}
+                isSubmitting={deletingMailboxPending}
             />
             <MailboxHealthModal
                 isOpen={showHealthModal}

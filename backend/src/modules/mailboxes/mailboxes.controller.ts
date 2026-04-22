@@ -162,4 +162,20 @@ export class MailboxesController {
   triggerSync(@Param('id') id: string, @CurrentUser() user: JwtUser) {
     return this.mailboxesService.triggerSync(id, user);
   }
+
+  // POST /mailboxes/:id/refresh
+  @Post(':id/refresh')
+  @HttpCode(HttpStatus.OK)
+  refresh(
+    @Param('id') id: string,
+    @Body()
+    body: {
+      currentFolderType?: string;
+      threadId?: string | null;
+      fastPath?: boolean;
+    },
+    @CurrentUser() user: JwtUser,
+  ) {
+    return this.mailboxesService.refreshInbox(id, body, user);
+  }
 }

@@ -253,6 +253,14 @@ const SignaturesPage: React.FC = () => {
             setFormError('Name and HTML body are required.');
             return;
         }
+        if (canManage && form.scope === 'team' && !form.teamId) {
+            setFormError('Please select a team for team-scoped signature assignment.');
+            return;
+        }
+        if (canManage && form.scope === 'personal' && !(form.userId || user?.id)) {
+            setFormError('Please select a user for personal signature assignment.');
+            return;
+        }
 
         const payload = {
             name: form.name.trim(),
@@ -279,6 +287,7 @@ const SignaturesPage: React.FC = () => {
 
             if (signatureId && canManage) {
                 await api.post(`/signatures/${signatureId}/assign`, {
+                    scope: form.scope,
                     mailboxIds: form.mailboxIds,
                     teamId: form.scope === 'team' ? form.teamId || undefined : undefined,
                     userId: form.scope === 'personal' ? (form.userId || user?.id || undefined) : undefined,
@@ -541,14 +550,34 @@ const SignaturesPage: React.FC = () => {
                         <div className="grid gap-4 md:grid-cols-2">
                             <div>
                                 <label className="mb-1.5 block text-sm font-medium text-[var(--color-text-primary)]">Assign to Team</label>
-                                <select value={form.teamId} onChange={(event) => setForm((prev) => ({ ...prev, teamId: event.target.value }))} disabled={form.scope !== 'team'} className="w-full rounded-lg border border-[var(--color-card-border)] bg-white px-3 py-2 text-sm disabled:bg-[var(--color-background)]/40">
+                                <select
+                                    value={form.teamId}
+                                    onChange={(event) => setForm((prev) => ({
+                                        ...prev,
+                                        teamId: event.target.value,
+                                        userId: event.target.value ? '' : prev.userId,
+                                        scope: event.target.value ? 'team' : prev.scope,
+                                    }))}
+                                    disabled={!canManage}
+                                    className="w-full rounded-lg border border-[var(--color-card-border)] bg-white px-3 py-2 text-sm disabled:bg-[var(--color-background)]/40"
+                                >
                                     <option value="">No team selected</option>
                                     {teams.map((team: any) => <option key={team.id} value={team.id}>{team.name}</option>)}
                                 </select>
                             </div>
                             <div>
                                 <label className="mb-1.5 block text-sm font-medium text-[var(--color-text-primary)]">Assign to User</label>
-                                <select value={form.userId} onChange={(event) => setForm((prev) => ({ ...prev, userId: event.target.value, scope: 'personal' }))} disabled={form.scope !== 'personal' || !canManage} className="w-full rounded-lg border border-[var(--color-card-border)] bg-white px-3 py-2 text-sm disabled:bg-[var(--color-background)]/40">
+                                <select
+                                    value={form.userId}
+                                    onChange={(event) => setForm((prev) => ({
+                                        ...prev,
+                                        userId: event.target.value,
+                                        teamId: event.target.value ? '' : prev.teamId,
+                                        scope: event.target.value ? 'personal' : prev.scope,
+                                    }))}
+                                    disabled={!canManage}
+                                    className="w-full rounded-lg border border-[var(--color-card-border)] bg-white px-3 py-2 text-sm disabled:bg-[var(--color-background)]/40"
+                                >
                                     <option value="">Use current owner</option>
                                     {users.map((entry: any) => <option key={entry.id} value={entry.id}>{entry.fullName || entry.email}</option>)}
                                 </select>
