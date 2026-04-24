@@ -104,9 +104,13 @@ export class MailboxesService {
       raw === '[gmail]' ||
       raw === '[gmail]/starred' ||
       raw === '[gmail]/important' ||
+      normalized === 'outbox' ||
+      normalized === 'conversation history' ||
       normalized === 'starred' ||
       normalized === 'important' ||
       normalized === 'flagged emails' ||
+      normalized.endsWith('/outbox') ||
+      normalized.endsWith('/conversation history') ||
       normalized.endsWith('/starred') ||
       normalized.endsWith('/important')
     );
@@ -632,6 +636,34 @@ export class MailboxesService {
     });
     if (!mailbox) throw new NotFoundException('Mailbox not found');
 
+    if (
+      mailbox.provider === 'OUTLOOK' &&
+      String(mailbox.oauthProvider || '').toLowerCase() === 'microsoft'
+    ) {
+      const refreshSummary = await this.emailSyncProcessor.refreshMailboxInteractive(
+        {
+          mailboxId: id,
+          organizationId: user.organizationId,
+          folderTypeHints: [
+            'inbox',
+            'sent',
+            'drafts',
+            'spam',
+            'trash',
+            'archive',
+          ],
+          reconcileDeletions: true,
+        },
+      );
+
+      return {
+        message: 'Sync completed',
+        mailboxId: id,
+        mode: 'interactive',
+        refreshSummary,
+      };
+    }
+
     const streamingMode =
       this.configService.get<boolean>('featureFlags.enableStreamingSync') ??
       false;
@@ -718,7 +750,7 @@ export class MailboxesService {
         mailboxId: id,
         organizationId: user.organizationId,
         folderTypeHints: criticalFolderTypes,
-        reconcileDeletions: !Boolean(body?.fastPath),
+        reconcileDeletions: true,
       },
     );
 

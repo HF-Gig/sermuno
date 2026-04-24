@@ -773,6 +773,14 @@ export class ThreadsService {
     const fromEmail = params.mailbox.email || globalFrom || params.actor.email;
     const replyTo = params.mailbox.email || params.actor.email;
 
+    if (
+      params.mailbox.provider === 'OUTLOOK' &&
+      String(params.mailbox.oauthProvider || '').toLowerCase() === 'microsoft' &&
+      oauthAccessToken
+    ) {
+      return this.sendThroughMicrosoftGraph(params, oauthAccessToken, fromEmail);
+    }
+
     const isDisconnectedOauthMailbox =
       (params.mailbox.provider === 'GMAIL' ||
         params.mailbox.provider === 'OUTLOOK') &&
@@ -883,6 +891,125 @@ export class ThreadsService {
         error instanceof Error ? error.message : 'Unknown provider error';
       this.logger.error(
         `[reply-send-failed] ${JSON.stringify({ ...details, providerMessage })}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      throw new InternalServerErrorException(
+        `Failed to deliver email to provider: ${providerMessage}`,
+      );
+    }
+  }
+
+  private async sendThroughMicrosoftGraph(
+    params: {
+      mailbox: MailboxSmtpConfig;
+      to: string[];
+      cc: string[];
+      bcc: string[];
+      subject: string;
+      bodyHtml?: string;
+      bodyText?: string;
+      inReplyTo?: string;
+      references?: string[];
+      attachments?: Array<{
+        filename: string;
+        contentType: string;
+        content: Buffer;
+        cid?: string;
+        contentDisposition?: 'inline' | 'attachment';
+      }>;
+      threadId: string;
+    },
+    accessToken: string,
+    fromEmail: string,
+  ): Promise<{ providerMessageId?: string; fromEmail: string }> {
+    const graphAttachments = (params.attachments ?? []).map((attachment) => ({
+      '@odata.type': '#microsoft.graph.fileAttachment',
+      name: attachment.filename,
+      contentType: attachment.contentType || 'application/octet-stream',
+      contentBytes: attachment.content.toString('base64'),
+      isInline: attachment.contentDisposition === 'inline',
+      contentId: attachment.cid || undefined,
+    }));
+
+    const headers: Array<{ name: string; value: string }> = [];
+    if (params.inReplyTo) {
+      headers.push({ name: 'In-Reply-To', value: params.inReplyTo });
+    }
+    if (Array.isArray(params.references) && params.references.length > 0) {
+      headers.push({
+        name: 'References',
+        value: params.references.join(' '),
+      });
+    }
+
+    const payload = {
+      message: {
+        subject: params.subject,
+        body: {
+          contentType: 'HTML',
+          content: params.bodyHtml || String(params.bodyText || '').trim(),
+        },
+        toRecipients: params.to.map((email) => ({
+          emailAddress: { address: email },
+        })),
+        ccRecipients: params.cc.map((email) => ({
+          emailAddress: { address: email },
+        })),
+        bccRecipients: params.bcc.map((email) => ({
+          emailAddress: { address: email },
+        })),
+        ...(headers.length > 0
+          ? { internetMessageHeaders: headers }
+          : {}),
+        ...(graphAttachments.length > 0
+          ? { attachments: graphAttachments }
+          : {}),
+      },
+      saveToSentItems: true,
+    };
+
+    try {
+      const response = await fetch(
+        'https://graph.microsoft.com/v1.0/me/sendMail',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+
+      if (!response.ok) {
+        const body = await response.text();
+        const trimmed = body.slice(0, 300);
+        this.logger.error(
+          `[outlook-graph-send-failed] ${JSON.stringify({
+            threadId: params.threadId,
+            mailboxId: params.mailbox.id,
+            status: response.status,
+            body: trimmed,
+          })}`,
+        );
+        throw new InternalServerErrorException(
+          `Failed to deliver email to provider: Outlook Graph send failed (${response.status}) ${trimmed}`,
+        );
+      }
+
+      return { providerMessageId: undefined, fromEmail };
+    } catch (error) {
+      if (error instanceof InternalServerErrorException) {
+        throw error;
+      }
+      const providerMessage =
+        error instanceof Error ? error.message : 'Unknown provider error';
+      this.logger.error(
+        `[outlook-graph-send-exception] ${JSON.stringify({
+          threadId: params.threadId,
+          mailboxId: params.mailbox.id,
+          providerMessage,
+        })}`,
         error instanceof Error ? error.stack : undefined,
       );
       throw new InternalServerErrorException(
@@ -1211,11 +1338,13 @@ export class ThreadsService {
                   fromEmail: true,
                   bodyText: true,
                   bodyHtml: true,
+                  hasAttachments: true,
                   isRead: true,
                   isDraft: true,
                   messageId: true,
                   folderId: true,
                   createdAt: true,
+                  _count: { select: { attachments: true } },
                   folder: { select: { type: true, name: true } },
                 },
               },
@@ -3135,6 +3264,15 @@ export class ThreadsService {
       },
     });
 
+    const deleteAttempts = Math.max(
+      1,
+      Number(process.env.THREAD_DELETE_ATTEMPTS || 1),
+    );
+    const deleteBackoffMs = Math.max(
+      0,
+      Number(process.env.THREAD_DELETE_BACKOFF_MS || 0),
+    );
+
     await this.threadDeleteQueue.add(
       'provider-delete',
       {
@@ -3146,8 +3284,10 @@ export class ThreadsService {
         userAgent: meta.userAgent,
       },
       {
-        attempts: 8,
-        backoff: { type: 'exponential', delay: 5000 },
+        attempts: deleteAttempts,
+        ...(deleteBackoffMs > 0
+          ? { backoff: { type: 'exponential' as const, delay: deleteBackoffMs } }
+          : {}),
         removeOnComplete: 100,
         removeOnFail: 200,
         priority: 3,
@@ -3217,6 +3357,7 @@ export class ThreadsService {
             imapPass: true,
             oauthAccessToken: true,
             googleAccessToken: true,
+            oauthProvider: true,
             lastSyncError: true,
           },
         },
@@ -3246,21 +3387,26 @@ export class ThreadsService {
       return;
     }
 
+    const providerLinkedMessages = thread.messages
+      .map((message) => ({
+        imapUid:
+          typeof message.imapUid === 'number' && message.imapUid > 0
+            ? message.imapUid
+            : 0,
+        folderName: String(message.folder?.name || '').trim(),
+        messageId: String(message.messageId || '').trim() || null,
+      }))
+      .filter(
+        (entry) =>
+          (entry.imapUid > 0 && entry.folderName.length > 0) ||
+          Boolean(entry.messageId),
+      );
+
     const providerDeletion = await this.withTimeout(
       this.deleteThreadMessagesFromProvider({
         organizationId: job.organizationId,
         mailbox: thread.mailbox,
-        messages: thread.messages
-          .map((message) => ({
-            imapUid: message.imapUid,
-            folderName: message.folder?.name || null,
-          }))
-          .filter(
-            (entry): entry is { imapUid: number; folderName: string } =>
-              typeof entry.imapUid === 'number' &&
-              entry.imapUid > 0 &&
-              Boolean(entry.folderName),
-          ),
+        messages: providerLinkedMessages,
       }),
       ThreadsService.THREAD_DELETE_TOTAL_TIMEOUT_MS,
       'Timed out while deleting thread from provider mailbox.',
@@ -3436,9 +3582,14 @@ export class ThreadsService {
       imapPass: string | null;
       oauthAccessToken: string | null;
       googleAccessToken: string | null;
+      oauthProvider: string | null;
       lastSyncError: string | null;
     };
-    messages: Array<{ imapUid: number; folderName: string }>;
+    messages: Array<{
+      imapUid: number;
+      folderName: string;
+      messageId?: string | null;
+    }>;
   }): Promise<{
     attempted: boolean;
     deletedCount: number;
@@ -3463,6 +3614,21 @@ export class ThreadsService {
     const oauthAccessToken =
       this.decryptSecretIfNeeded(input.mailbox.oauthAccessToken) ||
       this.decryptSecretIfNeeded(input.mailbox.googleAccessToken);
+    const oauthProvider = String(input.mailbox.oauthProvider || '')
+      .trim()
+      .toLowerCase();
+
+    if (
+      String(input.mailbox.provider || '').toUpperCase() === 'OUTLOOK' &&
+      oauthProvider === 'microsoft' &&
+      oauthAccessToken
+    ) {
+      return this.deleteThreadMessagesFromOutlookGraph({
+        mailboxId: input.mailbox.id,
+        accessToken: oauthAccessToken,
+        messages: input.messages,
+      });
+    }
 
     if (!host || !port || !authUser) {
       throw new BadRequestException(
@@ -3561,6 +3727,177 @@ export class ThreadsService {
       deletedCount,
       movedToTrashCount,
     };
+  }
+
+  private async deleteThreadMessagesFromOutlookGraph(input: {
+    mailboxId: string;
+    accessToken: string;
+    messages: Array<{
+      imapUid: number;
+      folderName: string;
+      messageId?: string | null;
+    }>;
+  }): Promise<{
+    attempted: boolean;
+    deletedCount: number;
+    movedToTrashCount: number;
+    skippedReason?: string;
+  }> {
+    const normalizedMessageIds = Array.from(
+      new Set(
+        input.messages
+          .map((message) => this.normalizeMessageId(message.messageId))
+          .filter((messageId): messageId is string => Boolean(messageId)),
+      ),
+    );
+
+    if (normalizedMessageIds.length === 0) {
+      return {
+        attempted: false,
+        deletedCount: 0,
+        movedToTrashCount: 0,
+        skippedReason: 'No RFC message-id values available for Outlook Graph delete.',
+      };
+    }
+
+    let movedToTrashCount = 0;
+    for (const messageId of normalizedMessageIds) {
+      const escapedMessageId = messageId.replace(/'/g, "''");
+      const lookupUrl = `https://graph.microsoft.com/v1.0/me/messages?$filter=internetMessageId eq '${escapedMessageId}'&$select=id,parentFolderId&$top=10`;
+      const lookupResponse = await this.withTimeout(
+        fetch(lookupUrl, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${input.accessToken}`,
+          },
+        }),
+        ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+        'Timed out while querying Outlook Graph message metadata for thread deletion.',
+      );
+
+      if (!lookupResponse.ok) {
+        const body = (await lookupResponse.text()).slice(0, 500);
+        throw new BadRequestException(
+          `Failed to query Outlook Graph message for deletion (${lookupResponse.status}): ${body}`,
+        );
+      }
+
+      const lookupJson = (await lookupResponse.json()) as {
+        value?: Array<{ id?: string }>;
+      };
+      const graphMessageIds = Array.isArray(lookupJson?.value)
+        ? lookupJson.value
+            .map((entry) => String(entry?.id || '').trim())
+            .filter((value) => value.length > 0)
+        : [];
+
+      for (const graphMessageId of graphMessageIds) {
+        const moveUrl = `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(graphMessageId)}/move`;
+        const moveResponse = await this.withTimeout(
+          fetch(moveUrl, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${input.accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ destinationId: 'deleteditems' }),
+          }),
+          ThreadsService.THREAD_DELETE_PROVIDER_TIMEOUT_MS,
+          'Timed out while moving Outlook message to Deleted Items.',
+        );
+
+        if (!moveResponse.ok) {
+          const body = (await moveResponse.text()).slice(0, 500);
+          throw new BadRequestException(
+            `Failed to move Outlook message to Deleted Items (${moveResponse.status}): ${body}`,
+          );
+        }
+
+        movedToTrashCount += 1;
+      }
+    }
+
+    return {
+      attempted: true,
+      deletedCount: 0,
+      movedToTrashCount,
+    };
+  }
+
+  async handleQueuedThreadDeleteFailure(
+    job: ThreadDeleteJobData,
+    error: unknown,
+    finalFailure: boolean,
+  ): Promise<void> {
+    if (!finalFailure) {
+      return;
+    }
+
+    const thread = await this.prisma.thread.findFirst({
+      where: {
+        id: job.threadId,
+        mailboxId: job.mailboxId,
+        organizationId: job.organizationId,
+      },
+      select: {
+        id: true,
+        mailboxId: true,
+        organizationId: true,
+        status: true,
+        previousStatus: true,
+      },
+    });
+
+    if (!thread) {
+      return;
+    }
+
+    const restoredStatus = this.parseThreadStatus(thread.previousStatus);
+    await this.prisma.thread.update({
+      where: { id: thread.id },
+      data: {
+        status: restoredStatus,
+        archivedAt: null,
+        previousStatus: null,
+      },
+    });
+
+    const reason = error instanceof Error ? error.message : String(error);
+    await this.logAuditSafe({
+      organizationId: thread.organizationId,
+      userId: job.requestedByUserId || undefined,
+      action: 'STATUS_CHANGE',
+      entityType: 'thread',
+      entityId: thread.id,
+      previousValue: {
+        status: ThreadStatus.TRASH,
+      },
+      newValue: {
+        status: restoredStatus,
+        deleteFailed: true,
+        reason,
+      },
+      ipAddress: job.ipAddress,
+      userAgent: job.userAgent,
+    });
+
+    void this.eventsGateway.emitToMailbox(thread.mailboxId, 'thread:updated', {
+      threadId: thread.id,
+      mailboxId: thread.mailboxId,
+      type: 'delete_failed',
+      status: restoredStatus,
+      reason,
+    });
+    void this.eventsGateway.emitToMailbox(
+      thread.mailboxId,
+      'thread:delete_failed',
+      {
+        threadId: thread.id,
+        mailboxId: thread.mailboxId,
+        status: restoredStatus,
+        reason,
+      },
+    );
   }
 
   private async resolveProviderTrashFolderName(

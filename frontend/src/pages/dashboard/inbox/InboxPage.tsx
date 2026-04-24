@@ -26,7 +26,7 @@ import {
     FileText, Paperclip, Type, Reply, FileSignature,
     CheckCircle2, Archive, Trash2,
     MoreHorizontal, Users, EyeOff, Star, RefreshCw,
-    ArrowLeft, Check, Plus, X, Loader2, Columns2, ChevronLeft, ChevronRight,
+    ArrowLeft, Check, Plus, X, Loader2, Columns2, ChevronLeft, ChevronRight, Download,
     PanelRight
 } from 'lucide-react';
 import { clsx } from 'clsx';
@@ -182,6 +182,21 @@ const formatSize = (bytes?: number) => {
     return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 };
 
+const inferPreviewKind = (contentType?: string | null, filename?: string | null): 'image' | 'pdf' | 'text' | 'unsupported' => {
+    const normalizedType = String(contentType || '').toLowerCase().trim();
+    const normalizedName = String(filename || '').toLowerCase().trim();
+
+    if (normalizedType.startsWith('image/')) return 'image';
+    if (normalizedType === 'application/pdf') return 'pdf';
+    if (normalizedType.startsWith('text/') || normalizedType === 'application/json') return 'text';
+
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(normalizedName)) return 'image';
+    if (/\.pdf$/i.test(normalizedName)) return 'pdf';
+    if (/\.(txt|md|log|csv|json|xml|yaml|yml)$/i.test(normalizedName)) return 'text';
+
+    return 'unsupported';
+};
+
 const formatThreadListTimestamp = (value?: string | null) => {
     const date = new Date(String(value || ''));
     if (!value || Number.isNaN(date.getTime())) return '--';
@@ -198,6 +213,35 @@ const normalizeAddressList = (input: unknown): string[] => {
     return input
         .map((entry) => String(entry || '').trim())
         .filter(Boolean);
+};
+
+const formatHeaderAddressValue = (addresses: string[]): string => {
+    if (!Array.isArray(addresses) || addresses.length === 0) return '—';
+    return addresses.join(', ');
+};
+
+const buildThreadMessageDedupeKey = (message: any) => {
+    const byId = String(message?.id || '').trim();
+    if (byId) return `id:${byId}`;
+    const byMessageId = String(message?.messageId || '').trim();
+    if (byMessageId) return `msgid:${byMessageId}`;
+    const direction = String(message?.direction || '').trim().toUpperCase();
+    const createdAt = String(message?.createdAt || '').trim();
+    const fromEmail = String(message?.fromEmail || '').trim().toLowerCase();
+    const bodySignature = String(message?.bodyHtml || message?.bodyText || '').trim().slice(0, 120);
+    return `fallback:${direction}|${createdAt}|${fromEmail}|${bodySignature}`;
+};
+
+const dedupeThreadMessages = (messages: any[]) => {
+    const seen = new Set<string>();
+    const deduped: any[] = [];
+    for (const message of messages) {
+        const key = buildThreadMessageDedupeKey(message);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(message);
+    }
+    return deduped;
 };
 
 type SidebarFilterItem = {
@@ -760,6 +804,29 @@ const InboxPage: React.FC = () => {
     const [openDropdown, setOpenDropdown] = useState<string | null>(null);
     const [isThreadDeleteConfirmOpen, setIsThreadDeleteConfirmOpen] = useState(false);
     const [isDeletingThread, setIsDeletingThread] = useState(false);
+    const [attachmentPreview, setAttachmentPreview] = useState<{
+        isOpen: boolean;
+        isLoading: boolean;
+        error: string;
+        filename: string;
+        sizeBytes: number | null;
+        contentType: string;
+        previewKind: 'image' | 'pdf' | 'text' | 'unsupported';
+        objectUrl: string | null;
+        textContent: string;
+        attachment: any | null;
+    }>({
+        isOpen: false,
+        isLoading: false,
+        error: '',
+        filename: '',
+        sizeBytes: null,
+        contentType: '',
+        previewKind: 'unsupported',
+        objectUrl: null,
+        textContent: '',
+        attachment: null,
+    });
 
     const ProviderLogo = ({ provider, className = 'w-4 h-4' }: { provider?: string; className?: string }) => {
         const providerKey = getProviderKey(provider);
@@ -1628,7 +1695,19 @@ const InboxPage: React.FC = () => {
             return res.data.threads.map((t: any) => ({
                 id: t.id,
                 subject: t.subject || '(No Subject)',
-                from: t.contact?.email || t.messages?.[0]?.fromEmail || 'unknown@example.com',
+                from: t.messages?.[0]?.fromEmail || t.contact?.email || 'unknown@example.com',
+                hasAttachments: Boolean(
+                    t.messages?.[0]?.hasAttachments
+                    || Number(t.messages?.[0]?.attachmentCount || 0) > 0
+                    || Number(t.messages?.[0]?._count?.attachments || 0) > 0
+                    || (Array.isArray(t.messages?.[0]?.attachments) && t.messages[0].attachments.length > 0)
+                ),
+                attachmentCount: Number(
+                    t.messages?.[0]?.attachmentCount
+                    || t.messages?.[0]?._count?.attachments
+                    || (Array.isArray(t.messages?.[0]?.attachments) ? t.messages[0].attachments.length : 0)
+                    || 0
+                ),
                 assignedTo: t.assignedUser?.fullName || t.assignedTeam?.name || '',
                 assignedToUserId: t.assignedUser?.id || null,
                 assignedToTeamId: t.assignedTeam?.id || null,
@@ -1970,7 +2049,7 @@ const InboxPage: React.FC = () => {
                     setLoadedThread({
                         id: res.data.id,
                         subject: res.data.subject || '(No Subject)',
-                        from: res.data.contact?.email || rawMessages?.[0]?.fromEmail || 'unknown@example.com',
+                        from: rawMessages?.[0]?.fromEmail || res.data.contact?.email || 'unknown@example.com',
                         assignedTo: res.data.assignedUser?.fullName || res.data.assignedTeam?.name || '',
                         assignedToUserId: res.data.assignedUser?.id || null,
                         assignedToTeamId: res.data.assignedTeam?.id || null,
@@ -2127,7 +2206,7 @@ const InboxPage: React.FC = () => {
     useEffect(() => {
         if (openThread) {
             const sessionReplies = localReplies[openThread.id] || [];
-            const merged = [...apiThreadMessages, ...mappedInternalNoteMessages, ...sessionReplies]
+            const merged = dedupeThreadMessages([...apiThreadMessages, ...mappedInternalNoteMessages, ...sessionReplies])
                 .sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
             setLocalMessages(merged);
         } else {
@@ -2344,16 +2423,142 @@ const InboxPage: React.FC = () => {
         refreshSidebarDataForEvent(openThreadMailboxId, resolvedRouteThreadId || null);
     };
 
+    const fetchAttachmentBlob = useCallback(async (attachmentId: string, inline = false) => {
+        const response = await api.get(`/attachments/${attachmentId}/download`, {
+            params: inline ? { inline: 'true' } : undefined,
+            responseType: 'blob',
+        });
+        return response.data as Blob;
+    }, []);
+
+    const closeAttachmentPreview = useCallback(() => {
+        setAttachmentPreview((prev) => {
+            if (prev.objectUrl) {
+                URL.revokeObjectURL(prev.objectUrl);
+            }
+            return {
+                isOpen: false,
+                isLoading: false,
+                error: '',
+                filename: '',
+                sizeBytes: null,
+                contentType: '',
+                previewKind: 'unsupported',
+                objectUrl: null,
+                textContent: '',
+                attachment: null,
+            };
+        });
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            setAttachmentPreview((prev) => {
+                if (prev.objectUrl) {
+                    URL.revokeObjectURL(prev.objectUrl);
+                }
+                return prev;
+            });
+        };
+    }, []);
+
+    const triggerBlobDownload = useCallback((blob: Blob, filename: string) => {
+        const objectUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    }, []);
+
+    const handleOpenAttachment = async (_messageId: string, attachment: any) => {
+        const attachmentId = String(attachment?.id || '');
+        if (!attachmentId) return;
+        const filename = String(attachment?.filename || 'attachment');
+        const contentType = String(attachment?.contentType || '');
+        const previewKind = inferPreviewKind(contentType, filename);
+
+        setAttachmentPreview((prev) => {
+            if (prev.objectUrl) {
+                URL.revokeObjectURL(prev.objectUrl);
+            }
+            return {
+                isOpen: true,
+                isLoading: previewKind !== 'unsupported',
+                error: '',
+                filename,
+                sizeBytes: Number.isFinite(Number(attachment?.sizeBytes))
+                    ? Number(attachment.sizeBytes)
+                    : null,
+                contentType,
+                previewKind,
+                objectUrl: null,
+                textContent: '',
+                attachment,
+            };
+        });
+
+        if (previewKind === 'unsupported') {
+            return;
+        }
+
+        try {
+            const blob = await fetchAttachmentBlob(attachmentId, true);
+            if (previewKind === 'text') {
+                const textContent = await blob.text();
+                setAttachmentPreview((prev) => {
+                    if (!prev.isOpen || String(prev.attachment?.id || '') !== attachmentId) {
+                        return prev;
+                    }
+                    return {
+                        ...prev,
+                        isLoading: false,
+                        textContent,
+                    };
+                });
+                return;
+            }
+
+            const objectUrl = URL.createObjectURL(blob);
+            setAttachmentPreview((prev) => {
+                if (!prev.isOpen || String(prev.attachment?.id || '') !== attachmentId) {
+                    URL.revokeObjectURL(objectUrl);
+                    return prev;
+                }
+                if (prev.objectUrl) {
+                    URL.revokeObjectURL(prev.objectUrl);
+                }
+                return {
+                    ...prev,
+                    isLoading: false,
+                    objectUrl,
+                };
+            });
+        } catch (error) {
+            console.error('Failed to open attachment:', error);
+            setAttachmentPreview((prev) => {
+                if (!prev.isOpen || String(prev.attachment?.id || '') !== attachmentId) {
+                    return prev;
+                }
+                return {
+                    ...prev,
+                    isLoading: false,
+                    error: 'Failed to preview this attachment. You can still download it.',
+                };
+            });
+        }
+    };
+
     const handleDownloadAttachment = async (_messageId: string, attachment: any) => {
         const attachmentId = String(attachment?.id || '');
         if (!attachmentId) return;
+        const filename = String(attachment?.filename || 'attachment');
 
         try {
-            const response = await api.get(`/attachments/${attachmentId}/download-link`);
-            const downloadUrl = response.data?.url;
-            if (downloadUrl) {
-                window.open(downloadUrl, '_blank', 'noopener,noreferrer');
-            }
+            const blob = await fetchAttachmentBlob(attachmentId);
+            triggerBlobDownload(blob, filename);
         } catch (error) {
             console.error('Failed to download attachment:', error);
         }
@@ -2779,6 +2984,29 @@ const InboxPage: React.FC = () => {
             });
         };
 
+        const handleThreadDeleteFailed = (payload: any) => {
+            const failedThreadId = String(payload?.threadId || '');
+            const mailboxId = payload?.mailboxId || null;
+            if (!failedThreadId) return;
+            if (!shouldProcessMailboxEvent(mailboxId, failedThreadId)) return;
+
+            scheduleThreadListRefresh();
+            refreshSidebarDataForEvent(mailboxId, failedThreadId);
+            if (normalizeThreadApiId(String(resolvedRouteThreadId || '')) === normalizeThreadApiId(failedThreadId)) {
+                scheduleOpenThreadDetailRefresh({ immediate: true, retry: true });
+            }
+
+            const reason = String(payload?.reason || '').trim();
+            window.dispatchEvent(
+                new CustomEvent('sermuno:api-error', {
+                    detail: {
+                        status: 500,
+                        message: reason || 'Thread delete failed in provider mailbox. Thread was restored.',
+                    },
+                }),
+            );
+        };
+
         socket.on('new_thread', handleNewThread);
         socket.on('thread_updated', handleThreadUpdated);
         socket.on('thread:updated', handleThreadUpdated);
@@ -2788,6 +3016,8 @@ const InboxPage: React.FC = () => {
         socket.on('message:new', handleNewMessage);
         socket.on('mailbox:synced', handleMailboxSynced);
         socket.on('thread:note_added', handleThreadNoteAdded);
+        socket.on('thread:delete_failed', handleThreadDeleteFailed);
+        socket.on('thread_delete_failed', handleThreadDeleteFailed);
 
         return () => {
             socket.off('new_thread', handleNewThread);
@@ -2799,6 +3029,8 @@ const InboxPage: React.FC = () => {
             socket.off('message:new', handleNewMessage);
             socket.off('mailbox:synced', handleMailboxSynced);
             socket.off('thread:note_added', handleThreadNoteAdded);
+            socket.off('thread:delete_failed', handleThreadDeleteFailed);
+            socket.off('thread_delete_failed', handleThreadDeleteFailed);
         };
     }, [activeFolderId, socket, isConnected, resolvedRouteThreadId, scheduleThreadListRefresh, currentPage, shouldProcessMailboxEvent, refreshSidebarDataForEvent, mergeNoteMentionDirectory, scheduleOpenThreadDetailRefresh]);
 
@@ -3842,7 +4074,7 @@ const InboxPage: React.FC = () => {
                                         {actualOpenThread.subject || 'Urgent Shipping Availability'}
                                     </h2>
                                     <p className="text-[11px] truncate mt-0.5 text-(--color-text-muted)">
-                                        From {actualOpenThread.from} to support@sermuno.com
+                                        Conversation participants are shown per message below
                                     </p>
                                     <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                                         {actualOpenThread.priority && (
@@ -4069,6 +4301,15 @@ const InboxPage: React.FC = () => {
                                     ? new Date(msg.scheduledAt).toLocaleString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
                                     : null;
                                 const messageAttachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+                                const fromValue = String(
+                                    msg.fromEmail
+                                    || (isOutbound ? (actualOpenThread?.mailboxEmail || user?.email) : '')
+                                    || '—',
+                                ).trim() || '—';
+                                const toValues = normalizeAddressList(msg.to);
+                                const ccValues = normalizeAddressList(msg.cc);
+                                const bccValues = normalizeAddressList(msg.bcc);
+                                const replyToValues = normalizeAddressList(msg.replyTo);
                                 const noteAvatarUrl = resolveAvatarUrl(isInternalNote ? (msg.user?.avatarUrl || user?.avatarUrl) : undefined);
                                 return (
                                     <div key={msg.id} className={clsx('flex flex-col max-w-[85%]', isOutbound || isInternalNote ? 'ml-auto items-end' : 'mr-auto items-start')}>
@@ -4125,6 +4366,21 @@ const InboxPage: React.FC = () => {
                                                         {scheduledAtLabel ? `Pending. Scheduled for ${scheduledAtLabel}` : 'Pending scheduled send.'}
                                                     </p>
                                                 )}
+                                                {!isInternalNote && (
+                                                    <div className="mb-2 border-b border-(--color-card-border) pb-2 text-[11px] text-(--color-text-muted) space-y-0.5">
+                                                        <div><span className="font-medium text-(--color-text-primary)">From:</span> {fromValue}</div>
+                                                        <div><span className="font-medium text-(--color-text-primary)">To:</span> {formatHeaderAddressValue(toValues)}</div>
+                                                        {ccValues.length > 0 && (
+                                                            <div><span className="font-medium text-(--color-text-primary)">Cc:</span> {formatHeaderAddressValue(ccValues)}</div>
+                                                        )}
+                                                        {bccValues.length > 0 && (
+                                                            <div><span className="font-medium text-(--color-text-primary)">Bcc:</span> {formatHeaderAddressValue(bccValues)}</div>
+                                                        )}
+                                                        {replyToValues.length > 0 && (
+                                                            <div><span className="font-medium text-(--color-text-primary)">Reply-To:</span> {formatHeaderAddressValue(replyToValues)}</div>
+                                                        )}
+                                                    </div>
+                                                )}
                                                 {isInternalNote && (
                                                     <div className="absolute top-1.5 right-1.5 dropdown-container">
                                                         <button
@@ -4171,16 +4427,29 @@ const InboxPage: React.FC = () => {
                                                 {messageAttachments.length > 0 && (
                                                     <div className="mt-3 flex flex-wrap gap-1.5">
                                                         {messageAttachments.map((attachment: any, index: number) => (
-                                                            <button
+                                                            <div
                                                                 key={String(attachment?.id || `${msg.id}-${index}`)}
-                                                                type="button"
-                                                                onClick={() => handleDownloadAttachment(String(msg.id), attachment)}
-                                                                className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] rounded-md border border-(--color-card-border) bg-white hover:bg-(--color-background) text-(--color-text-muted)"
+                                                                className="inline-flex items-center gap-1 rounded-md border border-(--color-card-border) bg-white text-(--color-text-muted)"
                                                             >
-                                                                <Paperclip className="w-3 h-3" />
-                                                                <span className="max-w-[180px] truncate">{attachment?.filename || `Attachment ${index + 1}`}</span>
-                                                                {formatSize(attachment?.sizeBytes) && <span className="opacity-70">({formatSize(attachment?.sizeBytes)})</span>}
-                                                            </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleOpenAttachment(String(msg.id), attachment)}
+                                                                    className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] hover:bg-(--color-background)"
+                                                                >
+                                                                    <Paperclip className="w-3 h-3" />
+                                                                    <span className="max-w-[180px] truncate">{attachment?.filename || `Attachment ${index + 1}`}</span>
+                                                                    {formatSize(attachment?.sizeBytes) && <span className="opacity-70">({formatSize(attachment?.sizeBytes)})</span>}
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={() => handleDownloadAttachment(String(msg.id), attachment)}
+                                                                    className="px-2 py-1 hover:bg-(--color-background)"
+                                                                    aria-label={`Download ${attachment?.filename || `Attachment ${index + 1}`}`}
+                                                                    title="Download"
+                                                                >
+                                                                    <Download className="w-3 h-3" />
+                                                                </button>
+                                                            </div>
                                                         ))}
                                                     </div>
                                                 )}
@@ -5033,6 +5302,7 @@ const InboxPage: React.FC = () => {
                             </div>
                         ) : threads.map(thread => {
                             const rowTags = thread.tags || [];
+                            const hasAttachments = Boolean(thread.hasAttachments);
                             const isScheduledPending = Boolean(
                                 (thread.hasPendingScheduledReply
                                     && String(thread.pendingScheduledStatus || '').toLowerCase() === 'pending')
@@ -5083,6 +5353,14 @@ const InboxPage: React.FC = () => {
                                     <div className="flex items-center justify-between gap-2">
                                         <span className="text-[12px] text-[var(--color-text-muted)] truncate flex-1">{thread.snippet}</span>
                                         <div className="flex items-center gap-1.5">
+                                            {hasAttachments && (
+                                                <span
+                                                    className="inline-flex items-center text-[var(--color-text-muted)]"
+                                                    title={`Has attachment${Number(thread.attachmentCount || 0) > 1 ? 's' : ''}`}
+                                                >
+                                                    <Paperclip className="w-3.5 h-3.5" />
+                                                </span>
+                                            )}
                                             {isScheduledPending && (
                                                 <span className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700">
                                                     Scheduled
@@ -5144,6 +5422,7 @@ const InboxPage: React.FC = () => {
                                     </tr>
                                 ) : threads.map(thread => {
                                     const rowTags = thread.tags || [];
+                                    const hasAttachments = Boolean(thread.hasAttachments);
                                     const isScheduledPending = Boolean(
                                         (thread.hasPendingScheduledReply
                                             && String(thread.pendingScheduledStatus || '').toLowerCase() === 'pending')
@@ -5175,7 +5454,17 @@ const InboxPage: React.FC = () => {
                                             </div>
                                         </td>
                                         <td className="px-2 py-2.5">
-                                            <div className="text-[13px] text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate max-w-xs">{thread.subject}</div>
+                                            <div className="flex items-center gap-1.5">
+                                                <div className="text-[13px] text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate max-w-xs">{thread.subject}</div>
+                                                {hasAttachments && (
+                                                    <span
+                                                        className="inline-flex items-center text-[var(--color-text-muted)] shrink-0"
+                                                        title={`Has attachment${Number(thread.attachmentCount || 0) > 1 ? 's' : ''}`}
+                                                    >
+                                                        <Paperclip className="w-3.5 h-3.5" />
+                                                    </span>
+                                                )}
+                                            </div>
                                             <div className="text-[10px] text-[var(--color-text-muted)]/60 truncate max-w-xs">{thread.snippet}</div>
                                             {isScheduledPending && scheduledAtLabel && (
                                                 <div className="mt-1 inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
@@ -5223,6 +5512,85 @@ const InboxPage: React.FC = () => {
                 onClose={handleCloseCompose}
                 defaultMailboxId={String(actualOpenThread?.mailboxId || activeMailboxId || '') || undefined}
             />
+            {attachmentPreview.isOpen && (
+                <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/40 p-4">
+                    <div className="w-full max-w-4xl max-h-[90vh] overflow-hidden rounded-xl border border-(--color-card-border) bg-white shadow-2xl">
+                        <div className="flex items-center justify-between border-b border-(--color-card-border) px-4 py-3">
+                            <div className="min-w-0">
+                                <p className="truncate text-sm font-semibold text-(--color-text-primary)">
+                                    {attachmentPreview.filename || 'Attachment preview'}
+                                </p>
+                                <p className="text-xs text-(--color-text-muted)">
+                                    {attachmentPreview.contentType || 'Unknown type'}
+                                    {formatSize(attachmentPreview.sizeBytes || 0) ? ` • ${formatSize(attachmentPreview.sizeBytes || 0)}` : ''}
+                                </p>
+                            </div>
+                            <div className="ml-3 flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => attachmentPreview.attachment && handleDownloadAttachment('', attachmentPreview.attachment)}
+                                    className="inline-flex items-center gap-1.5 rounded-md border border-(--color-card-border) px-2.5 py-1.5 text-xs text-(--color-text-primary) hover:bg-(--color-background)"
+                                >
+                                    <Download className="h-3.5 w-3.5" />
+                                    Download
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={closeAttachmentPreview}
+                                    className="rounded-md border border-(--color-card-border) p-1.5 text-(--color-text-muted) hover:bg-(--color-background)"
+                                    aria-label="Close attachment preview"
+                                >
+                                    <X className="h-4 w-4" />
+                                </button>
+                            </div>
+                        </div>
+                        <div className="h-[70vh] overflow-auto bg-(--color-background)/40 p-4">
+                            {attachmentPreview.isLoading && (
+                                <div className="flex h-full items-center justify-center text-sm text-(--color-text-muted)">
+                                    Loading preview...
+                                </div>
+                            )}
+                            {!attachmentPreview.isLoading && attachmentPreview.error && (
+                                <div className="flex h-full items-center justify-center text-sm text-red-600">
+                                    {attachmentPreview.error}
+                                </div>
+                            )}
+                            {!attachmentPreview.isLoading && !attachmentPreview.error && attachmentPreview.previewKind === 'image' && attachmentPreview.objectUrl && (
+                                <img
+                                    src={attachmentPreview.objectUrl}
+                                    alt={attachmentPreview.filename || 'Attachment preview'}
+                                    className="mx-auto max-h-full w-auto rounded-md border border-(--color-card-border) bg-white"
+                                />
+                            )}
+                            {!attachmentPreview.isLoading && !attachmentPreview.error && attachmentPreview.previewKind === 'pdf' && attachmentPreview.objectUrl && (
+                                <iframe
+                                    src={attachmentPreview.objectUrl}
+                                    title={attachmentPreview.filename || 'Attachment preview'}
+                                    className="h-full w-full rounded-md border border-(--color-card-border) bg-white"
+                                />
+                            )}
+                            {!attachmentPreview.isLoading && !attachmentPreview.error && attachmentPreview.previewKind === 'text' && (
+                                <pre className="min-h-full whitespace-pre-wrap break-words rounded-md border border-(--color-card-border) bg-white p-4 text-xs text-(--color-text-primary)">
+                                    {attachmentPreview.textContent}
+                                </pre>
+                            )}
+                            {!attachmentPreview.isLoading && !attachmentPreview.error && attachmentPreview.previewKind === 'unsupported' && (
+                                <div className="flex h-full flex-col items-center justify-center gap-3 text-center text-sm text-(--color-text-muted)">
+                                    <p>This file type cannot be previewed inline.</p>
+                                    <button
+                                        type="button"
+                                        onClick={() => attachmentPreview.attachment && handleDownloadAttachment('', attachmentPreview.attachment)}
+                                        className="inline-flex items-center gap-1.5 rounded-md border border-(--color-card-border) px-3 py-2 text-xs text-(--color-text-primary) hover:bg-(--color-background)"
+                                    >
+                                        <Download className="h-3.5 w-3.5" />
+                                        Download file
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            )}
             <ConfirmDialog
                 isOpen={isThreadDeleteConfirmOpen}
                 title="Delete Thread"

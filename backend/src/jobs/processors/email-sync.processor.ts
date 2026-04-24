@@ -188,9 +188,13 @@ function resolveFolderTypeFromName(name: string): ResolvedMailboxFolderType {
     raw === '[gmail]' ||
     raw === '[gmail]/starred' ||
     raw === '[gmail]/important' ||
+    normalized === 'outbox' ||
+    normalized === 'conversation history' ||
     normalized === 'important' ||
     normalized === 'starred' ||
     normalized === 'flagged emails' ||
+    normalized.endsWith('/outbox') ||
+    normalized.endsWith('/conversation history') ||
     normalized.endsWith('/starred') ||
     normalized.endsWith('/important')
   ) {
@@ -565,7 +569,13 @@ export class EmailSyncProcessor extends WorkerHost {
       });
     }
 
+    const enableOutlookGraphSync =
+      String(process.env.ENABLE_OUTLOOK_GRAPH_SYNC ?? 'true')
+        .trim()
+        .toLowerCase() === 'true';
+
     if (
+      enableOutlookGraphSync &&
       !imapPass &&
       oauthAccessToken &&
       mailbox.provider === 'OUTLOOK' &&
@@ -614,14 +624,18 @@ export class EmailSyncProcessor extends WorkerHost {
         timings.totalMs = Date.now() - runStartedAt;
         return timings;
       }
-
-      await this.markMailboxSyncFailed(
-        mailboxId,
-        organizationId,
-        'Microsoft mailbox does not have mail API scope yet. Reconnect Microsoft mailbox and grant requested permissions.',
+      this.logger.warn(
+        `[email-sync] mailbox=${mailboxId} Microsoft Graph sync unavailable, falling back to IMAP OAuth flow`,
       );
-      timings.totalMs = Date.now() - runStartedAt;
-      return timings;
+    } else if (
+      !enableOutlookGraphSync &&
+      mailbox.provider === 'OUTLOOK' &&
+      mailbox.oauthProvider === 'microsoft' &&
+      oauthAccessToken
+    ) {
+      this.logger.log(
+        `[email-sync] mailbox=${mailboxId} Outlook Graph sync disabled; using IMAP OAuth flow`,
+      );
     }
 
     const interactiveClientKey = `${mailboxId}:${imapHost}:${mailbox.imapPort ?? 993}:${mailbox.imapSecure ? 'secure' : 'plain'}`;
@@ -979,6 +993,33 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     errorMessage: string,
   ) {
+    const normalizedErrorMessage = String(errorMessage || 'Sync failed');
+    const isLegacyMicrosoftScopeFalsePositive =
+      normalizedErrorMessage.includes(
+        'Microsoft mailbox does not have mail API scope yet',
+      );
+
+    if (isLegacyMicrosoftScopeFalsePositive) {
+      this.logger.warn(
+        `[email-sync] mailbox=${mailboxId} ignoring legacy Microsoft scope false-positive failure`,
+      );
+      await this.prisma.mailbox.update({
+        where: { id: mailboxId },
+        data: {
+          syncStatus: 'PENDING',
+          healthStatus: 'degraded',
+          nextRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+          lastSyncError: null,
+        },
+      });
+      this.eventsGateway?.emitToOrganization(organizationId, 'mailbox:synced', {
+        mailboxId,
+        organizationId,
+        syncStatus: 'PENDING',
+      });
+      return;
+    }
+
     const adaptiveBucketKey = this.adaptiveBucketKey(mailboxId);
     const adaptiveOptions = this.adaptiveOptions();
     this.adaptiveThrottle.recordFailure(adaptiveBucketKey, adaptiveOptions);
@@ -1008,7 +1049,7 @@ export class EmailSyncProcessor extends WorkerHost {
         healthStatus: 'failed',
         syncErrorCount: { increment: 1 },
         nextRetryAt,
-        lastSyncError: String(errorMessage || 'Sync failed'),
+        lastSyncError: normalizedErrorMessage,
       },
     });
 
@@ -1298,7 +1339,7 @@ export class EmailSyncProcessor extends WorkerHost {
       {
         name: 'graph',
         folderUrl: (top: number) =>
-          `https://graph.microsoft.com/v1.0/me/mailFolders?$top=${top}&$select=id,displayName,wellKnownName`,
+          `https://graph.microsoft.com/v1.0/me/mailFolders?$top=${top}&$select=id,displayName`,
         messagesUrl: (folderId: string, top: number) =>
           `https://graph.microsoft.com/v1.0/me/mailFolders/${encodeURIComponent(folderId)}/messages` +
           `?$top=${top}&$orderby=receivedDateTime%20desc`,
@@ -1314,47 +1355,67 @@ export class EmailSyncProcessor extends WorkerHost {
     ];
 
     for (const candidate of apiCandidates) {
+      const candidateHeaders =
+        candidate.name === 'graph'
+          ? { ...apiHeaders, Prefer: 'IdType="ImmutableId"' }
+          : apiHeaders;
       const folderRows: Array<{
         id: string;
         displayName: string;
         wellKnownName?: string;
       }> = [];
-      try {
-        for await (const folderPage of this.iterateOutlookApiCollection<{
-          id?: string;
-          displayName?: string;
-          wellKnownName?: string;
-          Id?: string;
-          DisplayName?: string;
-          WellKnownName?: string;
-        }>(
-          mailboxId,
-          candidate.folderUrl(pageSize),
-          apiHeaders,
-          providerSyncPolicy,
-        )) {
-          folderRows.push(
-            ...folderPage
-              .map((folder) => ({
-                id: String(folder.id ?? folder.Id ?? '').trim(),
-                displayName: String(
-                  folder.displayName ?? folder.DisplayName ?? '',
-                ).trim(),
-                wellKnownName: String(
-                  folder.wellKnownName ?? folder.WellKnownName ?? '',
-                ).trim(),
-              }))
-              .filter((folder) => folder.id && folder.displayName),
+      const folderEndpoints =
+        candidate.name === 'graph'
+          ? [
+              candidate.folderUrl(pageSize),
+              `https://graph.microsoft.com/v1.0/me/mailFolders?$top=${pageSize}`,
+            ]
+          : [candidate.folderUrl(pageSize)];
+      let foldersFetched = false;
+
+      for (const folderEndpoint of folderEndpoints) {
+        try {
+          for await (const folderPage of this.iterateOutlookApiCollection<{
+            id?: string;
+            displayName?: string;
+            wellKnownName?: string;
+            Id?: string;
+            DisplayName?: string;
+            WellKnownName?: string;
+          }>(
+            mailboxId,
+            folderEndpoint,
+            candidateHeaders,
+            providerSyncPolicy,
+          )) {
+            folderRows.push(
+              ...folderPage
+                .map((folder) => ({
+                  id: String(folder.id ?? folder.Id ?? '').trim(),
+                  displayName: String(
+                    folder.displayName ?? folder.DisplayName ?? '',
+                  ).trim(),
+                  wellKnownName: String(
+                    folder.wellKnownName ?? folder.WellKnownName ?? '',
+                  ).trim(),
+                }))
+                .filter((folder) => folder.id && folder.displayName),
+            );
+          }
+          foldersFetched = true;
+          break;
+        } catch (err) {
+          if (err instanceof KillSwitchActivatedError) {
+            throw err;
+          }
+          const { status, body } = this.outlookApiErrorDetails(err);
+          this.logger.warn(
+            `[email-sync] ${candidate.name} folders read failed mailbox=${mailboxId} endpoint=${folderEndpoint} status=${status}: ${body.slice(0, 260)}`,
           );
         }
-      } catch (err) {
-        if (err instanceof KillSwitchActivatedError) {
-          throw err;
-        }
-        const { status, body } = this.outlookApiErrorDetails(err);
-        this.logger.warn(
-          `[email-sync] ${candidate.name} folders read failed mailbox=${mailboxId} status=${status}: ${body.slice(0, 260)}`,
-        );
+      }
+
+      if (!foldersFetched) {
         continue;
       }
 
@@ -1422,7 +1483,7 @@ export class EmailSyncProcessor extends WorkerHost {
           >(
             mailboxId,
             candidate.messagesUrl(folder.id, pageSize),
-            apiHeaders,
+            candidateHeaders,
             providerSyncPolicy,
           )) {
             const chunks = streamingMode
@@ -1437,6 +1498,9 @@ export class EmailSyncProcessor extends WorkerHost {
                   organizationId,
                   mailboxFolder.id,
                   folder.folderType,
+                  candidate.name as 'graph' | 'outlook-rest',
+                  candidateHeaders,
+                  providerSyncPolicy,
                 );
               }
               await this.applyChunkDelay(
@@ -1539,9 +1603,11 @@ export class EmailSyncProcessor extends WorkerHost {
     }
 
     const error = err as { status?: number | string; body?: string };
+    const message =
+      err instanceof Error ? err.message : String((err as any)?.message || '');
     return {
       status: String(error.status ?? 'unknown'),
-      body: String(error.body ?? ''),
+      body: String(error.body ?? message ?? ''),
     };
   }
 
@@ -1551,6 +1617,9 @@ export class EmailSyncProcessor extends WorkerHost {
     organizationId: string,
     folderId: string,
     folderType: string,
+    apiVariant: 'graph' | 'outlook-rest',
+    apiHeaders: Record<string, string>,
+    providerSyncPolicy: EmailSyncProviderPolicy,
   ): Promise<boolean> {
     const fromObj = (message.from ?? message.From ?? {}) as {
       emailAddress?: { address?: string; name?: string };
@@ -1583,24 +1652,20 @@ export class EmailSyncProcessor extends WorkerHost {
 
     const providerMessageId = String(message.id ?? message.Id ?? '').trim();
     if (!providerMessageId) return false;
-    const messageIdHeader = String(
+    const rawMessageIdHeader = String(
       message.internetMessageId ??
         message.InternetMessageId ??
         providerMessageId,
     ).trim();
+    const messageIdHeader =
+      normalizeRfcMessageId(rawMessageIdHeader) || rawMessageIdHeader;
     const candidateMessageIds = Array.from(
       new Set(
-        [providerMessageId, messageIdHeader]
+        [providerMessageId, rawMessageIdHeader, messageIdHeader]
           .map((value) => String(value || '').trim())
           .filter((value) => value.length > 0),
       ),
     );
-
-    const existing = await this.prisma.message.findFirst({
-      where: { mailboxId, messageId: { in: candidateMessageIds } },
-      select: { id: true },
-    });
-    if (existing) return false;
 
     if (this.isThreadingDisabled(mailboxId, 'outlook-thread-match-create')) {
       return false;
@@ -1643,6 +1708,9 @@ export class EmailSyncProcessor extends WorkerHost {
       Boolean(message.isDraft ?? message.IsDraft) || folderType === 'drafts';
     const direction: 'INBOUND' | 'OUTBOUND' =
       folderType === 'sent' ? 'OUTBOUND' : 'INBOUND';
+    const hasAttachmentsFlag = Boolean(
+      message.hasAttachments ?? message.HasAttachments,
+    );
     const bodyText = String(
       message.bodyPreview ?? message.BodyPreview ?? '',
     ).slice(0, 50000);
@@ -1665,6 +1733,121 @@ export class EmailSyncProcessor extends WorkerHost {
       : sentAtRaw
         ? new Date(sentAtRaw)
         : new Date();
+
+    const existing = await this.prisma.message.findFirst({
+      where: { mailboxId, messageId: { in: candidateMessageIds } },
+      select: { id: true, hasAttachments: true },
+    });
+    if (existing) {
+      if (direction === 'OUTBOUND') {
+        const placeholder = await this.findOutboundPlaceholderMessage({
+          mailboxId,
+          subject,
+          fromEmail,
+          toAddresses,
+          createdAt: receivedAt,
+          bodyText,
+          bodyHtml,
+        });
+        if (placeholder && placeholder.id !== existing.id) {
+          await this.prisma.attachment.updateMany({
+            where: { messageId: placeholder.id },
+            data: { messageId: existing.id },
+          });
+          if (placeholder.hasAttachments && !existing.hasAttachments) {
+            await this.prisma.message.updateMany({
+              where: { id: existing.id, hasAttachments: false },
+              data: { hasAttachments: true },
+            });
+          }
+          await this.deleteMissingProviderMessages(organizationId, [
+            { id: placeholder.id, threadId: placeholder.threadId },
+          ]);
+        }
+      }
+      await this.reconcileDuplicateMessageEntriesByMessageId(
+        mailboxId,
+        organizationId,
+        messageIdHeader,
+        existing.id,
+      );
+      if (hasAttachmentsFlag) {
+        await this.ingestOutlookApiAttachments({
+          messageId: existing.id,
+          organizationId,
+          mailboxId,
+          providerMessageId,
+          apiVariant,
+          apiHeaders,
+          providerSyncPolicy,
+          fallbackMessageId: messageIdHeader || providerMessageId,
+        });
+      }
+      return false;
+    }
+
+    if (direction === 'OUTBOUND') {
+      const placeholder = await this.findOutboundPlaceholderMessage({
+        mailboxId,
+        subject,
+        fromEmail,
+        toAddresses,
+        createdAt: receivedAt,
+        bodyText,
+        bodyHtml,
+      });
+
+      if (placeholder) {
+        await this.prisma.message.update({
+          where: { id: placeholder.id },
+          data: {
+            folder: { connect: { id: folderId } },
+            messageId: messageIdHeader || providerMessageId,
+            fromEmail,
+            to: toAddresses as unknown as Prisma.InputJsonValue,
+            cc: ccAddresses.length
+              ? (ccAddresses as unknown as Prisma.InputJsonValue)
+              : undefined,
+            bcc: bccAddresses.length
+              ? (bccAddresses as unknown as Prisma.InputJsonValue)
+              : undefined,
+            subject,
+            bodyText,
+            bodyHtml,
+            isRead: Boolean(message.isRead ?? message.IsRead),
+            hasAttachments:
+              placeholder.hasAttachments || hasAttachmentsFlag,
+            isDraft,
+            direction,
+            inReplyTo: null,
+            createdAt: Number.isNaN(receivedAt.getTime())
+              ? placeholder.createdAt
+              : receivedAt,
+          },
+        });
+
+        await this.reconcileDuplicateMessageEntriesByMessageId(
+          mailboxId,
+          organizationId,
+          messageIdHeader,
+          placeholder.id,
+        );
+        if (hasAttachmentsFlag || placeholder.hasAttachments) {
+          await this.ingestOutlookApiAttachments({
+            messageId: placeholder.id,
+            organizationId,
+            mailboxId,
+            providerMessageId,
+            apiVariant,
+            apiHeaders,
+            providerSyncPolicy,
+            fallbackMessageId: messageIdHeader || providerMessageId,
+          });
+        }
+
+        return false;
+      }
+    }
 
     const thread = await this.findOrCreateThread(
       organizationId,
@@ -1702,9 +1885,7 @@ export class EmailSyncProcessor extends WorkerHost {
         bodyText,
         bodyHtml,
         isRead: Boolean(message.isRead ?? message.IsRead),
-        hasAttachments: Boolean(
-          message.hasAttachments ?? message.HasAttachments,
-        ),
+        hasAttachments: hasAttachmentsFlag,
         isInternalNote: false,
         isDraft,
         direction,
@@ -1725,9 +1906,7 @@ export class EmailSyncProcessor extends WorkerHost {
         subject,
         bodyText,
         bodyHtml,
-        hasAttachments: Boolean(
-          message.hasAttachments ?? message.HasAttachments,
-        ),
+        hasAttachments: hasAttachmentsFlag,
       });
       await this.categorizeInboundMessage({
         organizationId,
@@ -1740,9 +1919,20 @@ export class EmailSyncProcessor extends WorkerHost {
         subject,
         bodyText,
         bodyHtml,
-        hasAttachments: Boolean(
-          message.hasAttachments ?? message.HasAttachments,
-        ),
+        hasAttachments: hasAttachmentsFlag,
+      });
+    }
+
+    if (hasAttachmentsFlag) {
+      await this.ingestOutlookApiAttachments({
+        messageId: createdMessage.id,
+        organizationId,
+        mailboxId,
+        providerMessageId,
+        apiVariant,
+        apiHeaders,
+        providerSyncPolicy,
+        fallbackMessageId: messageIdHeader || providerMessageId,
       });
     }
 
@@ -1794,7 +1984,267 @@ export class EmailSyncProcessor extends WorkerHost {
       });
     }
 
+    await this.reconcileDuplicateMessageEntriesByMessageId(
+      mailboxId,
+      organizationId,
+      messageIdHeader,
+      createdMessage.id,
+    );
+
     return true;
+  }
+
+  private async fetchOutlookApiMessageSource(
+    mailboxId: string,
+    providerMessageId: string,
+    apiVariant: 'graph' | 'outlook-rest',
+    apiHeaders: Record<string, string>,
+    providerSyncPolicy: EmailSyncProviderPolicy,
+  ): Promise<Buffer | null> {
+    const sourceUrl =
+      apiVariant === 'graph'
+        ? `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(
+            providerMessageId,
+          )}/$value`
+        : `https://outlook.office.com/api/v2.0/me/messages/${encodeURIComponent(
+            providerMessageId,
+          )}/$value`;
+    await this.acquireProviderRequestSlot(
+      mailboxId,
+      providerSyncPolicy,
+      'outlook-message-source',
+    );
+    try {
+      const response = await fetch(sourceUrl, {
+        headers: {
+          Authorization: apiHeaders.Authorization,
+          Accept: 'message/rfc822',
+        },
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const source = Buffer.from(await response.arrayBuffer());
+      return source.length > 0 ? source : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchOutlookApiAttachmentPayloads(
+    mailboxId: string,
+    providerMessageId: string,
+    apiVariant: 'graph' | 'outlook-rest',
+    apiHeaders: Record<string, string>,
+    providerSyncPolicy: EmailSyncProviderPolicy,
+  ): Promise<
+    Array<{
+      filename: string;
+      contentType: string | null;
+      content: Buffer;
+    }>
+  > {
+    const attachmentsUrl =
+      apiVariant === 'graph'
+        ? `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(providerMessageId)}/attachments?$top=50`
+        : `https://outlook.office.com/api/v2.0/me/messages/${encodeURIComponent(providerMessageId)}/attachments?$top=50`;
+
+    const payloads: Array<{
+      filename: string;
+      contentType: string | null;
+      content: Buffer;
+    }> = [];
+
+    for await (const attachmentPage of this.iterateOutlookApiCollection<
+      Record<string, unknown>
+    >(mailboxId, attachmentsUrl, apiHeaders, providerSyncPolicy)) {
+      for (const attachment of attachmentPage) {
+        const typeTag = String(
+          attachment['@odata.type'] ?? attachment.Type ?? '',
+        ).toLowerCase();
+        const isFileAttachment =
+          typeTag.includes('fileattachment') ||
+          String(attachment.type ?? attachment.Type ?? '').toLowerCase() ===
+            'fileattachment';
+        if (!isFileAttachment) {
+          continue;
+        }
+
+        const filename = String(
+          attachment.name ?? attachment.Name ?? 'attachment.bin',
+        ).trim();
+        const contentTypeRaw = String(
+          attachment.contentType ?? attachment.ContentType ?? '',
+        ).trim();
+        const contentType = contentTypeRaw || null;
+        let contentBase64 = String(
+          attachment.contentBytes ?? attachment.ContentBytes ?? '',
+        ).trim();
+
+        if (!contentBase64) {
+          const attachmentId = String(
+            attachment.id ?? attachment.Id ?? '',
+          ).trim();
+          if (!attachmentId) {
+            continue;
+          }
+          const detailUrl =
+            apiVariant === 'graph'
+              ? `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(providerMessageId)}/attachments/${encodeURIComponent(attachmentId)}`
+              : `https://outlook.office.com/api/v2.0/me/messages/${encodeURIComponent(providerMessageId)}/attachments/${encodeURIComponent(attachmentId)}`;
+          await this.acquireProviderRequestSlot(
+            mailboxId,
+            providerSyncPolicy,
+            'outlook-attachment-detail',
+          );
+          const detailResponse = await fetch(detailUrl, { headers: apiHeaders });
+          if (detailResponse.ok) {
+            const detailPayload =
+              (await detailResponse.json()) as Record<string, unknown>;
+            contentBase64 = String(
+              detailPayload.contentBytes ?? detailPayload.ContentBytes ?? '',
+            ).trim();
+          }
+        }
+
+        if (!contentBase64) {
+          continue;
+        }
+
+        let content: Buffer;
+        try {
+          content = Buffer.from(contentBase64, 'base64');
+        } catch {
+          continue;
+        }
+        if (content.length === 0) {
+          continue;
+        }
+
+        payloads.push({
+          filename: filename || 'attachment.bin',
+          contentType,
+          content,
+        });
+      }
+    }
+
+    return payloads;
+  }
+
+  private async persistParsedAttachments(
+    messageId: string,
+    organizationId: string,
+    parsedAttachments: Array<{
+      filename: string;
+      contentType: string | null;
+      content: Buffer;
+    }>,
+  ): Promise<boolean> {
+    if (!Array.isArray(parsedAttachments) || parsedAttachments.length === 0) {
+      return false;
+    }
+    const existingAttachmentCount = await this.prisma.attachment.count({
+      where: { messageId },
+    });
+    if (existingAttachmentCount > 0) {
+      return true;
+    }
+
+    for (const parsedAttachment of parsedAttachments) {
+      const filename = String(parsedAttachment.filename || 'attachment.bin').trim();
+      const contentType =
+        String(parsedAttachment.contentType || '').trim() || null;
+      const content = parsedAttachment.content;
+      if (!Buffer.isBuffer(content) || content.length === 0) {
+        continue;
+      }
+
+      const storageKey = this.attachmentStorage.generateStorageKey(
+        organizationId,
+        filename,
+      );
+      await this.attachmentStorage.upload(
+        storageKey,
+        content,
+        contentType || 'application/octet-stream',
+      );
+      await this.prisma.attachment.create({
+        data: {
+          messageId,
+          filename,
+          contentType,
+          sizeBytes: Number(content.length || 0),
+          storageKey,
+        },
+      });
+    }
+
+    return (
+      (await this.prisma.attachment.count({
+        where: { messageId },
+      })) > 0
+    );
+  }
+
+  private async ingestOutlookApiAttachments(input: {
+    messageId: string;
+    organizationId: string;
+    mailboxId: string;
+    providerMessageId: string;
+    apiVariant: 'graph' | 'outlook-rest';
+    apiHeaders: Record<string, string>;
+    providerSyncPolicy: EmailSyncProviderPolicy;
+    fallbackMessageId: string;
+  }): Promise<boolean> {
+    try {
+      const payloads = await this.fetchOutlookApiAttachmentPayloads(
+        input.mailboxId,
+        input.providerMessageId,
+        input.apiVariant,
+        input.apiHeaders,
+        input.providerSyncPolicy,
+      );
+      const ingestedFromApi = await this.persistParsedAttachments(
+        input.messageId,
+        input.organizationId,
+        payloads,
+      );
+      if (ingestedFromApi) {
+        await this.prisma.message.update({
+          where: { id: input.messageId },
+          data: { hasAttachments: true },
+        });
+        return true;
+      }
+    } catch (error) {
+      const { status, body } = this.outlookApiErrorDetails(error);
+      this.logger.warn(
+        `[email-sync] outlook attachment ingest failed mailbox=${input.mailboxId} message=${input.providerMessageId} status=${status}: ${body.slice(0, 260)}`,
+      );
+    }
+
+    const rawSource = await this.fetchOutlookApiMessageSource(
+      input.mailboxId,
+      input.providerMessageId,
+      input.apiVariant,
+      input.apiHeaders,
+      input.providerSyncPolicy,
+    );
+    if (!rawSource) {
+      return false;
+    }
+    await this.enrichInteractiveMessageContent(
+      input.messageId,
+      rawSource,
+      input.fallbackMessageId,
+      input.organizationId,
+    );
+    return (
+      (await this.prisma.attachment.count({
+        where: { messageId: input.messageId },
+      })) > 0
+    );
   }
 
   // ─── Multi-folder sync ────────────────────────────────────────────────────
@@ -2524,6 +2974,111 @@ export class EmailSyncProcessor extends WorkerHost {
 
   // ─── Message upsert ───────────────────────────────────────────────────────
 
+  private normalizeAddressArray(
+    value: Prisma.JsonValue | null | undefined,
+  ): string[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .map((entry) => String(entry || '').trim().toLowerCase())
+      .filter((entry) => entry.length > 0);
+  }
+
+  private normalizeBodySignature(
+    bodyText: string | null | undefined,
+    bodyHtml: string | null | undefined,
+  ): string {
+    const base = String(bodyText || '').trim()
+      || String(bodyHtml || '').replace(/<[^>]+>/g, ' ').trim();
+    return base.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 240);
+  }
+
+  private async findOutboundPlaceholderMessage(input: {
+    mailboxId: string;
+    subject: string;
+    fromEmail: string;
+    toAddresses: string[];
+    createdAt: Date;
+    bodyText: string | null;
+    bodyHtml: string | null;
+  }): Promise<{
+    id: string;
+    threadId: string;
+    createdAt: Date;
+    hasAttachments: boolean;
+  } | null> {
+    const start = new Date(input.createdAt.getTime() - 30 * 60 * 1000);
+    const end = new Date(input.createdAt.getTime() + 30 * 60 * 1000);
+    const candidates = await this.prisma.message.findMany({
+      where: {
+        mailboxId: input.mailboxId,
+        direction: 'OUTBOUND',
+        isDraft: false,
+        deletedAt: null,
+        messageId: null,
+        subject: input.subject,
+        fromEmail: input.fromEmail,
+        createdAt: {
+          gte: start,
+          lte: end,
+        },
+      },
+      select: {
+        id: true,
+        threadId: true,
+        createdAt: true,
+        hasAttachments: true,
+        to: true,
+        bodyText: true,
+        bodyHtml: true,
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+    });
+
+    if (candidates.length === 0) return null;
+
+    const targetTo = new Set(
+      input.toAddresses.map((value) => value.toLowerCase().trim()).filter(Boolean),
+    );
+    const targetBodySig = this.normalizeBodySignature(
+      input.bodyText || '',
+      input.bodyHtml || '',
+    );
+
+    const byRecipients = candidates.filter((candidate) => {
+      const candidateTo = new Set(this.normalizeAddressArray(candidate.to));
+      if (targetTo.size === 0 || candidateTo.size === 0) return true;
+      if (candidateTo.size !== targetTo.size) return false;
+      for (const entry of targetTo) {
+        if (!candidateTo.has(entry)) return false;
+      }
+      return true;
+    });
+
+    const recipientMatched = byRecipients.length > 0 ? byRecipients : candidates;
+    const bodyMatched = recipientMatched.find((candidate) => {
+      const candidateSig = this.normalizeBodySignature(
+        candidate.bodyText || '',
+        candidate.bodyHtml || '',
+      );
+      if (!targetBodySig || !candidateSig) return true;
+      return (
+        candidateSig === targetBodySig ||
+        candidateSig.includes(targetBodySig) ||
+        targetBodySig.includes(candidateSig)
+      );
+    });
+
+    const selected = bodyMatched || recipientMatched[0] || null;
+    if (!selected) return null;
+    return {
+      id: selected.id,
+      threadId: selected.threadId,
+      createdAt: selected.createdAt,
+      hasAttachments: selected.hasAttachments,
+    };
+  }
+
   private async deleteMissingProviderMessages(
     organizationId: string,
     messages: Array<{ id: string; threadId: string }>,
@@ -2651,6 +3206,64 @@ export class EmailSyncProcessor extends WorkerHost {
     };
   }
 
+  private async reconcileDuplicateMessageEntriesByMessageId(
+    mailboxId: string,
+    organizationId: string,
+    messageId: string,
+    preferredMessageId?: string | null,
+  ): Promise<void> {
+    const normalizedMessageId = normalizeRfcMessageId(messageId);
+    if (!normalizedMessageId) return;
+
+    const rows = await this.prisma.message.findMany({
+      where: {
+        mailboxId,
+        messageId: normalizedMessageId,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        threadId: true,
+        createdAt: true,
+        hasAttachments: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (rows.length <= 1) return;
+
+    const keeper =
+      rows.find((row) => String(row.id) === String(preferredMessageId || '')) ||
+      rows[0];
+    const duplicates = rows.filter((row) => row.id !== keeper.id);
+    if (duplicates.length === 0) return;
+
+    const duplicateIds = duplicates.map((row) => row.id);
+    await this.prisma.attachment.updateMany({
+      where: { messageId: { in: duplicateIds } },
+      data: { messageId: keeper.id },
+    });
+
+    if (duplicates.some((row) => row.hasAttachments)) {
+      await this.prisma.message.updateMany({
+        where: {
+          id: keeper.id,
+          hasAttachments: false,
+        },
+        data: { hasAttachments: true },
+      });
+    }
+
+    await this.deleteMissingProviderMessages(
+      organizationId,
+      duplicates.map((row) => ({ id: row.id, threadId: row.threadId })),
+    );
+
+    this.logger.warn(
+      `[email-sync] reconciled duplicate messages mailbox=${mailboxId} messageId=${normalizedMessageId} removed=${duplicates.length}`,
+    );
+  }
+
   private async upsertInteractiveBatch(
     chunk: Array<{
       uid: number;
@@ -2699,6 +3312,7 @@ export class EmailSyncProcessor extends WorkerHost {
             references: [],
             bodyText: '',
             bodyHtml: null,
+            hasAttachments: false,
           };
       const rfc822MessageId =
         fastContent.messageId ??
@@ -2719,6 +3333,7 @@ export class EmailSyncProcessor extends WorkerHost {
         references: fastContent.references,
         bodyText: fastContent.bodyText,
         bodyHtml: fastContent.bodyHtml,
+        hasAttachments: fastContent.hasAttachments,
         parseMs,
       };
     });
@@ -2741,6 +3356,7 @@ export class EmailSyncProcessor extends WorkerHost {
           },
           select: {
             id: true,
+            hasAttachments: true,
             messageId: true,
             folder: { select: { type: true } },
           },
@@ -2798,6 +3414,7 @@ export class EmailSyncProcessor extends WorkerHost {
     const messageRows: Prisma.MessageCreateManyInput[] = [];
     const threadRows: Prisma.ThreadCreateManyInput[] = [];
     const duplicateMoves: Array<{ id: string; imapUid: number }> = [];
+    const attachmentFlagPromotions: string[] = [];
     const postIngestPayloads: Array<{
       createdMessageId: string;
       thread: ThreadLookupResult;
@@ -2817,6 +3434,16 @@ export class EmailSyncProcessor extends WorkerHost {
     for (const item of prepared) {
       const existing = existingByMessageIdMap.get(item.rfc822MessageId);
       if (existing) {
+        if (item.hasAttachments && !existing.hasAttachments) {
+          attachmentFlagPromotions.push(existing.id);
+        }
+        await this.hydrateAttachmentsFromSourceIfNeeded(
+          existing.id,
+          item.msg.source,
+          item.rfc822MessageId,
+          organizationId,
+          item.hasAttachments,
+        );
         const existingPriority =
           FOLDER_MESSAGE_PRIORITY[String(existing.folder?.type || 'custom')] ?? 99;
         const currentPriority =
@@ -2902,6 +3529,7 @@ export class EmailSyncProcessor extends WorkerHost {
         subject: item.subject,
         bodyText: item.bodyText,
         bodyHtml: item.bodyHtml,
+        hasAttachments: item.hasAttachments,
         isInternalNote: false,
         isDraft,
         direction,
@@ -2932,6 +3560,17 @@ export class EmailSyncProcessor extends WorkerHost {
     }
 
     const createStartedAt = Date.now();
+    if (attachmentFlagPromotions.length > 0) {
+      await this.prisma.message.updateMany({
+        where: {
+          id: { in: attachmentFlagPromotions },
+          hasAttachments: false,
+        },
+        data: {
+          hasAttachments: true,
+        },
+      });
+    }
     if (duplicateMoves.length > 0) {
       const duplicateUpdateStartedAt = Date.now();
       const valuesSql = duplicateMoves
@@ -3002,6 +3641,7 @@ export class EmailSyncProcessor extends WorkerHost {
           payload.createdMessageId,
           payload.source,
           payload.rfc822MessageId,
+          organizationId,
         ).catch((error) => {
           this.logger.warn(
             `[email-sync] interactive message enrichment failed message=${payload.createdMessageId}: ${String(error)}`,
@@ -3059,17 +3699,22 @@ export class EmailSyncProcessor extends WorkerHost {
     const parseStartedAt = Date.now();
     let bodyText = '';
     let bodyHtml: string | null = null;
+    let hasAttachments = false;
     if (msg.source) {
       if (options.interactive) {
         const fastContent = this.extractFastMessageContent(msg.source);
         bodyText = fastContent.bodyText;
         bodyHtml = fastContent.bodyHtml;
+        hasAttachments = fastContent.hasAttachments;
         rfc822MessageId = fastContent.messageId ?? rfc822MessageId;
         inReplyTo = inReplyTo ?? fastContent.inReplyTo ?? undefined;
         references = fastContent.references;
       } else {
         try {
           const parsed = await simpleParser(msg.source);
+          hasAttachments = Array.isArray(parsed.attachments)
+            ? parsed.attachments.length > 0
+            : false;
           bodyText = parsed.text ?? '';
           bodyHtml = parsed.html || null;
           rfc822MessageId =
@@ -3086,6 +3731,7 @@ export class EmailSyncProcessor extends WorkerHost {
           const fastContent = this.extractFastMessageContent(msg.source);
           bodyText = fastContent.bodyText;
           bodyHtml = fastContent.bodyHtml;
+          hasAttachments = fastContent.hasAttachments;
           rfc822MessageId = fastContent.messageId ?? rfc822MessageId;
           references = fastContent.references;
         }
@@ -3101,6 +3747,24 @@ export class EmailSyncProcessor extends WorkerHost {
       select: { id: true },
     });
     if (existing) {
+      if (hasAttachments) {
+        await this.prisma.message.updateMany({
+          where: {
+            id: existing.id,
+            hasAttachments: false,
+          },
+          data: {
+            hasAttachments: true,
+          },
+        });
+      }
+      await this.hydrateAttachmentsFromSourceIfNeeded(
+        existing.id,
+        msg.source,
+        rfc822MessageId,
+        organizationId,
+        hasAttachments,
+      );
       timing.dedupeMs = Date.now() - dedupeStartedAt;
       return { created: false, unreadDelta: 0, timing };
     }
@@ -3115,6 +3779,7 @@ export class EmailSyncProcessor extends WorkerHost {
         },
         select: {
           id: true,
+          hasAttachments: true,
           folderId: true,
           folder: {
             select: {
@@ -3124,6 +3789,24 @@ export class EmailSyncProcessor extends WorkerHost {
         },
       });
       if (existingByMessageId) {
+        if (hasAttachments && !existingByMessageId.hasAttachments) {
+          await this.prisma.message.updateMany({
+            where: {
+              id: existingByMessageId.id,
+              hasAttachments: false,
+            },
+            data: {
+              hasAttachments: true,
+            },
+          });
+        }
+        await this.hydrateAttachmentsFromSourceIfNeeded(
+          existingByMessageId.id,
+          msg.source,
+          rfc822MessageId,
+          organizationId,
+          hasAttachments,
+        );
         const existingPriority =
           FOLDER_MESSAGE_PRIORITY[String(existingByMessageId.folder?.type || 'custom')] ?? 99;
         const currentPriority =
@@ -3160,6 +3843,38 @@ export class EmailSyncProcessor extends WorkerHost {
             },
           });
         }
+        if (folderTypeNormalized === 'sent') {
+          const placeholder = await this.findOutboundPlaceholderMessage({
+            mailboxId,
+            subject,
+            fromEmail,
+            toAddresses,
+            createdAt: receivedAt,
+            bodyText,
+            bodyHtml,
+          });
+          if (placeholder && placeholder.id !== existingByMessageId.id) {
+            await this.prisma.attachment.updateMany({
+              where: { messageId: placeholder.id },
+              data: { messageId: existingByMessageId.id },
+            });
+            if (placeholder.hasAttachments && !existingByMessageId.hasAttachments) {
+              await this.prisma.message.updateMany({
+                where: { id: existingByMessageId.id, hasAttachments: false },
+                data: { hasAttachments: true },
+              });
+            }
+            await this.deleteMissingProviderMessages(organizationId, [
+              { id: placeholder.id, threadId: placeholder.threadId },
+            ]);
+          }
+        }
+        await this.reconcileDuplicateMessageEntriesByMessageId(
+          mailboxId,
+          organizationId,
+          rfc822MessageId,
+          existingByMessageId.id,
+        );
         timing.dedupeMs = Date.now() - dedupeStartedAt;
         return { created: false, unreadDelta: 0, timing };
       }
@@ -3173,6 +3888,55 @@ export class EmailSyncProcessor extends WorkerHost {
     const direction: 'INBOUND' | 'OUTBOUND' =
       folderType === 'sent' ? 'OUTBOUND' : 'INBOUND';
     const isDraft = folderType === 'drafts';
+
+    if (direction === 'OUTBOUND' && hasRealMessageId) {
+      const placeholder = await this.findOutboundPlaceholderMessage({
+        mailboxId,
+        subject,
+        fromEmail,
+        toAddresses,
+        createdAt: receivedAt,
+        bodyText,
+        bodyHtml,
+      });
+
+      if (placeholder) {
+        await this.prisma.message.update({
+          where: { id: placeholder.id },
+          data: {
+            folder: { connect: { id: folderId } },
+            messageId: rfc822MessageId,
+            fromEmail,
+            to: toAddresses as unknown as Prisma.InputJsonValue,
+            subject,
+            bodyText,
+            bodyHtml,
+            hasAttachments: placeholder.hasAttachments || hasAttachments,
+            isDraft,
+            direction,
+            imapUid: msg.uid,
+            inReplyTo: inReplyTo ?? null,
+            references:
+              references.length > 0
+                ? (references as unknown as Prisma.InputJsonValue)
+                : undefined,
+            createdAt: receivedAt,
+          },
+        });
+
+        await this.reconcileDuplicateMessageEntriesByMessageId(
+          mailboxId,
+          organizationId,
+          rfc822MessageId,
+          placeholder.id,
+        );
+
+        timing.threadResolveMs = 0;
+        timing.createMs = 0;
+        timing.postIngestMs = 0;
+        return { created: false, unreadDelta: 0, timing };
+      }
+    }
 
     const threadResolveStartedAt = Date.now();
     const thread = await this.findOrCreateThread(
@@ -3205,6 +3969,7 @@ export class EmailSyncProcessor extends WorkerHost {
         subject,
         bodyText,
         bodyHtml,
+        hasAttachments,
         isInternalNote: false,
         isDraft,
         direction,
@@ -3264,11 +4029,21 @@ export class EmailSyncProcessor extends WorkerHost {
         createdMessage.id,
         msg.source,
         rfc822MessageId,
+        organizationId,
       ).catch((error) => {
         this.logger.warn(
           `[email-sync] interactive message enrichment failed message=${createdMessage.id}: ${String(error)}`,
         );
       });
+    }
+
+    if (hasRealMessageId) {
+      await this.reconcileDuplicateMessageEntriesByMessageId(
+        mailboxId,
+        organizationId,
+        rfc822MessageId,
+        createdMessage.id,
+      );
     }
 
     return { created: true, unreadDelta: 1, timing };
@@ -3782,6 +4557,7 @@ export class EmailSyncProcessor extends WorkerHost {
     references: string[];
     bodyText: string;
     bodyHtml: string | null;
+    hasAttachments: boolean;
   } {
     const raw = source.toString('utf8');
     const separatorMatch = raw.match(/\r?\n\r?\n/);
@@ -3821,6 +4597,9 @@ export class EmailSyncProcessor extends WorkerHost {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 50000);
+    const hasAttachments =
+      /content-disposition:\s*attachment/i.test(raw) ||
+      /content-type:[^\r\n;]+;\s*(?:name|filename)\s*=/i.test(raw);
 
     return {
       messageId,
@@ -3828,6 +4607,7 @@ export class EmailSyncProcessor extends WorkerHost {
       references,
       bodyText,
       bodyHtml,
+      hasAttachments,
     };
   }
 
@@ -3855,6 +4635,7 @@ export class EmailSyncProcessor extends WorkerHost {
     messageId: string,
     source: Buffer,
     fallbackMessageId: string,
+    organizationId: string,
   ): Promise<void> {
     try {
       const parsed = await simpleParser(source);
@@ -3868,12 +4649,55 @@ export class EmailSyncProcessor extends WorkerHost {
             .split(/\s+/)
             .map((value) => value.trim())
             .filter(Boolean);
+      const parsedAttachments = Array.isArray(parsed.attachments)
+        ? parsed.attachments.filter((attachment) =>
+            Buffer.isBuffer((attachment as any)?.content),
+          )
+        : [];
+
+      let hasAttachments = parsedAttachments.length > 0;
+      const existingAttachmentCount = await this.prisma.attachment.count({
+        where: { messageId },
+      });
+
+      if (parsedAttachments.length > 0 && existingAttachmentCount === 0) {
+        for (const parsedAttachment of parsedAttachments) {
+          const filename = String(
+            (parsedAttachment as any)?.filename || 'attachment.bin',
+          ).trim();
+          const contentType =
+            String((parsedAttachment as any)?.contentType || '').trim() || null;
+          const content = (parsedAttachment as any).content as Buffer;
+          const storageKey = this.attachmentStorage.generateStorageKey(
+            organizationId,
+            filename,
+          );
+          await this.attachmentStorage.upload(
+            storageKey,
+            content,
+            contentType || 'application/octet-stream',
+          );
+          await this.prisma.attachment.create({
+            data: {
+              messageId,
+              filename,
+              contentType,
+              sizeBytes: Number(content.length || 0),
+              storageKey,
+            },
+          });
+        }
+      } else if (existingAttachmentCount > 0) {
+        hasAttachments = true;
+      }
+
       await this.prisma.message.update({
         where: { id: messageId },
         data: {
           messageId: parsedMessageId,
           bodyText: String(parsed.text || '').slice(0, 50000),
           bodyHtml: parsed.html ? String(parsed.html).slice(0, 200000) : null,
+          hasAttachments,
           references:
             parsedReferences.length > 0
               ? (parsedReferences as unknown as Prisma.InputJsonValue)
@@ -3885,6 +4709,30 @@ export class EmailSyncProcessor extends WorkerHost {
         `[email-sync] interactive enrichment parse failed message=${messageId}: ${String(error)}`,
       );
     }
+  }
+
+  private async hydrateAttachmentsFromSourceIfNeeded(
+    messageId: string,
+    source: Buffer | undefined,
+    fallbackMessageId: string,
+    organizationId: string,
+    hasAttachments: boolean,
+  ): Promise<void> {
+    if (!hasAttachments || !source) {
+      return;
+    }
+    const existingAttachmentCount = await this.prisma.attachment.count({
+      where: { messageId },
+    });
+    if (existingAttachmentCount > 0) {
+      return;
+    }
+    await this.enrichInteractiveMessageContent(
+      messageId,
+      source,
+      fallbackMessageId,
+      organizationId,
+    );
   }
 
   // ─── Encryption ───────────────────────────────────────────────────────────

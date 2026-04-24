@@ -85,6 +85,10 @@ export class EmailSyncScheduler implements OnModuleInit, OnModuleDestroy {
       const mailboxes = await this.prisma.mailbox.findMany({
         where: {
           deletedAt: null,
+          NOT: {
+            provider: 'OUTLOOK',
+            oauthProvider: 'microsoft',
+          },
           AND: [
             { syncStatus: { not: 'SYNCING' } },
             {

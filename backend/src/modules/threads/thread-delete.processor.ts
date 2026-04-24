@@ -1,4 +1,4 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import type { Job } from 'bullmq';
 import {
@@ -22,5 +22,17 @@ export class ThreadDeleteProcessor extends WorkerHost {
       `[thread-delete] processing thread=${job.data.threadId} mailbox=${job.data.mailboxId}`,
     );
     await this.threadsService.processQueuedThreadDelete(job.data);
+  }
+
+  @OnWorkerEvent('failed')
+  async onFailed(job: Job<ThreadDeleteJobData> | undefined, error: Error) {
+    if (!job) return;
+    const maxAttempts = Number((job.opts as { attempts?: number })?.attempts || 1);
+    const finalFailure = job.attemptsMade >= maxAttempts;
+    await this.threadsService.handleQueuedThreadDeleteFailure(
+      job.data,
+      error,
+      finalFailure,
+    );
   }
 }
