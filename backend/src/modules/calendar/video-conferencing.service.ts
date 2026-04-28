@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import * as crypto from 'node:crypto';
+import { randomUUID } from 'crypto';
 import * as https from 'https';
 
 export interface MeetingResult {
@@ -26,7 +26,7 @@ export class VideoConferencingService {
     startTime: Date,
     endTime: Date,
   ): Promise<MeetingResult> {
-    const requestId = crypto.randomUUID();
+    const requestId = randomUUID();
 
     const body = JSON.stringify({
       summary: title,

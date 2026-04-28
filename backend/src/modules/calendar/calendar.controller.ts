@@ -17,7 +17,7 @@ import {
   Headers,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual } from 'crypto';
 import { CalendarService } from './calendar.service';
 import { CalendarTemplatesService } from './calendar-templates.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';

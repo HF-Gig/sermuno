@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../../database/prisma.service';
 import { Prisma } from '@prisma/client';
-import * as crypto from 'node:crypto';
+import { createHmac, createHash, createDecipheriv, randomBytes, createCipheriv } from 'crypto';
 import * as nodemailer from 'nodemailer';
 import { ConfigService } from '@nestjs/config';
 import { IcsGeneratorService } from './ics-generator.service';
@@ -742,8 +742,7 @@ export class CalendarService {
   async getRsvpPublic(eventId: string, token: string) {
     // Validate token = HMAC-SHA256 of eventId with JWT_SECRET
     const secret = this.config.get<string>('jwt.secret') ?? '';
-    const expected = crypto
-      .createHmac('sha256', secret)
+    const expected = createHmac('sha256', secret)
       .update(eventId)
       .digest('hex');
 
@@ -1245,9 +1244,9 @@ export class CalendarService {
 
     try {
       const keyBuffer = Buffer.from(
-        crypto.createHash('sha256').update(key).digest(),
+        createHash('sha256').update(key).digest(),
       );
-      const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+      const decipher = createDecipheriv('aes-256-gcm', keyBuffer, iv);
       decipher.setAuthTag(authTag);
       return (
         decipher.update(ciphertext).toString('utf8') + decipher.final('utf8')
@@ -1255,7 +1254,7 @@ export class CalendarService {
     } catch {
       try {
         const legacyKeyBuffer = Buffer.from(key.padEnd(32).slice(0, 32));
-        const legacyDecipher = crypto.createDecipheriv(
+        const legacyDecipher = createDecipheriv(
           'aes-256-gcm',
           legacyKeyBuffer,
           iv,
@@ -1275,11 +1274,11 @@ export class CalendarService {
     if (!key) {
       throw new Error('Missing encryption key');
     }
-    const iv = crypto.randomBytes(12);
+    const iv = randomBytes(12);
     const keyBuffer = Buffer.from(
-      crypto.createHash('sha256').update(key).digest(),
+      createHash('sha256').update(key).digest(),
     );
-    const cipher = crypto.createCipheriv('aes-256-gcm', keyBuffer, iv);
+    const cipher = createCipheriv('aes-256-gcm', keyBuffer, iv);
     const ciphertext = Buffer.concat([
       cipher.update(plaintext, 'utf8'),
       cipher.final(),
