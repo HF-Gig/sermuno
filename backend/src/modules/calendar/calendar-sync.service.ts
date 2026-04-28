@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma, type Event, type EventAttendee, type User } from '@prisma/client';
 import { ICalAttendeeStatus, ICalEventStatus } from 'ical-generator';
-import { randomBytes, createHash, createCipheriv, createDecipheriv, randomUUID } from 'crypto';
+import * as crypto from 'crypto';
 import * as https from 'https';
 import * as ical from 'node-ical';
 import { createDAVClient, type DAVCalendar, type DAVCalendarObject } from 'tsdav';
@@ -1207,11 +1207,11 @@ export class CalendarSyncService {
       throw new Error('Missing encryption key');
     }
 
-    const iv = randomBytes(12);
+    const iv = crypto.randomBytes(12);
     const keyBuffer = Buffer.from(
-      createHash('sha256').update(key).digest(),
+      crypto.createHash('sha256').update(key).digest(),
     );
-    const cipher = createCipheriv('aes-256-gcm', keyBuffer, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', keyBuffer, iv);
     const ciphertext = Buffer.concat([
       cipher.update(plaintext, 'utf8'),
       cipher.final(),
@@ -1236,9 +1236,9 @@ export class CalendarSyncService {
 
     try {
       const keyBuffer = Buffer.from(
-        createHash('sha256').update(key).digest(),
+        crypto.createHash('sha256').update(key).digest(),
       );
-      const decipher = createDecipheriv('aes-256-gcm', keyBuffer, iv);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
       decipher.setAuthTag(authTag);
       return (
         decipher.update(ciphertext).toString('utf8') + decipher.final('utf8')
@@ -1246,7 +1246,7 @@ export class CalendarSyncService {
     } catch {
       try {
         const legacyKeyBuffer = Buffer.from(key.padEnd(32).slice(0, 32));
-        const legacyDecipher = createDecipheriv(
+        const legacyDecipher = crypto.createDecipheriv(
           'aes-256-gcm',
           legacyKeyBuffer,
           iv,
@@ -1436,7 +1436,7 @@ export class CalendarSyncService {
     if (event.meetingProvider === 'google_meet' && !hasValidMeetLink) {
       payload['conferenceData'] = {
         createRequest: {
-          requestId: randomUUID(),
+          requestId: crypto.randomUUID(),
         },
       };
     }

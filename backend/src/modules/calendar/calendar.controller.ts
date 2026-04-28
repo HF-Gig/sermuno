@@ -17,7 +17,7 @@ import {
   Headers,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { timingSafeEqual } from 'crypto';
+import * as crypto from 'crypto';
 import { CalendarService } from './calendar.service';
 import { CalendarTemplatesService } from './calendar-templates.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -165,7 +165,7 @@ export class CalendarController {
     const providedBuffer = Buffer.from(provided, 'utf8');
     const isValid =
       expectedBuffer.length === providedBuffer.length &&
-      timingSafeEqual(expectedBuffer, providedBuffer);
+      crypto.timingSafeEqual(expectedBuffer, providedBuffer);
     if (!isValid) {
       throw new UnauthorizedException('Invalid RSVP ingest secret');
     }
