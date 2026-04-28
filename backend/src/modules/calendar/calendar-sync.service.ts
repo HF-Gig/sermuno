@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma, type Event, type EventAttendee, type User } from '@prisma/client';
 import { ICalAttendeeStatus, ICalEventStatus } from 'ical-generator';
-import * as crypto from 'crypto';
+import * as crypto from 'node:crypto';
 import * as https from 'https';
 import * as ical from 'node-ical';
 import { createDAVClient, type DAVCalendar, type DAVCalendarObject } from 'tsdav';
