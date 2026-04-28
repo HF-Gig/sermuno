@@ -48,7 +48,7 @@ const NOTIFICATION_TYPE_DEFS: Record<
   { config: Record<string, unknown>; channels: ChannelMap }
 > = {
   new_message: {
-    channels: { in_app: true, email: true, push: true, desktop: true },
+    channels: { in_app: true, email: false, push: true, desktop: true },
     config: { scope: 'all_mailboxes', mailboxIds: [] },
   },
   thread_assigned: {
@@ -456,17 +456,17 @@ export class NotificationsService {
           userPref?.inApp ??
           orgTypeSetting.channels.in_app),
       email:
-        (params.channels?.email ?? false) ||
+        params.channels?.email ??
         (orgTypeSetting.channels.email &&
           (contactPref?.email ??
             userPref?.email ??
             orgTypeSetting.channels.email)),
       push:
-        (params.channels?.push ?? false) ||
+        params.channels?.push ??
         (orgTypeSetting.channels.push &&
           (contactPref?.push ?? userPref?.push ?? orgTypeSetting.channels.push)),
       desktop:
-        (params.channels?.desktop ?? false) ||
+        params.channels?.desktop ??
         (orgTypeSetting.channels.desktop &&
           (contactPref?.desktop ??
             userPref?.desktop ??

@@ -4113,6 +4113,7 @@ export class EmailSyncProcessor extends WorkerHost {
             title,
             message,
             resourceId: input.threadId,
+            channels: { email: false },
             data: {
               threadId: input.threadId,
               mailboxId: input.mailboxId,
